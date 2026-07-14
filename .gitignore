@@ -2,3 +2,4 @@ dist/
 test/smoke
 test/smoke.dSYM/
 *.o
+.ucd_cache/

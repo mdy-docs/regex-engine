@@ -35,6 +35,8 @@ include/
 src/
   regexp.c       the engine itself (lexer/parser/compiler + backtracking VM)
   regex_wasm.c   WASM shim: opaque handles, UTF-16-buffer-in/int32-buffer-out API
+scripts/
+  generate_ucd.py generates include/ucd.h from unicode.org data (see below)
 test/
   smoke.c        native sanity test against the shim API (no Emscripten needed)
   node_smoke.mjs end-to-end test against the actual compiled .wasm, via Node
@@ -47,6 +49,17 @@ make test       # native smoke test (cc, no Emscripten needed)
 make wasm       # emcc build -> dist/regex-engine.js + dist/regex-engine.wasm
 make test-wasm  # builds wasm, then runs node_smoke.mjs against the real artifact
 ```
+
+To regenerate `include/ucd.h` (e.g. after bumping `UNICODE_VERSION` in the
+script to pick up a new Unicode release):
+
+```sh
+python3 scripts/generate_ucd.py > include/ucd.h
+```
+
+Fetches from unicode.org on first run, caching each source file under
+`.ucd_cache/` (gitignored) so subsequent regenerations at the same version
+are offline/instant. No dependencies beyond the Python 3 standard library.
 
 `make wasm` needs `emcc` on `PATH` (Emscripten SDK). The build is
 `MODULARIZE=1`, exporting a factory function `createRegexEngineModule`
