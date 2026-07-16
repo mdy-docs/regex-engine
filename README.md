@@ -6,6 +6,19 @@ JavaScript engine with a thin WASM shim on top. Zero runtime dependencies
 beyond libc — no GC, no string-interning, no host-engine `Value`/`Object`
 types.
 
+**Try it live:** [the WASM playground demo](https://mdy-docs.github.io/regex-engine/)
+(source in `web/`, published via `.github/workflows/pages.yml`) runs this
+exact engine, compiled to WebAssembly, entirely in your browser.
+
+**New to this repo?** Start with [`CLAUDE.md`](CLAUDE.md) — it's the
+onboarding doc (for humans and AI agents alike) and points to
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (how the engine works
+internally) and [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md) (a
+structure/performance/testing/correctness analysis with several confirmed,
+reproducible findings — including memory-safety issues — worth reading
+before relying on this in anything security-sensitive or exposed to
+untrusted patterns).
+
 ## Provenance
 
 Extracted from jsvm2's `src/regexp.c` / `include/regexp.h` (the compiler +
@@ -40,6 +53,14 @@ scripts/
 test/
   smoke.c        native sanity test against the shim API (no Emscripten needed)
   node_smoke.mjs end-to-end test against the actual compiled .wasm, via Node
+web/
+  index.html/style.css/app.js   the WASM playground demo (see "Web demo" below)
+docs/
+  ARCHITECTURE.md  how the lexer/parser/compiler/VM actually work
+  IMPROVEMENTS.md  structure/perf/testing/correctness analysis with confirmed findings
+.github/workflows/
+  test.yml         make test + make test-wasm on every push/PR
+  pages.yml         builds the wasm demo and deploys web/ to GitHub Pages
 ```
 
 ## Building
@@ -48,6 +69,7 @@ test/
 make test       # native smoke test (cc, no Emscripten needed)
 make wasm       # emcc build -> dist/regex-engine.js + dist/regex-engine.wasm
 make test-wasm  # builds wasm, then runs node_smoke.mjs against the real artifact
+make demo       # builds wasm, copies artifacts into web/ for local testing
 ```
 
 To regenerate `include/ucd.h` (e.g. after bumping `UNICODE_VERSION` in the
@@ -126,6 +148,38 @@ const patPtr = writeUtf16("(\\d+)-([a-z]+)");
 const handle = regex_compile(patPtr, 0, /* flags */ 0);
 // regex_exec(handle, textPtr, textLen, 0), then read regex_captures_ptr(handle)
 ```
+
+## Web demo
+
+`web/` is a small dependency-free regex playground (pattern + flags +
+subject text, live highlighted matches, a capture-group table, a handful of
+preset patterns) built directly on `regex_wasm.c`'s API — it's both a demo
+and a worked example of the "host-appropriate binding layer" step below
+(see `web/app.js`'s `findAllMatches` for a from-scratch, matchAll-style
+global-search loop built on the low-level `regex_exec` API).
+
+To run it locally:
+```sh
+make demo                       # builds wasm, copies artifacts into web/
+python3 -m http.server -d web   # then open http://localhost:8000/
+```
+(`regex-engine.js`/`.wasm` fetched by the page over `file://` won't work in
+most browsers — serve it over `http://`.)
+
+It's deployed automatically to GitHub Pages by
+`.github/workflows/pages.yml` on every push to `main` that touches
+`src/`, `include/`, or `web/` — the workflow does the equivalent of
+`make demo` in CI and publishes the result. One-time setup this workflow
+can't do for you: in the repo's **Settings → Pages**, set **Source** to
+**GitHub Actions**.
+
+The demo's Makefile target enables Emscripten's `STACK_OVERFLOW_CHECK` and
+a larger `STACK_SIZE` specifically because this engine has a confirmed
+C-stack-overflow crash on some inputs (see `docs/IMPROVEMENTS.md` #1.1) —
+without those flags a crash can silently corrupt WASM linear memory instead
+of throwing a catchable error. `web/app.js` catches that error and
+transparently reloads the WASM instance so the page keeps working; that's a
+build/host-level mitigation, not a fix for the underlying engine bug.
 
 ## Integrating into another WASM package
 

@@ -1,0 +1,65 @@
+name: Deploy playground to GitHub Pages
+
+# Builds src/regexp.c + src/regex_wasm.c to WASM (same `make wasm` used
+# locally) and publishes web/ + the freshly-built artifacts as the GitHub
+# Pages site. Nothing under web/regex-engine.{js,wasm} is committed to git
+# (see .gitignore) -- this workflow is what produces them for the deployed
+# site, same as `make demo` does for local testing.
+#
+# One-time setup this workflow can't do for you: in the repo's Settings ->
+# Pages, set "Source" to "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "include/**"
+      - "web/**"
+      - "Makefile"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Gate the deploy on the native smoke test -- cheap, no Emscripten
+      # needed, and it's the one check that must never be skipped.
+      - run: make test
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+      - run: make wasm
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp web/index.html web/style.css web/app.js _site/
+          cp dist/regex-engine.js dist/regex-engine.wasm _site/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

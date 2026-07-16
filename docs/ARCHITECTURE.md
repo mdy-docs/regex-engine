@@ -1,0 +1,284 @@
+# Architecture
+
+How `src/regexp.c` actually works, for anyone about to modify it. This is a
+single-pass-compile, backtracking-VM regex engine (think "hand-rolled PCRE
+subset with a memoization cache bolted on for ReDoS mitigation," not an
+NFA/DFA-simulation engine like RE2). Everything lives in two files:
+`include/regexp.h` (the types + public entry points) and `src/regexp.c`
+(everything else), plus the generated `include/ucd.h` for Unicode data.
+
+## Pipeline
+
+```
+pattern (UTF-16, NUL-terminated)
+   |
+   v
+Lexer (next_token)  --------- one token of lookahead, hand-written
+   |
+   v
+Parser (parse_alt / parse_concat / parse_quantifier / parse_primary)
+   |  recursive descent, builds an ASTNode tree
+   v
+Compiler (compile_node)  --- walks the AST once, emits Instruction[]
+   |                          into Program.code (a flat array, not a
+   |                          separate bytecode buffer)
+   v
+Program  (Instruction[] + CharClass[] + group metadata + flags)
+   |
+   v
+VM (vm_execute_internal) --- backtracking interpreter over Program.code,
+                              invoked once per candidate start offset by
+                              the caller (regex_exec in regex_wasm.c)
+```
+
+`compile_into` (regexp.c:1425) is the single entry point that drives lexer
+→ parser → validation → compiler and populates a caller-owned `Program`.
+There is no separate "optimize" pass — bytecode is emitted directly from
+the AST in one recursive walk (`compile_node`, regexp.c:1286).
+
+## The `Program` struct — why it's all fixed-size arrays
+
+```c
+typedef struct {
+    Instruction code[MAX_OPCODES];       // 16384
+    CharClass classes[MAX_CLASSES];      // 64
+    char group_names[MAX_GROUPS][32];    // 255
+    int code_count, class_count, group_count, counter_count;
+    bool ignore_case, multiline, dot_all, sticky, unicode, has_indices, unicode_sets;
+    const char* error;
+} Program;
+```
+
+No `malloc` happens during compilation or matching except the one
+`malloc(sizeof(Program))` (or `sizeof(RegexHandle)` in the WASM shim) up
+front — `Program` itself is ~2MB of fixed-size arrays, deliberately sized to
+avoid any dynamic growth logic in a component meant to run inside a WASM
+sandbox with no realloc-heavy allocator pressure. `compile_into`'s top
+comment (regexp.c:1425) explains why it *doesn't* zero the whole struct on
+each compile (`= {0}` would touch all ~2MB) — only the bookkeeping counters
+and `group_names` (which is read by name lookups even for slots that were
+never written) get reset.
+
+**The tradeoff:** none of `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS`/
+`MAX_COUNTERS` are enforced — see `docs/IMPROVEMENTS.md` for why that's a
+real, confirmed problem, not a hypothetical one. If you're changing any of
+these constants, grep for the corresponding `_count` field's every
+increment site first (`class_count++`, `++prog->group_count`,
+`counter_count++`, `emit()`'s `code_count++`) — none of them currently
+check against the bound they're indexing into.
+
+## Lexer (`Lexer`, `next_token`, regexp.c:38–1084)
+
+One token of lookahead (`lexer->current`), hand-written character-class
+dispatch in `next_token`. Notable pieces:
+
+- `decode_utf16_lexer` (regexp.c:57) advances by one *code point* when
+  `prog->unicode` is set (surrogate-pair aware), one *code unit* otherwise —
+  this is the general pattern throughout the engine: unicode-mode
+  operations are code-point-based, non-unicode-mode operations are
+  UTF-16-code-unit-based (see `docs/IMPROVEMENTS.md`'s note on the `255`
+  cap bug, which violates this pattern in one place).
+- Escape sequences (`\d`, `\p{...}`, `\u{...}`, `\k<name>`, `\cX`, etc.) are
+  all resolved inside `next_token`'s `case '\\':` block or inside
+  `parse_char_class` for class-internal escapes — there's no separate
+  escape-resolution pass.
+- Character classes (`[...]`) are parsed by `parse_char_class`
+  (regexp.c:540), which also implements `/v`-mode set operations (`&&`,
+  `--`, nested `[...]`) and `\q{...}` string-literal alternatives in
+  classes — these are `/v`-only (`unicode_sets`) ECMAScript 2024 features,
+  gated on `lexer->prog->unicode_sets`.
+- `CharClass` ranges are kept **sorted and coalesced** by `add_range`
+  (regexp.c:268) — every insertion merges into adjacent/overlapping ranges,
+  so `cls->ranges` is always a minimal sorted disjoint-range representation.
+  This is what makes `OP_CLASS` matching a linear scan over a small range
+  list rather than a per-character membership test.
+- Capture group names go through `parse_group_name` /
+  `rx_idname_cp` / `rx_is_id_start` / `rx_is_id_continue`
+  (regexp.c:122–266), which implement the actual ECMAScript
+  `RegExpIdentifierName` grammar (including `\u` escapes *inside* a group
+  name, e.g. `(?<a>x)`) against the UCD `ID_Start`/`ID_Continue`
+  binary-search tables — not a simplified ASCII-only approximation.
+- `fill_unicode_property` (regexp.c:369) has a small LRU-less cache
+  (`prop_cache`, 64 entries) so repeated `\p{...}` escapes for the same
+  property across one compile don't redo the UCD range union each time —
+  cache is compile-scoped in practice since it's a `static` file-scope
+  array that just grows across the process lifetime (see
+  `docs/IMPROVEMENTS.md` for the thread-safety implication).
+
+## Parser (regexp.c:1086–1276)
+
+Standard precedence-climbing recursive descent, four levels:
+
+```
+parse_alt        ::= parse_concat ('|' parse_alt)?              -- alternation, right-recursive
+parse_concat      ::= parse_quantifier+                          -- implicit sequencing
+parse_quantifier   ::= parse_primary ('*'|'+'|'?'|'{m,n}') '?'?  -- '?' suffix = lazy
+parse_primary      ::= literal | class | ^ | $ | \b | \B | backref
+                      | ( ... ) | (?: ... ) | (?<name> ... )
+                      | (?= ... ) | (?! ... ) | (?<= ... ) | (?<! ... )
+                      | (?ims-ims: ... )
+```
+
+`parse_concat` and `parse_alt` build **left-leaning / right-leaning linear
+chains** of `AST_CONCAT`/`AST_ALT` nodes for a flat sequence, not balanced
+trees — a pattern with N flat concatenated atoms produces an AST N nodes
+deep. `free_ast`, `validate_group_names`, `validate_backrefs`, and
+`compile_node` all recurse through that chain, so **all four have O(pattern
+length) recursion depth with no iterative fallback** — see
+`docs/IMPROVEMENTS.md` P0 findings; this is a real stack-overflow DoS on
+long patterns, confirmed via ASan, not a style concern.
+
+Group numbering happens during parsing, not compilation:
+`parse_primary`'s group case (regexp.c:1152) does
+`node->id = ++lexer->prog->group_count` immediately, so group numbers are
+assigned in the order groups' **opening parens** appear in the source —
+standard ECMAScript numbering.
+
+## Compiler (`compile_node`, regexp.c:1286)
+
+One switch over `ASTNode.type`, walked once, emitting directly into
+`prog->code[]` via `emit()` (regexp.c:1280). A few things worth knowing
+before you touch this:
+
+- **Quantifiers compile to a counter loop, not unrolled repetition.**
+  `AST_QUANTIFIER` (regexp.c:1369) emits `OP_INIT_COUNTER` /
+  `OP_CHECK_COUNTER` / body / `OP_INC_COUNTER` / `OP_JMP` back to the
+  check. `OP_CHECK_COUNTER` carries `min`/`max`/`exit_pc` and a `lazy` bit,
+  and the VM's handling of it (regexp.c:1760) is where greedy-vs-lazy
+  actually branches: greedy pushes the "give up and exit" thread onto the
+  backtrack stack and continues into the body first; lazy does the
+  opposite. Each quantifier gets its own counter slot
+  (`prog->counter_count++`) — this is the `MAX_COUNTERS` = 16 resource this
+  repo's `docs/IMPROVEMENTS.md` flags as unbounded.
+- **Lookaround compiles to an out-of-line subroutine plus a jump around
+  it.** `AST_LOOKAHEAD`/`AST_LOOKBEHIND` (regexp.c:1342) emit an
+  unconditional `OP_JMP` past the lookaround body, compile the body inline
+  right after the jump (so it's reachable by PC but not by fallthrough),
+  terminate it with `OP_MATCH`, then patch the jump target and emit
+  `OP_LOOKAHEAD`/`OP_LOOKBEHIND` (whose `arg1` is the body's start PC) at
+  the point where control actually flows. At runtime, `OP_LOOKAHEAD` etc.
+  (regexp.c:1720) don't jump to that PC at all — they make a **fresh
+  recursive call to `vm_execute_internal`** starting at that PC, with a
+  copy of the current captures, and only splice the captures back in on
+  success. This is why lookaround is a real recursive call (C stack, not
+  the VM's own thread stack) — deeply nested lookarounds cost C stack
+  frames.
+- **Lookbehind reuses the same compiler in reverse (`rtl=true`).**
+  `compile_node`'s `rtl` parameter (regexp.c:1286) flips `AST_CONCAT`'s
+  emission order and `AST_GROUP`'s save-instruction order, so the *same*
+  AST for the lookbehind body compiles into bytecode that matches
+  right-to-left. The VM's `step` parameter (`vm_execute_internal`'s 2nd-to-
+  last-but-one arg, +1 or -1) then walks `sp` backward instead of forward
+  for `OP_CHAR`/`OP_CLASS`/backreference matching — every one of those
+  opcode handlers in the VM has a `step > 0` / `else` branch pair
+  (regexp.c:1517 onward) implementing forward vs. backward matching
+  logic side by side. If you fix a bug in one branch, check whether the
+  mirror branch has the same bug — several of `docs/IMPROVEMENTS.md`'s
+  findings are exactly this (a bounds check present on one side, missing
+  on the other).
+- **Backreferences resolve group *numbers* at compile time even for named
+  backrefs.** `AST_NAMED_BACKREF` (regexp.c:1294) looks up the name against
+  `prog->group_names[]` at compile time and emits a plain `OP_BACKREF`
+  with the resolved numeric id — `OP_NAMED_BACKREF` exists as an opcode and
+  has VM support (regexp.c:1627, the `inst.op == OP_NAMED_BACKREF` branch
+  re-resolves by name at *runtime* to handle the "duplicate group name
+  across mutually-exclusive alternation branches" ES2025 case) but is
+  never actually emitted by the compiler — `AST_NAMED_BACKREF` always
+  emits `OP_BACKREF`. That runtime-resolution VM code path is currently
+  dead; worth knowing before assuming `OP_NAMED_BACKREF` is reachable.
+
+### Opcodes (`include/regexp.h:22`)
+
+| Opcode | Meaning |
+|---|---|
+| `OP_CHAR`, `OP_CLASS` | match one code point (literal / class), advance `sp` |
+| `OP_SPLIT` | push one branch onto the backtrack stack, continue into the other (alternation) |
+| `OP_JMP` | unconditional jump |
+| `OP_SAVE` | record `sp` into `captures[arg1]` (group open/close, and 0/1 for the whole match) |
+| `OP_LOOKAHEAD`/`OP_NEG_LOOKAHEAD`/`OP_LOOKBEHIND`/`OP_NEG_LOOKBEHIND` | recursive sub-match, no `sp` consumption on success |
+| `OP_MATCH` | success (top-level or lookaround-subroutine) |
+| `OP_INIT_COUNTER`/`OP_INC_COUNTER`/`OP_CHECK_COUNTER` | bounded-repetition loop control |
+| `OP_ASSERT_START`/`OP_ASSERT_END` | `^`/`$` (multiline-aware) |
+| `OP_BACKREF`/`OP_NAMED_BACKREF` | match previously captured text |
+| `OP_WORD_BOUNDARY`/`OP_NON_WORD_BOUNDARY` | `\b`/`\B` |
+| `OP_CLEAR_CAPTURES` | **defined, VM-implemented, never emitted by the compiler** — see `docs/IMPROVEMENTS.md`; this is the missing piece behind the "stale captures from earlier alternation branch survive a later iteration" bug |
+
+## VM (`vm_execute_internal`, regexp.c:1496)
+
+A backtracking interpreter with an explicit thread stack (not the C call
+stack) plus a memoizing fail-cache:
+
+```c
+typedef struct {
+    int pc; const uint16_t* sp;
+    const uint16_t* captures[MAX_GROUPS * 2];
+    int counters[MAX_COUNTERS];
+    const uint16_t* counter_sp[MAX_COUNTERS];
+} Thread;
+```
+
+- `Thread stack[512]` (regexp.c:1497) is the backtrack stack — every
+  `OP_SPLIT` and every "give up on this quantifier iteration" push a full
+  `Thread` (which is itself several KB, dominated by
+  `captures[MAX_GROUPS*2]` = 510 pointers). **This is a fixed-size array
+  with no overflow check** — see `docs/IMPROVEMENTS.md`.
+- `fail_cache[CACHE_SIZE]` (`CACHE_SIZE` = 8192, regexp.h:11) is the ReDoS
+  mitigation: before running a popped thread, `hash_state` (regexp.c:1490)
+  hashes `(pc, sp, counters[])` and checks whether that exact state was
+  already tried and failed on *this* `vm_execute_internal` invocation; if
+  so, the thread is dropped without re-running. This is what keeps classic
+  catastrophic-backtracking patterns like `(a+)+$` fast in practice (see
+  `docs/IMPROVEMENTS.md`'s "positive finding" — this genuinely works for
+  the common cases). It's allocated fresh per call, including per
+  recursive lookaround call, so it does **not** protect across a
+  lookaround boundary — a quantifier *containing* a lookaround that itself
+  contains a quantifier gets a fresh, uncorrelated cache for the inner
+  call each time the outer one is retried.
+- Each opcode handler is a big `if`/`else if` chain (not a jump table /
+  `switch`) inside the innermost `while (true)` loop (regexp.c:1516
+  onward) — this is the hot loop; see `docs/IMPROVEMENTS.md`'s performance
+  section for the `switch` vs `if`-chain tradeoff here.
+- `OP_CHAR`/`OP_CLASS`/backreference matching each have a `step > 0` branch
+  (forward, used for normal matching and lookahead) and a `step <= 0`
+  branch (backward, used for lookbehind) that independently reimplement
+  surrogate-pair decoding, case-folding, and bounds checks. They are *not*
+  shared helper functions — this duplication is the root cause of several
+  "bug fixed on one side, not the mirror side" findings.
+
+`vm_get_indices` (regexp.c:1790) is the only other public entry point —
+it converts the VM's raw `const uint16_t*` capture pointers back into
+integer offsets relative to `original_text`, which is what
+`regex_exec` (`src/regex_wasm.c:132`) calls after a successful match.
+
+## Unicode data (`include/ucd.h`, `scripts/generate_ucd.py`)
+
+`ucd.h` is fully generated, ~40k lines, and must never be hand-edited.
+`scripts/generate_ucd.py` (regenerate with
+`python3 scripts/generate_ucd.py > include/ucd.h`) pulls straight from
+unicode.org (`UNICODE_VERSION` at the top of the script; results are cached
+under `.ucd_cache/`, gitignored) and emits, per Unicode property, a sorted
+`UCDRange[]` array plus a linear `UCD_PROPERTIES[]` table with a
+linear-scan `lookup_unicode_property(name)` (property count is small — tens
+of properties — so linear scan is fine; it's the *ranges within* a property
+that are binary-searched, via `rx_cp_in_ucd` in regexp.c and the inline
+lookup in `ucd.h` itself). Also generated: case-folding pairs
+(`UCD_CASE_FOLD[]`, binary-searched by `unicode_casefold`), simple upper/
+lowercase mappings, combining-class/decomposition/composition-exclusion
+tables (present in `ucd.h` but currently **unused** by `regexp.c` — no
+normalization step exists in the engine; see `docs/IMPROVEMENTS.md`), and
+special-casing data.
+
+## WASM shim (`src/regex_wasm.c`)
+
+Thin opaque-handle wrapper: `RegexHandle` bundles a `Program` (embedded by
+value — this is where that ~2MB comes from per handle) with a separately
+`malloc`'d `int32_t* captures` buffer sized to `(group_count+1)*2`. All
+state (the last compile error, the current handle's captures) is accessed
+through the handle or a single `static g_last_error` buffer — there's
+**no thread-local isolation**, matching the fact that a WASM module
+instance is single-threaded by default; don't assume this is safe to call
+from multiple Web Workers sharing one instantiated module. `regex_exec`
+(regexp.c:132) is also where the **global (non-sticky) search loop**
+lives — it's the shim, not the engine core, that scans start offsets
+looking for the first match, advancing by code point under `/u`/`/v` so a
+surrogate pair is never split mid-scan.

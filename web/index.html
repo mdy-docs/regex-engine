@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>regex-engine — WASM playground</title>
+<meta name="description" content="Live playground for a standalone ECMAScript-flavored regex engine, compiled to WebAssembly.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>regex-engine <span class="sub">WASM playground</span></h1>
+  <p class="tagline">
+    A standalone C regex engine (ECMAScript-flavored: named groups, lookaround,
+    <code>\p{&#8230;}</code> Unicode properties, <code>/u</code>/<code>/v</code> mode)
+    running <strong>as compiled WebAssembly, in your browser</strong> — no server involved.
+    <a href="https://github.com/mdy-docs/regex-engine" id="repo-link">Source on GitHub</a>
+  </p>
+</header>
+
+<main>
+  <section class="panel" aria-label="Pattern input">
+    <div class="pattern-row">
+      <span class="slash">/</span>
+      <input id="pattern" type="text" spellcheck="false" autocomplete="off"
+             value="(\d{4})-(\d{2})-(\d{2})" aria-label="Regular expression pattern">
+      <span class="slash">/</span>
+      <span id="flags-display" class="flags-display" aria-hidden="true"></span>
+    </div>
+
+    <fieldset class="flags">
+      <legend>Flags</legend>
+      <label title="Global — find all matches, not just the first"><input type="checkbox" data-flag="g" checked> g <small>global</small></label>
+      <label title="Ignore case"><input type="checkbox" data-flag="i"> i <small>ignoreCase</small></label>
+      <label title="^ and $ match at line boundaries too"><input type="checkbox" data-flag="m"> m <small>multiline</small></label>
+      <label title=". also matches line terminators"><input type="checkbox" data-flag="s"> s <small>dotAll</small></label>
+      <label title="Unicode mode: code-point aware, enables \\p{...}"><input type="checkbox" data-flag="u"> u <small>unicode</small></label>
+      <label title="Unicode Sets mode (ES2024): superset of u, enables class set operations"><input type="checkbox" data-flag="v"> v <small>unicodeSets</small></label>
+      <label title="Sticky — anchor at lastIndex only"><input type="checkbox" data-flag="y"> y <small>sticky</small></label>
+      <label title="Generate match indices (d flag) — offsets are always shown below regardless"><input type="checkbox" data-flag="d"> d <small>hasIndices</small></label>
+    </fieldset>
+
+    <label class="subject-label" for="subject">Subject text</label>
+    <textarea id="subject" spellcheck="false" rows="4">Order #1057 shipped on 2026-07-15, invoiced 2026-07-17.</textarea>
+
+    <div class="presets">
+      <label for="presets">Examples</label>
+      <select id="presets">
+        <option value="">— pick an example —</option>
+      </select>
+    </div>
+  </section>
+
+  <section class="panel" aria-label="Results">
+    <div id="status" class="status" role="status"></div>
+    <div id="highlighted" class="highlighted" aria-label="Subject text with matches highlighted"></div>
+    <div id="matches"></div>
+  </section>
+</main>
+
+<footer>
+  <p>
+    This page loads the exact <code>src/regexp.c</code> / <code>src/regex_wasm.c</code>
+    compiled by <code>make wasm</code> in this repo — nothing here is reimplemented in JS.
+    The compiled <code>Program</code> struct and its backtracking VM run entirely inside
+    the WASM sandbox; this page only marshals UTF-16 buffers in and capture offsets out.
+  </p>
+  <p>
+    <strong>Known limitations:</strong> this engine has a few confirmed correctness and
+    memory-safety issues (deeply nested lookaround can crash the matcher; a couple of
+    other edge cases) — see
+    <a href="https://github.com/mdy-docs/regex-engine/blob/main/docs/IMPROVEMENTS.md">docs/IMPROVEMENTS.md</a>
+    for the full list with reproductions. If a pattern below reports an engine crash, that's
+    one of those, not a bug in this page — the WASM instance is automatically reloaded so you
+    can keep experimenting.
+  </p>
+</footer>
+
+<script src="./regex-engine.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

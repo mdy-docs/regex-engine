@@ -3,3 +3,5 @@ test/smoke
 test/smoke.dSYM/
 *.o
 .ucd_cache/
+web/regex-engine.js
+web/regex-engine.wasm
