@@ -584,8 +584,8 @@ int main(void) {
     {
         /* The 255 cap was also masking a second bug in the same branch:
          * non-/u `.` never excluded the LineTerminators U+2028/U+2029
-         * (both unreachable under the cap). Node: /./.test(' ') is
-         * false, /./s.test(' ') is true. */
+         * (both unreachable under the cap). Node: /./.test('\u2028') is
+         * false, /./s.test('\u2028') is true. */
         uint16_t* pattern = to_utf16(".");
         uintptr_t h = regex_compile(pattern, 0, 0);
         uint16_t ls[] = { 0x2028 };
@@ -769,6 +769,55 @@ int main(void) {
         check(m2 && caps2[2] == -1 && caps2[3] == -1, "lookahead capture in atom: cleared by final iteration");
         free(pattern);
         regex_free(h);
+    }
+
+    /* Silent-failure spots (docs/IMPROVEMENTS.md #1.9): unknown \p{...}
+     * names silently compiled to an empty class (so \p{Bogus} never matched
+     * and \P{Bogus} matched EVERYTHING, where Node raises SyntaxError for
+     * both), and capture-group names silently truncated to 31 UTF-8 bytes
+     * (turning two long names distinct only past byte 31 into a spurious
+     * "Duplicate capture group name" error). Both now fail loudly. */
+    {
+        uint16_t* p1 = to_utf16("\\p{Bogus}");
+        uintptr_t h1 = regex_compile(p1, 0, regex_flag_bit('u'));
+        check(h1 == 0 && strstr(regex_last_error(), "Invalid property name") != NULL,
+              "\\p{Bogus}/u is a SyntaxError (was: silently-empty class)");
+        if (h1) regex_free(h1);
+        free(p1);
+
+        uint16_t* p2 = to_utf16("\\P{Bogus}");
+        uintptr_t h2 = regex_compile(p2, 0, regex_flag_bit('u'));
+        check(h2 == 0, "\\P{Bogus}/u is a SyntaxError (was: matched everything)");
+        if (h2) regex_free(h2);
+        free(p2);
+
+        /* A known property must still resolve afterward -- rejected names
+         * must not have been cached as (empty) results. */
+        uint16_t* p3 = to_utf16("\\p{L}");
+        uintptr_t h3 = regex_compile(p3, 0, regex_flag_bit('u'));
+        uint16_t text[] = { 'a' };
+        check(h3 != 0 && regex_exec(h3, text, 1, 0), "\\p{L} still resolves after a rejected name (cache not poisoned)");
+        if (h3) regex_free(h3);
+        free(p3);
+    }
+    {
+        /* 40-char name: engine limit (31 UTF-8 bytes + NUL), reported
+         * loudly. A deliberate deviation from the spec, which has no name
+         * length limit -- same nature as the MAX_GROUPS/MAX_CLASSES caps. */
+        uint16_t* plong = to_utf16("(?<abcdefghijklmnopqrstuvwxyz0123456789abcd>x)");
+        uintptr_t hlong = regex_compile(plong, 0, 0);
+        check(hlong == 0 && strstr(regex_last_error(), "name exceeds maximum length") != NULL,
+              "40-char group name is a clean resource-limit error (was: silent truncation)");
+        if (hlong) regex_free(hlong);
+        free(plong);
+
+        /* Exactly at the limit: 31 chars, including \k<...> resolution. */
+        uint16_t* pfit = to_utf16("(?<abcdefghijklmnopqrstuvwxyz01234>x)\\k<abcdefghijklmnopqrstuvwxyz01234>");
+        uintptr_t hfit = regex_compile(pfit, 0, 0);
+        uint16_t xx[] = { 'x', 'x' };
+        check(hfit != 0 && regex_exec(hfit, xx, 2, 0), "31-char group name (at the limit) still works, incl. \\k backref");
+        if (hfit) regex_free(hfit);
+        free(pfit);
     }
 
     if (failures == 0) {

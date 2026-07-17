@@ -39,7 +39,7 @@ predictably, along the mapping `docs/ARCHITECTURE.md`'s intro describes.
 | 1.6 | Backreference bounds only validated under `/u` — `\999` OOB-reads in Annex B mode | P1 — OOB read | ✅ ASan — **FIXED** |
 | 1.7 | Non-unicode `.`/`\D`/`\W`/`\S` wrongly capped at codepoint 255 instead of 0xFFFF | P1 — wrong results | ✅ diffed vs Node — **FIXED** |
 | 1.8 | `OP_CLEAR_CAPTURES` defined + VM-implemented but never emitted — stale captures leak across alternation | P2 — wrong results | ✅ diffed vs Node — **FIXED** |
-| 1.9 | Assorted silent-truncation spots | P3 — minor | inspection |
+| 1.9 | Assorted silent-truncation spots | P3 — minor | inspection — **FIXED** |
 
 Sections 2–5 below cover performance, testing, and code-quality findings
 that aren't safety bugs but are worth knowing.
@@ -656,7 +656,7 @@ and `.`'s `max_cp`. The addition: **lifting the cap on `.` exposed a
 second, previously-masked bug in the same branch** — non-unicode `.` never
 excluded the LineTerminators U+2028/U+2029 (only the `/u` branch did),
 which was unobservable while both were above the 255 cap but wrong the
-moment the cap rose (Node: `/./.test(' ')` is `false`, no flags).
+moment the cap rose (Node: `/./.test('\u2028')` is `false`, no flags).
 The two branches are now collapsed into one that always carves out
 2028–2029, differing only in `max_cp`. Deliberately *not* changed, per
 this finding's own "don't pattern-match blindly" warning: the
@@ -723,7 +723,7 @@ groups were numbered by *closing* paren rather than opening paren — see
 "Fixed since this analysis" above; fixed separately, and jsvm2 upstream
 has it too. Permanent regression coverage for both in `test/smoke.c`.
 
-### 1.9 [P3] Minor / silent-truncation spots (inspection only, not independently repro'd)
+### 1.9 [P3] Minor / silent-truncation spots (inspection only, not independently repro'd) — **FIXED**
 
 - `rx_name_append_utf8` (`re_lexer.c:186`) silently stops appending past 31
   bytes rather than erroring — an extremely long capture-group name
@@ -741,6 +741,54 @@ has it too. Permanent regression coverage for both in `test/smoke.c`.
   from multiple threads natively (WASM is single-threaded by default so
   this is currently moot there, but would bite a native multi-threaded
   embedder).
+
+**Fixed** — and implementing it turned up a worse, unlisted silent-failure
+bug in the same function the second bullet points at:
+
+- **Group-name truncation now fails loudly** (`InternalError: capture
+  group name exceeds maximum length`; 31 UTF-8 bytes + NUL is the limit,
+  which the spec doesn't have — a deliberate engine limit of the same
+  nature as `MAX_GROUPS`). The truncation wasn't as cosmetic as this
+  finding assumed: two names identical in their first 31 bytes collided
+  into a **spurious "Duplicate capture group name" error** (Node accepts
+  both), and a truncated name would resolve `\k<...>` against the wrong
+  spelling. Verified: 40-char names error cleanly; a 31-char name (exactly
+  at the limit) still compiles and resolves its `\k` backreference.
+- **Unknown `\p{...}` property names were silently accepted as an empty
+  class** — `fill_unicode_property` only ever returned `false` for
+  negate-on-strings, so `\p{Bogus}/u` compiled and never matched, and
+  `\P{Bogus}/u` compiled and **matched everything**, where Node raises
+  `SyntaxError: Invalid property name` for both (confirmed). Now returns
+  `false` for unknown names too — both lexer call sites already report
+  that as `Invalid property name` — and rejected names are **not cached**,
+  so a stream of distinct bogus names can no longer fill the cache's 64
+  slots with useless entries (which would have permanently disabled the
+  caching speedup for the rest of the process).
+- **Over-long property-of-strings sequences are skipped, not truncated**:
+  the `cps[16]` copy in `fill_unicode_property` used to clamp a longer
+  sequence to its first 16 code points, which would wrongly *match the
+  prefix*; it now skips such a sequence whole. Moot with current data (the
+  longest sequence in the generated `ucd.h` is 10) — hardening for a
+  future Unicode release, not a behavior change today.
+- **`prop_cache` itself is left as-is deliberately**, now with the
+  constraint documented at the definition: no eviction (65th+ distinct
+  property loses only the speedup) and no thread-safety (fine under WASM
+  and single-threaded native use; a multi-threaded native embedder must
+  serialize `regex_compile` itself). Making it per-`Program` would cost
+  ~64 `CharClass` copies of space per compiled pattern; locking would add
+  a dependency the engine otherwise doesn't have — neither is warranted
+  for a P3 with a documented workaround.
+
+**Residual deviation observed while verifying (not new, not fixed):** the
+`\p{...}` parser discards everything before an `=`, so `\p{Script=Greek}`,
+`\p{Foo=Greek}`, and bare `\p{Greek}` are all treated as `Greek` — real
+engines require the `Script=`/`sc=` key for script values and reject bare
+`\p{Greek}` (confirmed in Node), and would reject a bogus key. This engine
+is *more permissive* than spec here (never wrongly rejects, never wrongly
+matches a wrong class); tightening it is a separate spec-compliance item.
+
+Verified under ASan+UBSan against Node for every case above; permanent
+regression coverage in `test/smoke.c`.
 
 ---
 

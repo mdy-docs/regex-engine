@@ -203,16 +203,23 @@ static int64_t rx_idname_cp(const uint16_t* src, int* pos) {
     return c;
 }
 
-static void rx_name_append_utf8(char* buf, int* len, uint32_t cp) {
-    /* buf is 32 bytes; a well-formed name that fits in 31 UTF-16 units of source
-     * cannot overflow this in practice, but bound it defensively. */
+/* Returns false if appending would overflow buf (32 bytes, so 31 UTF-8
+ * bytes + NUL). Silently truncating instead used to be actively wrong, not
+ * just lossy: two group names identical in their first 31 bytes collided
+ * into a spurious "Duplicate capture group name" error, and a truncated
+ * name would resolve \k<...> backreferences against the wrong spelling
+ * (docs/IMPROVEMENTS.md #1.9). The spec puts no length limit on group
+ * names, so rejecting long ones is an engine limit like MAX_GROUPS -- the
+ * caller reports it as such, loudly. */
+static bool rx_name_append_utf8(char* buf, int* len, uint32_t cp) {
     char tmp[4]; int n;
     if (cp < 0x80) { tmp[0] = (char)cp; n = 1; }
     else if (cp < 0x800) { tmp[0] = (char)(0xC0 | (cp >> 6)); tmp[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
     else if (cp < 0x10000) { tmp[0] = (char)(0xE0 | (cp >> 12)); tmp[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); tmp[2] = (char)(0x80 | (cp & 0x3F)); n = 3; }
     else { tmp[0] = (char)(0xF0 | (cp >> 18)); tmp[1] = (char)(0x80 | ((cp >> 12) & 0x3F)); tmp[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); tmp[3] = (char)(0x80 | (cp & 0x3F)); n = 4; }
-    if (*len + n >= 32) return;
+    if (*len + n >= 32) return false;
     for (int i = 0; i < n; i++) buf[(*len)++] = tmp[i];
+    return true;
 }
 
 /* Parse a RegExpIdentifierName from lexer->src, starting just past the opening
@@ -239,7 +246,10 @@ static bool parse_group_name(Lexer* lexer, char* out) {
             lexer->prog->error = "SyntaxError: Invalid capture group name";
             return false;
         }
-        rx_name_append_utf8(out, &len, (uint32_t)cp);
+        if (!rx_name_append_utf8(out, &len, (uint32_t)cp)) {
+            lexer->prog->error = "InternalError: capture group name exceeds maximum length";
+            return false;
+        }
         first = false;
     }
     if (first) { /* empty name */
@@ -352,6 +362,14 @@ static void fill_builtin_class(CharClass* cls, char type, bool unicode) {
     }
 }
 
+/* Process-lifetime cache of expanded \p{...} classes, keyed by property
+ * name. Deliberately simple, with two documented consequences
+ * (docs/IMPROVEMENTS.md #1.9): it never evicts (the 65th+ distinct
+ * property in a process just loses the caching speedup -- results stay
+ * correct), and being file-scope static it is NOT thread-safe -- fine for
+ * WASM (single-threaded) and single-threaded native embedders, but a
+ * native embedder compiling patterns from multiple threads concurrently
+ * must add its own serialization around regex_compile. */
 #define MAX_PROP_CACHE 64
 static struct {
     char name[64];
@@ -359,13 +377,17 @@ static struct {
 } prop_cache[MAX_PROP_CACHE];
 static int prop_cache_count = 0;
 
-/* Returns false iff `negate` was requested on a "property of strings" (e.g.
- * \P{RGI_Emoji_Flag_Sequence}) -- negating a set that contains multi-
- * codepoint strings has no well-defined single-codepoint complement, and
- * real engines reject it as a SyntaxError (confirmed: `\P{Basic_Emoji}` and
- * `[\P{Basic_Emoji}]` both fail to compile in a spec-compliant engine, not
- * just the already-handled `[^\p{Basic_Emoji}]` negated-class case). Callers
- * must check this and set prog->error accordingly. */
+/* Returns false iff the property name is unknown, or `negate` was requested
+ * on a "property of strings" (e.g. \P{RGI_Emoji_Flag_Sequence}) -- negating
+ * a set that contains multi-codepoint strings has no well-defined single-
+ * codepoint complement, and real engines reject it as a SyntaxError
+ * (confirmed: `\P{Basic_Emoji}` and `[\P{Basic_Emoji}]` both fail to
+ * compile in a spec-compliant engine, not just the already-handled
+ * `[^\p{Basic_Emoji}]` negated-class case). Unknown names used to be
+ * silently accepted as an empty class -- so `\p{Bogus}` never matched and
+ * `\P{Bogus}` matched everything, where real engines raise SyntaxError:
+ * Invalid property name for both (docs/IMPROVEMENTS.md #1.9). Callers must
+ * check this and set prog->error accordingly. */
 static bool fill_unicode_property(CharClass* cls, const char* prop, bool negate) {
     CharClass temp = {0};
     
@@ -450,23 +472,32 @@ static bool fill_unicode_property(CharClass* cls, const char* prop, bool negate)
         else if (strcmp(prop, "Cn") == 0) long_prop = "Unassigned";
 
         const UCDProperty* ucd_prop = lookup_unicode_property(long_prop);
-        if (ucd_prop) {
-            for (int i = 0; i < ucd_prop->count; i++) {
-                add_range(&temp, ucd_prop->ranges[i].start, ucd_prop->ranges[i].end);
-            }
-            /* "Properties of strings" (RGI_Emoji, RGI_Emoji_Flag_Sequence,
-             * Basic_Emoji, etc. -- /v mode only) carry multi-codepoint
-             * sequences alongside or instead of single-codepoint ranges. */
-            for (int i = 0; i < ucd_prop->sequence_count && temp.string_count < 128; i++) {
-                const UCDStringSequence* seq = &ucd_prop->sequences[i];
-                StringSequence* out = &temp.strings[temp.string_count++];
-                int len = seq->length < 16 ? seq->length : 16;
-                for (int k = 0; k < len; k++) out->cps[k] = seq->cps[k];
-                out->length = len;
-            }
+        /* Unknown name: fail (and don't cache) rather than fall through
+         * with an empty class -- see the contract comment above. Returning
+         * before the cache write also stops a stream of distinct bogus
+         * names from filling the cache's 64 slots with useless entries. */
+        if (!ucd_prop) return false;
+        for (int i = 0; i < ucd_prop->count; i++) {
+            add_range(&temp, ucd_prop->ranges[i].start, ucd_prop->ranges[i].end);
+        }
+        /* "Properties of strings" (RGI_Emoji, RGI_Emoji_Flag_Sequence,
+         * Basic_Emoji, etc. -- /v mode only) carry multi-codepoint
+         * sequences alongside or instead of single-codepoint ranges. A
+         * sequence longer than cps[16] is skipped whole rather than
+         * truncated: a prefix-truncated sequence would wrongly MATCH the
+         * prefix, where skipping merely fails to match that one sequence
+         * (moot today -- the longest in the generated ucd.h is 10 -- but
+         * the guard shouldn't silently corrupt if a future Unicode
+         * release exceeds it). */
+        for (int i = 0; i < ucd_prop->sequence_count && temp.string_count < 128; i++) {
+            const UCDStringSequence* seq = &ucd_prop->sequences[i];
+            if (seq->length > 16) continue;
+            StringSequence* out = &temp.strings[temp.string_count++];
+            for (int k = 0; k < seq->length; k++) out->cps[k] = seq->cps[k];
+            out->length = seq->length;
         }
     }
-        
+
         if (prop_cache_count < MAX_PROP_CACHE) {
             strncpy(prop_cache[prop_cache_count].name, prop, 63);
             prop_cache[prop_cache_count].cls = temp;
