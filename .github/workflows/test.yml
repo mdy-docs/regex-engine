@@ -30,10 +30,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+      # setup-emsdk must run BEFORE setup-node: both prepend to GITHUB_PATH
+      # and later entries win, so this order makes `node` resolve to
+      # setup-node's install rather than emsdk's bundled binary (which has
+      # shipped without the exec bit -- "make: node: Permission denied").
+      # emcc is unaffected either way; it locates its own node via EM_CONFIG,
+      # not PATH.
       - uses: mymindstorm/setup-emsdk@v14
         with:
           version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
       - run: make test-wasm
