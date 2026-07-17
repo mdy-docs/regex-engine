@@ -153,6 +153,17 @@ script_cps = {}  # canonical -> set of code points
 for start, end, name in parse_ranges(UCD_BASE + "Scripts.txt"):
     script_cps.setdefault(sc_canonical.get(name, name), set()).update(range(start, end + 1))
 
+# Per UAX #24, every code point has a Script value; those Scripts.txt does
+# not assign to a specific script get Unknown (alias Zzzz). Scripts.txt
+# lists no Unknown entries, so synthesize it as the complement of every
+# assigned script -- and add it to script_cps *before* the scx computation
+# below so Script_Extensions=Unknown falls out of the same UAX #24 default
+# logic (scx defaults to { sc } for code points with no explicit scx). Real
+# engines accept \p{sc=Unknown}/\p{scx=Unknown}; this engine used to reject
+# them (docs/CONFORMANCE_GAPS.md #4). Added before the scx loop uses it.
+_assigned_to_script = set().union(*script_cps.values())
+script_cps["Unknown"] = set(range(0, 0x110000)) - _assigned_to_script
+
 string_properties = {}
 
 # 5. Properties of strings: multi-code-point entries become sequences,

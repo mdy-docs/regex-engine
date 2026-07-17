@@ -86,22 +86,7 @@ constants) point directly at the `ucd.h` `UCDStringSequence[]` arrays
 instead of copying. The latter is cleanest but changes the `CharClass`
 ownership model. Weigh against the ~2MB `Program` footprint goal.
 
-## 4. [real] The `Unknown` / `Zzzz` script value
-
-**Fails:** `property-escapes/special-property-value-Script_Extensions-Unknown.js`.
-
-**What's wrong:** `\p{sc=Unknown}` / `\p{sc=Zzzz}` name the script of
-codepoints with no assigned script; Node accepts them, this engine rejects
-(the generator sees no `Zzzz` in `Scripts.txt`, since unassigned codepoints
-aren't listed).
-
-**Approach:** in `scripts/generate_ucd.py`, synthesize the `Unknown`/`Zzzz`
-script as the complement of every assigned script's codepoints (same
-technique already used for the `Assigned` binary property), and emit it
-under both `SCRIPT` and `SCX` kinds. Small, self-contained generator change
-+ regenerate `ucd.h`.
-
-## 5. [real] `\p{…}` as a character-class range endpoint
+## 4. [real] `\p{…}` as a character-class range endpoint
 
 **Fails:** `property-escapes/character-class-range-start.js`.
 
@@ -115,7 +100,7 @@ specific shape through.
 `\p{…}` too. Narrow, but re-diff the passing class-range tests carefully —
 the guard conditions there are subtle and easy to over-broaden.
 
-## 6. [scope] Match-result object descriptors
+## 5. [scope] Match-result object descriptors
 
 **Fails:** `match-indices/indices-property.js`,
 `match-indices/indices-groups-object.js`, `named-groups/groups-object.js`.
