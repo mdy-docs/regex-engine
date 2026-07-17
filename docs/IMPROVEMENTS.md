@@ -29,6 +29,65 @@ below has a command that reproduces it.
 Sections 2–5 below cover performance, testing, and code-quality findings
 that aren't safety bugs but are worth knowing.
 
+## Fixed since this analysis
+
+Two additional correctness bugs (found in a follow-up pass, same
+verify-before-claiming methodology) have been fixed, each with permanent
+regression coverage added to `test/smoke.c`:
+
+- **Non-`/u` `/i` matching only folded ASCII.** Real JS folds the full BMP
+  even without the `/u` flag (`/ä/i.test('Ä')`, `/стол/i.test('СТОЛ')` are
+  both `true` in Node); this engine's non-unicode ignore-case path only
+  handled `A-Z`/`a-z` at all five call sites that implement it (character-
+  class expansion, `OP_CHAR` forward/backward, backreference forward/
+  backward). Fixed by `annexb_canonicalize` (`src/regexp.c`, next to
+  `apply_case_folding`), which implements ECMA-262's actual non-Unicode
+  `Canonicalize` operation via the generated `UCD_SIMPLE_UPPERCASE` table,
+  including its "don't fold across the ASCII boundary" exception (verified
+  against real JS: `KELVIN SIGN U+212A` doesn't fold to/from `k`/`K`;
+  `LATIN SMALL LETTER LONG S U+017F` doesn't fold to/from `s`/`S`, even
+  though its simple uppercase mapping is literally `S`). Verified correct
+  against **~10,000 real-Node-checked (pattern-codepoint, text-codepoint)
+  pairs** spanning Basic Latin, Latin-1 Supplement, Latin Extended-A/B,
+  Greek, Cyrillic, and Latin Extended Additional — zero mismatches.
+
+- **`/v` mode "properties of strings" (`\p{RGI_Emoji}`, `\p{Basic_Emoji}`,
+  etc.) silently matched nothing.** Root cause turned out to be two
+  layered bugs, not one: (a) `fill_unicode_property` never read
+  `UCDProperty.sequences` at all, so multi-codepoint sequence data was
+  simply discarded; and (b), more fundamentally, **the VM had no matching
+  support for `CharClass.strings` whatsoever** — confirmed by grep, that
+  field was written but never read anywhere in `vm_execute_internal`. This
+  means the pre-existing `\q{...}` character-class string-alternative
+  syntax (a `/v`-mode feature that predates this fix) was *also* silently
+  broken in exactly the same way, not just the Unicode-property case.
+  Fixed by (a) copying `sequences` into `CharClass.strings` in
+  `fill_unicode_property`, and (b) a new `compile_class_with_strings`
+  (`src/regexp.c`, by `compile_node`) that compiles a class containing
+  strings into a real alternation (`OP_SPLIT`/`OP_CHAR`/`OP_JMP` chains,
+  one branch per string, falling back to a plain `OP_CLASS` branch for any
+  ordinary single-codepoint ranges in the same class) instead of inventing
+  a new opcode — this reuses the VM's already-correct backtracking rather
+  than adding a second, independent matching mode to get right. Also fixed:
+  negating a property of strings (`\P{Basic_Emoji}`, `[\P{Basic_Emoji}]`)
+  now correctly fails to compile, matching real engines, instead of
+  silently doing nothing.
+
+  **Residual limitation surfaced by this fix, not introduced by it:**
+  `CharClass.strings` is a fixed `[128]` array (same size `\q{...}` parsing
+  already enforced before this fix). Several real Unicode properties have
+  far more sequences than that — `RGI_Emoji` has 2604, `RGI_Emoji_ZWJ_Sequence`
+  1468, `RGI_Emoji_Modifier_Sequence` 655, `RGI_Emoji_Flag_Sequence` 259,
+  `Basic_Emoji` 207 — so those specific properties now match their first
+  128 sequences (in generation order) rather than silently matching
+  nothing, but still don't match *every* valid sequence. Raising the cap to
+  fit the largest property in full (2604) would add well over 10MB to
+  `Program` (already the dominant cost at ~2MB, per `docs/ARCHITECTURE.md`)
+  for a single class slot — the same fixed-size-vs-unbounded-input tension
+  as finding 1.2 above, not a new problem, and out of scope for this fix to
+  resolve. Worth knowing if a consuming project leans on one of the five
+  large properties named above expecting full coverage.
+
 ---
 
 ## 1. Correctness & memory safety
@@ -333,7 +392,7 @@ not.
 | Pattern | Input | Node | This engine |
 |---|---|---|---|
 | `/x.y/` | `"x€y"` | matches | **no match** |
-| `/\s/` | `" "` | matches | **no match** |
+| `/\s/` | `""` | matches | **no match** |
 | `/\W/` | `"Ā"` | matches | **no match** |
 
 **Fix:** replace the four `255` literals at regexp.c:328(`\D`, already

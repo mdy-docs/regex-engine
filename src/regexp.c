@@ -366,7 +366,14 @@ static struct {
 } prop_cache[MAX_PROP_CACHE];
 static int prop_cache_count = 0;
 
-static void fill_unicode_property(CharClass* cls, const char* prop, bool negate) {
+/* Returns false iff `negate` was requested on a "property of strings" (e.g.
+ * \P{RGI_Emoji_Flag_Sequence}) -- negating a set that contains multi-
+ * codepoint strings has no well-defined single-codepoint complement, and
+ * real engines reject it as a SyntaxError (confirmed: `\P{Basic_Emoji}` and
+ * `[\P{Basic_Emoji}]` both fail to compile in a spec-compliant engine, not
+ * just the already-handled `[^\p{Basic_Emoji}]` negated-class case). Callers
+ * must check this and set prog->error accordingly. */
+static bool fill_unicode_property(CharClass* cls, const char* prop, bool negate) {
     CharClass temp = {0};
     
     bool cached = false;
@@ -454,6 +461,16 @@ static void fill_unicode_property(CharClass* cls, const char* prop, bool negate)
             for (int i = 0; i < ucd_prop->count; i++) {
                 add_range(&temp, ucd_prop->ranges[i].start, ucd_prop->ranges[i].end);
             }
+            /* "Properties of strings" (RGI_Emoji, RGI_Emoji_Flag_Sequence,
+             * Basic_Emoji, etc. -- /v mode only) carry multi-codepoint
+             * sequences alongside or instead of single-codepoint ranges. */
+            for (int i = 0; i < ucd_prop->sequence_count && temp.string_count < 128; i++) {
+                const UCDStringSequence* seq = &ucd_prop->sequences[i];
+                StringSequence* out = &temp.strings[temp.string_count++];
+                int len = seq->length < 16 ? seq->length : 16;
+                for (int k = 0; k < len; k++) out->cps[k] = seq->cps[k];
+                out->length = len;
+            }
         }
     }
         
@@ -465,6 +482,7 @@ static void fill_unicode_property(CharClass* cls, const char* prop, bool negate)
     }
     
     if (negate) {
+        if (temp.string_count > 0) return false;
         uint32_t current = 0;
         for (int i = 0; i < temp.range_count; i++) {
             if (temp.ranges[i].start > current) {
@@ -475,7 +493,35 @@ static void fill_unicode_property(CharClass* cls, const char* prop, bool negate)
         if (current <= 0x10FFFF) add_range(cls, current, 0x10FFFF);
     } else {
         for (int i = 0; i < temp.range_count; i++) add_range(cls, temp.ranges[i].start, temp.ranges[i].end);
+        for (int i = 0; i < temp.string_count && cls->string_count < 128; i++) {
+            cls->strings[cls->string_count++] = temp.strings[i];
+        }
     }
+    return true;
+}
+
+/* Non-unicode-mode (Annex B) per-character canonicalization: fold via the
+ * character's simple uppercase mapping, except when that mapping would cross
+ * from a non-ASCII source into an ASCII target -- real engines skip that
+ * fold specifically to avoid non-ASCII/ASCII cross-contamination (confirmed
+ * against real JS: LATIN SMALL LETTER LONG S U+017F, whose simple uppercase
+ * mapping is 'S', does NOT case-insensitively match 's'/'S'; KELVIN SIGN
+ * U+212A, which has no simple uppercase mapping at all, does not match 'k'/
+ * 'K' either). This is ECMA-262's Canonicalize abstract operation for the
+ * non-Unicode case, expressed with the "simple" (single-code-point) mapping
+ * table -- which is exactly what a *simple* uppercase mapping already is, so
+ * the "if toUppercase(ch) has length != 1, don't fold" spec clause falls out
+ * for free rather than needing separate handling. */
+static uint32_t annexb_canonicalize(uint32_t ch) {
+    int lo = 0, hi = (int)(sizeof(UCD_SIMPLE_UPPERCASE) / sizeof(SimpleCaseMapping)) - 1;
+    uint32_t cu = ch;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (UCD_SIMPLE_UPPERCASE[mid].cp == ch) { cu = UCD_SIMPLE_UPPERCASE[mid].mapping; break; }
+        if (UCD_SIMPLE_UPPERCASE[mid].cp < ch) lo = mid + 1; else hi = mid - 1;
+    }
+    if (ch >= 128 && cu < 128) return ch;
+    return cu;
 }
 
 static void apply_case_folding(CharClass* cls, bool unicode) {
@@ -497,14 +543,28 @@ static void apply_case_folding(CharClass* cls, bool unicode) {
             }
         } while (changed);
     } else {
-        CharClass expanded = *cls;
-        for (int i = 0; i < cls->range_count; i++) {
-            for (uint32_t c = cls->ranges[i].start; c <= cls->ranges[i].end && c <= 127; c++) {
-                if (c >= 'a' && c <= 'z') add_range(&expanded, c - 32, c - 32);
-                else if (c >= 'A' && c <= 'Z') add_range(&expanded, c + 32, c + 32);
+        /* Table-driven, like the unicode branch above -- iterating every
+         * candidate codepoint in a wide range (e.g. non-unicode mode's
+         * 0-0xFFFF space) would be far too slow for a compile-time step.
+         * Skip pairs the ASCII-crossing rule above would reject, so e.g.
+         * 's'/'S' never pull in long-s U+017F and vice versa. */
+        bool changed;
+        do {
+            changed = false;
+            for (size_t i = 0; i < sizeof(UCD_SIMPLE_UPPERCASE)/sizeof(SimpleCaseMapping); i++) {
+                uint32_t from = UCD_SIMPLE_UPPERCASE[i].cp;
+                uint32_t to = UCD_SIMPLE_UPPERCASE[i].mapping;
+                if (from >= 128 && to < 128) continue;
+                bool from_in = false, to_in = false;
+                for (int j = 0; j < cls->range_count; j++) {
+                    if (from >= cls->ranges[j].start && from <= cls->ranges[j].end) from_in = true;
+                    if (to >= cls->ranges[j].start && to <= cls->ranges[j].end) to_in = true;
+                    if (from_in && to_in) break;
+                }
+                if (from_in && !to_in) { if (add_range(cls, to, to)) changed = true; }
+                if (to_in && !from_in) { if (add_range(cls, from, from)) changed = true; }
             }
-        }
-        *cls = expanded;
+        } while (changed);
     }
 }
 
@@ -660,7 +720,10 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                             if (lexer->src[lexer->pos] == '}') lexer->pos++;
                             else lexer->prog->error = "SyntaxError: Unterminated Unicode property escape";
                             
-                            fill_unicode_property(&current_union, val, esc == 'P');
+                            if (!fill_unicode_property(&current_union, val, esc == 'P')) {
+                                lexer->prog->error = "SyntaxError: Invalid property name";
+                                return;
+                            }
                             is_special = true;
                         } else {
                             lexer->prog->error = "SyntaxError: Invalid property escape";
@@ -990,7 +1053,10 @@ static void next_token(Lexer* lexer) {
                         
                         int cid = lexer->prog->class_count++;
             memset(&lexer->prog->classes[cid], 0, sizeof(CharClass)); /* slots are built in place */
-                        fill_unicode_property(&lexer->prog->classes[cid], val, esc == 'P');
+                        if (!fill_unicode_property(&lexer->prog->classes[cid], val, esc == 'P')) {
+                            lexer->prog->error = "SyntaxError: Invalid property name";
+                            return;
+                        }
                         lexer->current = (Token){TOK_CLASS, 0, cid};
                     } else {
                         lexer->prog->error = "SyntaxError: Invalid property escape";
@@ -1283,6 +1349,42 @@ static int emit(Program* prog, RegexOpCode op, int arg1, int arg2, int arg3, int
     return idx;
 }
 
+/* A character class containing multi-codepoint string alternatives (from
+ * \q{...} or a Unicode "property of strings" like \p{RGI_Emoji_Flag_Sequence})
+ * can't be matched by a single OP_CLASS instruction, which only ever tests
+ * one code point against cls->ranges. Compile it instead as an alternation
+ * -- each string in declaration order, then (if the class also has ordinary
+ * single-codepoint ranges) a final OP_CLASS fallback -- reusing the VM's
+ * existing, already-correct OP_SPLIT/backtracking machinery rather than
+ * teaching OP_CLASS a second matching mode. Preferring strings before the
+ * single-codepoint fallback mirrors how the Unicode property data itself is
+ * structured (ranges and sequences are disjoint code point sets in every
+ * property this engine generates); rtl mirrors AST_CONCAT's lookbehind
+ * handling by emitting each string's code points in reverse. */
+static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
+    CharClass* cls = &prog->classes[class_id];
+    int jmp_pcs[128];
+    int jmp_count = 0;
+    for (int i = 0; i < cls->string_count; i++) {
+        bool has_more = (i < cls->string_count - 1) || (cls->range_count > 0);
+        int split = has_more ? emit(prog, OP_SPLIT, 0, 0, 0, 0, false) : -1;
+        if (split != -1) prog->code[split].arg1 = prog->code_count;
+        StringSequence* seq = &cls->strings[i];
+        if (rtl) {
+            for (int k = seq->length - 1; k >= 0; k--) emit(prog, OP_CHAR, seq->cps[k], 0, 0, 0, false);
+        } else {
+            for (int k = 0; k < seq->length; k++) emit(prog, OP_CHAR, seq->cps[k], 0, 0, 0, false);
+        }
+        if (has_more) {
+            jmp_pcs[jmp_count++] = emit(prog, OP_JMP, 0, 0, 0, 0, false);
+            prog->code[split].arg2 = prog->code_count;
+        }
+    }
+    if (cls->range_count > 0) emit(prog, OP_CLASS, class_id, 0, 0, 0, false);
+    int end_pc = prog->code_count;
+    for (int i = 0; i < jmp_count; i++) prog->code[jmp_pcs[i]].arg1 = end_pc;
+}
+
 static void compile_node(ASTNode* node, Program* prog, bool rtl) {
     if (!node) return;
     switch (node->type) {
@@ -1320,7 +1422,10 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
             break;
         }
         case AST_LITERAL: emit(prog, OP_CHAR, node->ch, 0, 0, 0, false); break;
-        case AST_CLASS:   emit(prog, OP_CLASS, node->id, 0, 0, 0, false); break;
+        case AST_CLASS:
+            if (prog->classes[node->id].string_count > 0) compile_class_with_strings(prog, node->id, rtl);
+            else emit(prog, OP_CLASS, node->id, 0, 0, 0, false);
+            break;
         case AST_CONCAT:
             if (rtl) {
                 compile_node(node->right, prog, rtl); compile_node(node->left, prog, rtl);
@@ -1529,8 +1634,8 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                                 inst_cp = unicode_casefold(inst_cp);
                                 match_cp = unicode_casefold(match_cp);
                             } else {
-                                if (inst_cp >= 'A' && inst_cp <= 'Z') inst_cp += 32;
-                                if (match_cp >= 'A' && match_cp <= 'Z') match_cp += 32;
+                                inst_cp = annexb_canonicalize(inst_cp);
+                                match_cp = annexb_canonicalize(match_cp);
                             }
                             if (inst_cp == match_cp) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
                         } else {
@@ -1560,8 +1665,8 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                                 inst_cp = unicode_casefold(inst_cp);
                                 match_cp = unicode_casefold(match_cp);
                             } else {
-                                if (inst_cp >= 'A' && inst_cp <= 'Z') inst_cp += 32;
-                                if (match_cp >= 'A' && match_cp <= 'Z') match_cp += 32;
+                                inst_cp = annexb_canonicalize(inst_cp);
+                                match_cp = annexb_canonicalize(match_cp);
                             }
                             if (inst_cp == match_cp) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
                         } else {
@@ -1658,8 +1763,8 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                                 } else {
                                     cp1 = *temp_sp++;
                                     cp2 = *temp_start++;
-                                    if (cp1 >= 'A' && cp1 <= 'Z') cp1 += 32;
-                                    if (cp2 >= 'A' && cp2 <= 'Z') cp2 += 32;
+                                    cp1 = annexb_canonicalize(cp1);
+                                    cp2 = annexb_canonicalize(cp2);
                                 }
                                 if (cp1 != cp2) { match = false; break; }
                             }
@@ -1685,8 +1790,8 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                                 } else {
                                     cp1 = *(--temp_sp);
                                     cp2 = *(--temp_end);
-                                    if (cp1 >= 'A' && cp1 <= 'Z') cp1 += 32;
-                                    if (cp2 >= 'A' && cp2 <= 'Z') cp2 += 32;
+                                    cp1 = annexb_canonicalize(cp1);
+                                    cp2 = annexb_canonicalize(cp2);
                                 }
                                 if (cp1 != cp2) { match = false; break; }
                             }
