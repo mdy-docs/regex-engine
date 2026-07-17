@@ -137,12 +137,19 @@ int regex_exec(uintptr_t handle, const uint16_t* text, int text_units, int start
     const uint16_t* captures[MAX_GROUPS * 2] = {0};
     int matched = 0;
 
+    /* One context for the whole call, not one per start position -- the
+     * scan loop below re-enters the VM at every offset, and per-position
+     * setup (backtrack stack + fail-cache allocation and initialization)
+     * used to dominate unanchored searches; see regexp.h's VMContext
+     * comment and docs/IMPROVEMENTS.md section 2. */
+    VMContext* ctx = vm_context_new(&h->prog);
+
     if (h->prog.sticky) {
-        matched = vm_execute_internal(&h->prog, 0, 1, text, text_end, text + start_index, captures);
+        matched = vm_execute(&h->prog, ctx, 0, 1, text, text_end, text + start_index, captures);
     } else {
         int is_unicode = h->prog.unicode || h->prog.unicode_sets;
         for (int index = start_index; index <= text_units; ) {
-            matched = vm_execute_internal(&h->prog, 0, 1, text, text_end, text + index, captures);
+            matched = vm_execute(&h->prog, ctx, 0, 1, text, text_end, text + index, captures);
             if (matched) break;
             if (is_unicode && index < text_units &&
                 text[index] >= 0xD800 && text[index] <= 0xDBFF &&
@@ -153,6 +160,7 @@ int regex_exec(uintptr_t handle, const uint16_t* text, int text_units, int start
             }
         }
     }
+    vm_context_free(ctx);
 
     int pair_count = (h->prog.group_count + 1) * 2;
     if (!matched) {

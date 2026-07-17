@@ -66,23 +66,27 @@ typedef struct {
 } Program;
 ```
 
-No `malloc` happens during compilation or matching except the one
+No `malloc` happens during *compilation* except the one
 `malloc(sizeof(Program))` (or `sizeof(RegexHandle)` in the WASM shim) up
 front — `Program` itself is ~2MB of fixed-size arrays, deliberately sized to
 avoid any dynamic growth logic in a component meant to run inside a WASM
-sandbox with no realloc-heavy allocator pressure. `compile_into`'s top
+sandbox with no realloc-heavy allocator pressure. (*Matching* allocates a
+`VMContext` — backtrack stacks, capture arenas, fail caches — once per
+`regex_exec` call, reused across every start position; see the VM section
+below.) `compile_into`'s top
 comment (`re_compiler.c:208`) explains why it *doesn't* zero the whole struct on
 each compile (`= {0}` would touch all ~2MB) — only the bookkeeping counters
 and `group_names` (which is read by name lookups even for slots that were
 never written) get reset.
 
-**The tradeoff:** none of `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS`/
-`MAX_COUNTERS` are enforced — see `docs/IMPROVEMENTS.md` for why that's a
-real, confirmed problem, not a hypothetical one. If you're changing any of
-these constants, grep for the corresponding `_count` field's every
-increment site first (`class_count++`, `++prog->group_count`,
-`counter_count++`, `emit()`'s `code_count++`) — none of them currently
-check against the bound they're indexing into.
+All of `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS`/`MAX_COUNTERS` are
+enforced at their allocation sites (they originally weren't — see
+`docs/IMPROVEMENTS.md` #1.2 for the confirmed corruption that caused). If
+you're changing any of these constants, or adding a new allocation site,
+find the corresponding `_count` field's existing check-before-index
+increment sites first (`alloc_class`, `++prog->group_count`,
+`counter_count++`, `emit()`'s `code_count++`) and follow the same
+pattern — a new unchecked site reintroduces exactly #1.2's bug.
 
 ## Lexer (`re_lexer.c`; `Lexer`/`Token` types in `re_internal.h`)
 
@@ -242,10 +246,21 @@ knowing before you touch this:
 | `OP_WORD_BOUNDARY`/`OP_NON_WORD_BOUNDARY` | `\b`/`\B` |
 | `OP_CLEAR_CAPTURES` | **defined, VM-implemented, never emitted by the compiler** — see `docs/IMPROVEMENTS.md`; this is the missing piece behind the "stale captures from earlier alternation branch survive a later iteration" bug |
 
-## VM (`vm_execute_internal`, `re_vm.c:128`)
+## VM (`vm_run` via `vm_execute`/`VMContext`, `re_vm.c`)
 
 A backtracking interpreter with an explicit thread stack (not the C call
-stack) plus a memoizing fail-cache:
+stack) plus a memoizing fail-cache. All execution scratch lives in a
+`VMContext` (created by the caller once per exec *call*, passed to
+`vm_execute` for every start position tried in that call): one set of
+{backtrack stack, captures arena, fail cache} per lookaround recursion
+depth, allocated lazily on first use at that depth and reused until the
+context is freed. This replaced allocating and initializing those buffers
+inside every VM entry — which an unanchored search performs once per text
+position — worth roughly two orders of magnitude on scan-heavy workloads
+(see `docs/IMPROVEMENTS.md` §2 for measurements). The fail cache is
+logically cleared between entries by a generation counter on each entry
+rather than an 8192-slot reset. `vm_execute_internal` survives as a
+one-shot convenience wrapper (create context, run once, free):
 
 ```c
 typedef struct {
@@ -261,16 +276,20 @@ typedef struct {
   KB and this function's own stack frame balloon to ~2.2MB regardless of
   how many groups the compiled pattern actually has, a real crash risk
   once lookaround's recursion (below) is in the picture — see
-  `docs/IMPROVEMENTS.md` #1.1 for the history. `vm_execute_internal` now
-  allocates one arena per call (`re_vm.c:139`), sized to `cap_pairs =
+  `docs/IMPROVEMENTS.md` #1.1 for the history. Each `VMContext` depth slot
+  holds one arena, sized to `cap_pairs =
   (prog->group_count + 1) * 2` — the pattern's *actual* group count — with
-  one slice per backtrack-stack thread plus one more for `current`, and
-  points every `Thread.captures` into its own slice. The backtrack stack
-  itself (`Thread* stack`, `VM_STACK_CAPACITY` = 512 slots, `re_vm.c:140`)
-  and the fail-cache below are heap-allocated alongside it, not C-stack
-  locals, for the same reason: this function recurses into itself for
-  every `OP_LOOKAHEAD`/`OP_LOOKBEHIND`, so whatever lived on the C stack
-  here used to be paid again at every nesting level. **One consequence
+  one slice per backtrack-stack slot (the in-flight thread's captures live
+  in a separate allocation so arena growth never moves them), and
+  every `Thread.captures` points into its own slice. The backtrack stack
+  starts at `VM_STACK_CAPACITY` (512) slots and **doubles on demand up to
+  `VM_STACK_MAX`** (`vm_grow_stack` rebases each slot's arena pointer
+  after the tandem realloc); a match needing more than `VM_STACK_MAX`
+  entries is abandoned as no-match — the greedy-quantifier loop pushes one
+  backtrack entry per iteration, so this bounds how long a single
+  quantifier run can be, and the pre-growth fixed array with unchecked
+  pushes was a confirmed text-driven heap overflow (see `test/smoke.c`'s
+  100k-run regression tests). **One consequence
   worth knowing before editing this function:** since a plain struct
   assignment now only copies `captures`' *pointer* (aliasing two threads'
   capture state instead of duplicating it), every place that used to push
@@ -278,15 +297,15 @@ typedef struct {
   `OP_SPLIT`, `OP_CHECK_COUNTER`'s two backtrack pushes, and popping the
   next thread off the stack — now goes through a small `thread_copy_state()`
   helper that copies the *data* `.captures` points to explicitly, into the
-  destination thread's own already-assigned slice. Still a fixed-size
-  array with no *overflow* check on `VM_STACK_CAPACITY` itself, though —
-  see `docs/IMPROVEMENTS.md`.
-- `fail_cache` (`CacheEntry`, also heap-allocated per call now,
+  destination thread's own already-assigned slice.
+- `fail_cache` (`CacheEntry`, one per context depth slot,
   `CACHE_SIZE` = 8192, `include/regexp.h:11`) is the ReDoS mitigation:
-  before running a popped thread, `hash_state` (`re_vm.c:105`) hashes
+  before running a popped thread, `hash_state` (power-of-two mask, not a
+  division) hashes
   `(pc, sp, counters[])` and checks whether that exact state was already
-  tried and failed on *this* `vm_execute_internal` invocation; if so, the
-  thread is dropped without re-running. This is what keeps classic
+  tried and failed on *this* VM entry (entries are generation-stamped, so
+  "this entry's" failures never leak into the next start position's); if
+  so, the thread is dropped without re-running. This is what keeps classic
   catastrophic-backtracking patterns like `(a+)+$` fast in practice (see
   `docs/IMPROVEMENTS.md`'s "positive finding" — this genuinely works for
   the common cases). It's allocated fresh per call, including per

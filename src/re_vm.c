@@ -1,10 +1,14 @@
 /* Virtual machine: backtracking interpreter over Program.code, with an
  * explicit thread stack (not the C call stack -- except for lookaround,
- * which recurses via a genuine nested call to vm_execute_internal) and a
- * memoizing fail-cache that's the main defense against classic
- * catastrophic-backtracking patterns. See docs/ARCHITECTURE.md's "VM"
+ * which recurses via a genuine nested call to vm_run) and a memoizing
+ * fail-cache that's the main defense against classic
+ * catastrophic-backtracking patterns. All execution scratch lives in a
+ * caller-provided VMContext (one per exec call, reused across every start
+ * position and lookaround depth -- see regexp.h and docs/IMPROVEMENTS.md
+ * section 2 for why: per-position setup used to dominate unanchored
+ * searches by two orders of magnitude). See docs/ARCHITECTURE.md's "VM"
  * section for the full picture, and docs/IMPROVEMENTS.md #1.1 for the
- * history here: that lookaround recursion used to be this engine's most
+ * history here: lookaround recursion used to be this engine's most
  * serious known crash risk (a fixed ~2.2MB C-stack frame per call,
  * regardless of the pattern's actual group count, crashed the process at
  * only 3 levels of nesting) until the backtrack stack, fail-cache, and
@@ -82,7 +86,27 @@ static uint32_t annexb_canonicalize(uint32_t ch) {
     return cu;
 }
 
-typedef struct { int pc; const uint16_t* sp; } CacheEntry;
+/* `gen` implements O(1) logical clearing: an entry counts as present only
+ * if its gen matches the owning VMDepth's current generation, so "clearing"
+ * the 8192-entry cache between VM entries is one integer increment instead
+ * of an 8192-iteration reset (docs/IMPROVEMENTS.md section 2 -- that reset
+ * used to run once per *start position* of an unanchored search). */
+typedef struct { int pc; const uint16_t* sp; unsigned int gen; } CacheEntry;
+
+/* Binary search over CharClass.ranges -- add_range (re_lexer.c) maintains
+ * them sorted and coalesced, so this is a drop-in for the old linear scan
+ * (docs/IMPROVEMENTS.md section 2); \p{L} alone is ~700 ranges, paid per
+ * text position. */
+static inline bool class_contains(const CharClass* cls, uint32_t cp) {
+    int lo = 0, hi = cls->range_count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (cp < cls->ranges[mid].start) hi = mid - 1;
+        else if (cp > cls->ranges[mid].end) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
 
 /* captures used to be a fixed MAX_GROUPS*2 (510-pointer) array embedded
  * directly in this struct -- and this struct was itself embedded 512 times
@@ -110,7 +134,9 @@ typedef struct {
 static inline unsigned int hash_state(const Thread* t, int counter_count) {
     unsigned int h = (unsigned int)((t->pc * 31) + (size_t)t->sp);
     for (int i = 0; i < counter_count; i++) h ^= (t->counters[i] * 73);
-    return h % CACHE_SIZE;
+    /* CACHE_SIZE is a power of two, so masking replaces the division a
+     * true % would need -- this runs once per backtrack-stack pop. */
+    return h & (CACHE_SIZE - 1);
 }
 
 /* Copies src's pc/sp/counters/counter_sp, and the *data* src->captures
@@ -143,60 +169,109 @@ static inline void thread_copy_state(Thread* dst, const Thread* src, int cap_pai
  * around 130MB, tolerable transiently even under WASM's default heap. */
 #define VM_STACK_MAX (1 << 19)
 
+/* Per-recursion-depth execution scratch. Lookaround runs the VM
+ * recursively, and a nested run can't share the outer run's backtrack
+ * stack or fail cache -- so each depth owns a set, allocated on first use
+ * and kept for the context's lifetime. */
+typedef struct {
+    Thread* stack;
+    const uint16_t** arena;            /* stack slots' capture slices */
+    const uint16_t** current_captures; /* the in-flight thread's, outside the arena */
+    CacheEntry* cache;
+    int capacity;
+    unsigned int gen; /* current fail-cache generation, see CacheEntry */
+} VMDepth;
+
+/* Reusable scratch for every VM entry within one exec call -- see
+ * regexp.h's comment for why this exists (per-start-position allocation +
+ * fail-cache initialization used to dominate unanchored searches by
+ * orders of magnitude). depth[] is indexed by lookaround recursion depth;
+ * MAX_AST_DEPTH bounds it because every lookaround level costs at least
+ * one AST level, which the parser caps (docs/IMPROVEMENTS.md #1.3). */
+struct VMContext {
+    int cap_pairs;
+    VMDepth depth[MAX_AST_DEPTH];
+};
+
+VMContext* vm_context_new(const Program* prog) {
+    VMContext* ctx = calloc(1, sizeof(VMContext));
+    if (!ctx) {
+        fprintf(stderr, "Fatal Error: Out of memory\n");
+        exit(EXIT_FAILURE);
+    }
+    ctx->cap_pairs = (prog->group_count + 1) * 2;
+    return ctx;
+}
+
+void vm_context_free(VMContext* ctx) {
+    if (!ctx) return;
+    for (int i = 0; i < MAX_AST_DEPTH; i++) {
+        free(ctx->depth[i].stack);
+        free((void*)ctx->depth[i].arena);
+        free((void*)ctx->depth[i].current_captures);
+        free(ctx->depth[i].cache);
+    }
+    free(ctx);
+}
+
 /* Doubles the backtrack stack and its captures arena in tandem. Every
  * stack slot's .captures points into the arena at a fixed stride, so a
  * realloc that moves the arena invalidates all of them -- they're rebased
  * below. (The capture *data* -- pointers into the subject text -- moves
  * with the realloc and stays valid; it's only the slot->arena pointers
- * that need recomputing. `current`'s captures live in their own
- * allocation, not the arena, precisely so growth never moves them.)
+ * that need recomputing. The in-flight thread's captures live in their
+ * own allocation, not the arena, precisely so growth never moves them.)
  * Returns false only at VM_STACK_MAX; allocation failure stays fatal,
- * matching the existing OOM policy at the top of vm_execute_internal. */
-static bool vm_grow_stack(Thread** stack, const uint16_t*** arena, int* capacity, int cap_pairs) {
-    if (*capacity >= VM_STACK_MAX) return false;
-    int new_capacity = *capacity * 2;
-    Thread* new_stack = realloc(*stack, sizeof(Thread) * (size_t)new_capacity);
-    const uint16_t** new_arena = realloc((void*)*arena, sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)new_capacity);
+ * matching the OOM policy everywhere else in this file. */
+static bool vm_grow_stack(VMDepth* d, int cap_pairs) {
+    if (d->capacity >= VM_STACK_MAX) return false;
+    int new_capacity = d->capacity * 2;
+    Thread* new_stack = realloc(d->stack, sizeof(Thread) * (size_t)new_capacity);
+    const uint16_t** new_arena = realloc((void*)d->arena, sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)new_capacity);
     if (!new_stack || !new_arena) {
         fprintf(stderr, "Fatal Error: Out of memory\n");
         exit(EXIT_FAILURE);
     }
     for (int i = 0; i < new_capacity; i++) new_stack[i].captures = new_arena + (size_t)i * cap_pairs;
-    *stack = new_stack;
-    *arena = new_arena;
-    *capacity = new_capacity;
+    d->stack = new_stack;
+    d->arena = new_arena;
+    d->capacity = new_capacity;
     return true;
 }
 
-bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures) {
-    int cap_pairs = (prog->group_count + 1) * 2;
-
-    /* One arena slice per backtrack-stack slot, plus a separate allocation
-     * for `current` (the thread actively being stepped through
-     * instructions, outside the stack array -- separate so vm_grow_stack's
-     * arena realloc never moves it) -- see the Thread/thread_copy_state
-     * comments above for why this, and the stack/fail_cache arrays below,
-     * are heap-allocated here rather than being plain C-stack locals like
-     * they used to be: this function recurses into itself for every
-     * OP_LOOKAHEAD/OP_LOOKBEHIND, so whatever these cost used to be paid
-     * again on the C stack at every nesting level. */
-    int stack_capacity = VM_STACK_CAPACITY;
-    const uint16_t** captures_arena = malloc(sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)stack_capacity);
-    Thread* stack = malloc(sizeof(Thread) * (size_t)stack_capacity);
-    CacheEntry* fail_cache = malloc(sizeof(CacheEntry) * CACHE_SIZE);
-    const uint16_t** current_captures = malloc(sizeof(uint16_t*) * (size_t)cap_pairs);
-    if (!captures_arena || !stack || !fail_cache || !current_captures) {
-        fprintf(stderr, "Fatal Error: Out of memory\n");
-        exit(EXIT_FAILURE);
+static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures) {
+    int cap_pairs = ctx->cap_pairs;
+    if (depth >= MAX_AST_DEPTH) return false; /* unreachable: the parser caps nesting */
+    VMDepth* d = &ctx->depth[depth];
+    if (!d->stack) {
+        d->capacity = VM_STACK_CAPACITY;
+        d->arena = malloc(sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)d->capacity);
+        d->stack = malloc(sizeof(Thread) * (size_t)d->capacity);
+        d->cache = malloc(sizeof(CacheEntry) * CACHE_SIZE);
+        d->current_captures = malloc(sizeof(uint16_t*) * (size_t)cap_pairs);
+        if (!d->arena || !d->stack || !d->cache || !d->current_captures) {
+            fprintf(stderr, "Fatal Error: Out of memory\n");
+            exit(EXIT_FAILURE);
+        }
+        for (int i = 0; i < d->capacity; i++) d->stack[i].captures = d->arena + (size_t)i * cap_pairs;
+        /* gen 0 marks every entry stale forever; real generations start at 1. */
+        for (int i = 0; i < CACHE_SIZE; i++) d->cache[i].gen = 0;
+        d->gen = 0;
     }
+    if (++d->gen == 0) {
+        /* Generation wrapped (2^32 entries at one depth in one context) --
+         * hard-reset so gen-0 entries can't masquerade as current. */
+        for (int i = 0; i < CACHE_SIZE; i++) d->cache[i].gen = 0;
+        d->gen = 1;
+    }
+    const unsigned int gen = d->gen;
+    Thread* stack = d->stack;
+    CacheEntry* fail_cache = d->cache;
+    int stack_capacity = d->capacity;
     int stack_ptr = 0;
-    bool result = false;
-
-    for (int i = 0; i < stack_capacity; i++) stack[i].captures = captures_arena + (size_t)i * cap_pairs;
-    for (int i = 0; i < CACHE_SIZE; i++) fail_cache[i].pc = -1;
 
     Thread current;
-    current.captures = current_captures;
+    current.captures = d->current_captures;
 
     stack[0].pc = start_pc;
     stack[0].sp = search_start;
@@ -211,13 +286,21 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
         thread_copy_state(&current, &stack[stack_ptr], cap_pairs);
 
         unsigned int h = hash_state(&current, prog->counter_count);
-        if (fail_cache[h].pc == current.pc && fail_cache[h].sp == current.sp) continue;
+        if (fail_cache[h].gen == gen && fail_cache[h].pc == current.pc && fail_cache[h].sp == current.sp) continue;
 
         int path_start_pc = current.pc; const uint16_t* path_start_sp = current.sp; bool path_failed = false;
-        
+
         while (true) {
             Instruction inst = prog->code[current.pc];
-            if (inst.op == OP_CHAR) {
+            /* A dense switch over the opcode enum compiles to a jump table
+             * where the old if/else-if chain compiled to sequential
+             * compares (docs/IMPROVEMENTS.md section 2). The opcode bodies
+             * are unchanged; their `path_failed = true; break;` idiom now
+             * breaks the switch instead of this while, so the
+             * `if (path_failed) break;` after the switch completes the
+             * exit -- same control flow, one extra branch on failure. */
+            switch (inst.op) {
+            case OP_CHAR: {
                 if (step > 0) {
                     if (current.sp < text_end) {
                         uint32_t cp;
@@ -272,19 +355,16 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                         }
                     } else { path_failed = true; break; }
                 }
-            } 
-            else if (inst.op == OP_CLASS) {
+            } break;
+            case OP_CLASS: {
                 if (step > 0) {
                     if (current.sp < text_end) {
                         uint32_t cp;
                         const uint16_t* next_sp = current.sp;
                         if (prog->unicode) cp = decode_utf16(&next_sp, text_end);
                         else cp = *next_sp++;
-                        bool matched = false;
                         CharClass* cls = &prog->classes[inst.arg1];
-                        for (int i = 0; i < cls->range_count; i++) {
-                            if (cp >= cls->ranges[i].start && cp <= cls->ranges[i].end) { matched = true; break; }
-                        }
+                        bool matched = class_contains(cls, cp);
                         if (cls->negated) matched = !matched;
                         if (matched) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
                     } else { path_failed = true; break; }
@@ -304,20 +384,17 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                         } else {
                             cp = *(--next_sp);
                         }
-                        bool matched = false;
                         CharClass* cls = &prog->classes[inst.arg1];
-                        for (int i = 0; i < cls->range_count; i++) {
-                            if (cp >= cls->ranges[i].start && cp <= cls->ranges[i].end) { matched = true; break; }
-                        }
+                        bool matched = class_contains(cls, cp);
                         if (cls->negated) matched = !matched;
                         if (matched) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
                     } else { path_failed = true; break; }
                 }
-            }
-            else if (inst.op == OP_SAVE) { current.captures[inst.arg1] = current.sp; current.pc++; }
-            else if (inst.op == OP_ASSERT_START) { if (current.sp == original_text || (prog->multiline && current.sp > original_text && *(current.sp - 1) == '\n')) current.pc++; else { path_failed = true; break; } }
-            else if (inst.op == OP_ASSERT_END)   { if (current.sp >= text_end || (prog->multiline && *current.sp == '\n')) current.pc++; else { path_failed = true; break; } }
-            else if (inst.op == OP_WORD_BOUNDARY) {
+            } break;
+            case OP_SAVE: { current.captures[inst.arg1] = current.sp; current.pc++; } break;
+            case OP_ASSERT_START: { if (current.sp == original_text || (prog->multiline && current.sp > original_text && *(current.sp - 1) == '\n')) current.pc++; else { path_failed = true; break; } } break;
+            case OP_ASSERT_END:   { if (current.sp >= text_end || (prog->multiline && *current.sp == '\n')) current.pc++; else { path_failed = true; break; } } break;
+            case OP_WORD_BOUNDARY: {
                 /* The sp < text_end guard mirrors OP_ASSERT_END's: text need
                  * not be NUL-terminated (text_units is authoritative, per
                  * README), so end-of-text must be detected by bound, not by
@@ -326,13 +403,14 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                 bool left_is_word = (current.sp > original_text) && is_word_char(*(current.sp - 1));
                 bool right_is_word = (current.sp < text_end) && is_word_char(*current.sp);
                 if (left_is_word != right_is_word) current.pc++; else { path_failed = true; break; }
-            }
-            else if (inst.op == OP_NON_WORD_BOUNDARY) {
+            } break;
+            case OP_NON_WORD_BOUNDARY: {
                 bool left_is_word = (current.sp > original_text) && is_word_char(*(current.sp - 1));
                 bool right_is_word = (current.sp < text_end) && is_word_char(*current.sp);
                 if (left_is_word == right_is_word) current.pc++; else { path_failed = true; break; }
-            }
-            else if (inst.op == OP_BACKREF || inst.op == OP_NAMED_BACKREF) {
+            } break;
+            case OP_BACKREF:
+            case OP_NAMED_BACKREF: {
                 const uint16_t* start = NULL;
                 const uint16_t* end = NULL;
                 if (inst.op == OP_BACKREF) {
@@ -429,8 +507,8 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                 } else {
                     current.pc++;
                 }
-            }
-            else if (inst.op == OP_LOOKAHEAD) {
+            } break;
+            case OP_LOOKAHEAD: {
                 /* Sized to this pattern's actual cap_pairs (a small,
                  * on-C-stack VLA), not MAX_GROUPS*2 -- unlike the arenas
                  * above, this one's small enough (at most 510 pointers,
@@ -439,32 +517,33 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                  * dispatch, not one per backtrack-stack slot. */
                 const uint16_t* temp_captures[cap_pairs];
                 memcpy(temp_captures, current.captures, sizeof(temp_captures));
-                bool la_match = vm_execute_internal(prog, inst.arg1, 1, original_text, text_end, current.sp, temp_captures);
+                bool la_match = vm_run(prog, ctx, depth + 1, inst.arg1, 1, original_text, text_end, current.sp, temp_captures);
                 if (la_match) {
                     memcpy((void*)current.captures, temp_captures, sizeof(temp_captures));
                     current.pc++;
                 } else { path_failed = true; break; }
-            }
-            else if (inst.op == OP_NEG_LOOKAHEAD) {
+            } break;
+            case OP_NEG_LOOKAHEAD: {
                 const uint16_t* temp_captures[cap_pairs];
                 memcpy(temp_captures, current.captures, sizeof(temp_captures));
-                bool la_match = vm_execute_internal(prog, inst.arg1, 1, original_text, text_end, current.sp, temp_captures);
+                bool la_match = vm_run(prog, ctx, depth + 1, inst.arg1, 1, original_text, text_end, current.sp, temp_captures);
                 if (!la_match) {
                     current.pc++;
                 } else { path_failed = true; break; }
-            }
-            else if (inst.op == OP_LOOKBEHIND || inst.op == OP_NEG_LOOKBEHIND) {
+            } break;
+            case OP_LOOKBEHIND:
+            case OP_NEG_LOOKBEHIND: {
                 const uint16_t* temp_captures[cap_pairs];
                 memcpy(temp_captures, current.captures, sizeof(temp_captures));
-                bool lb_match = vm_execute_internal(prog, inst.arg1, -1, original_text, text_end, current.sp, temp_captures);
+                bool lb_match = vm_run(prog, ctx, depth + 1, inst.arg1, -1, original_text, text_end, current.sp, temp_captures);
                 if ((inst.op == OP_LOOKBEHIND && lb_match) || (inst.op == OP_NEG_LOOKBEHIND && !lb_match)) {
                     if (lb_match) memcpy((void*)current.captures, temp_captures, sizeof(temp_captures));
                     current.pc++;
                 } else {
                     path_failed = true; break;
                 }
-            }
-            else if (inst.op == OP_CLEAR_CAPTURES) {
+            } break;
+            case OP_CLEAR_CAPTURES: {
                 /* Bound against this pattern's own group_count, not
                  * MAX_GROUPS -- captures is now sized to cap_pairs, not
                  * always the worst-case MAX_GROUPS*2 (see the Thread
@@ -477,19 +556,24 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                     current.captures[i * 2 + 1] = NULL;
                 }
                 current.pc++;
-            }
-            else if (inst.op == OP_SPLIT) {
+            } break;
+            case OP_SPLIT: {
                 /* Every push site checks capacity first; hitting VM_STACK_MAX
-                 * abandons the whole match (see the define above). */
-                if (stack_ptr == stack_capacity && !vm_grow_stack(&stack, &captures_arena, &stack_capacity, cap_pairs)) goto cleanup;
+                 * abandons the whole match (see the define above). Growth
+                 * reallocates through the VMDepth, so refresh the locals. */
+                if (stack_ptr == stack_capacity) {
+                    if (!vm_grow_stack(d, cap_pairs)) return false;
+                    stack = d->stack;
+                    stack_capacity = d->capacity;
+                }
                 thread_copy_state(&stack[stack_ptr], &current, cap_pairs);
                 stack[stack_ptr].pc = inst.arg2;
                 stack_ptr++;
                 current.pc = inst.arg1;
-            }
-            else if (inst.op == OP_INIT_COUNTER) { current.counters[inst.arg1] = 0; current.counter_sp[inst.arg1] = NULL; current.pc++; }
-            else if (inst.op == OP_INC_COUNTER)  { current.counters[inst.arg1]++; current.pc++; }
-            else if (inst.op == OP_CHECK_COUNTER) {
+            } break;
+            case OP_INIT_COUNTER: { current.counters[inst.arg1] = 0; current.counter_sp[inst.arg1] = NULL; current.pc++; } break;
+            case OP_INC_COUNTER:  { current.counters[inst.arg1]++; current.pc++; } break;
+            case OP_CHECK_COUNTER: {
                 int c = current.counters[inst.arg1], min = inst.arg2, max = inst.arg3, exit_pc = inst.arg4;
                 if (c > 0 && current.counter_sp[inst.arg1] == current.sp && c >= min) {
                     current.pc = exit_pc;
@@ -498,7 +582,11 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                     if (c < min) current.pc++;
                     else if (max != -1 && c == max) current.pc = exit_pc;
                     else {
-                        if (stack_ptr == stack_capacity && !vm_grow_stack(&stack, &captures_arena, &stack_capacity, cap_pairs)) goto cleanup;
+                        if (stack_ptr == stack_capacity) {
+                            if (!vm_grow_stack(d, cap_pairs)) return false;
+                            stack = d->stack;
+                            stack_capacity = d->capacity;
+                        }
                         if (inst.lazy) {
                             thread_copy_state(&stack[stack_ptr], &current, cap_pairs);
                             stack[stack_ptr].pc = current.pc + 1;
@@ -512,21 +600,34 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                         }
                     }
                 }
-            }
-            else if (inst.op == OP_JMP) { current.pc = inst.arg1; }
-            else if (inst.op == OP_MATCH) {
+            } break;
+            case OP_JMP: { current.pc = inst.arg1; } break;
+            case OP_MATCH: {
                 if (out_captures) memcpy((void*)out_captures, current.captures, sizeof(const uint16_t*) * (size_t)cap_pairs);
-                result = true;
-                goto cleanup;
+                return true;
             }
+            default:
+                /* Unreachable with well-formed bytecode; failing the path
+                 * beats the if/else chain's old behavior (silent infinite
+                 * loop on an unknown opcode). */
+                path_failed = true;
+                break;
+            }
+            if (path_failed) break;
         }
-        if (path_failed) { fail_cache[h].pc = path_start_pc; fail_cache[h].sp = path_start_sp; }
+        if (path_failed) { fail_cache[h].pc = path_start_pc; fail_cache[h].sp = path_start_sp; fail_cache[h].gen = gen; }
     }
-cleanup:
-    free(captures_arena);
-    free(stack);
-    free(fail_cache);
-    free(current_captures);
+    return false;
+}
+
+bool vm_execute(Program* prog, VMContext* ctx, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures) {
+    return vm_run(prog, ctx, 0, start_pc, step, original_text, text_end, search_start, out_captures);
+}
+
+bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures) {
+    VMContext* ctx = vm_context_new(prog);
+    bool result = vm_run(prog, ctx, 0, start_pc, step, original_text, text_end, search_start, out_captures);
+    vm_context_free(ctx);
     return result;
 }
 

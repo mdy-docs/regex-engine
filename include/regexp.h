@@ -112,6 +112,25 @@ typedef struct {
 } CaptureIndex;
 
 void compile_into(Program* prog, const uint16_t* regex, int flags);
+
+/* Reusable execution scratch (backtrack stacks, capture arenas, fail
+ * caches -- one set per lookaround recursion depth, allocated lazily and
+ * kept until freed). Create one per exec *call* and pass it to vm_execute
+ * for every start position tried within that call: an unanchored search
+ * over N code units re-enters the VM up to N times, and paying
+ * allocation + fail-cache initialization per position instead of per call
+ * dominated the runtime by orders of magnitude (see docs/IMPROVEMENTS.md
+ * section 2). A context is tied to the group count of the Program it was
+ * created for, and is not thread-safe -- one context per thread. */
+typedef struct VMContext VMContext;
+VMContext* vm_context_new(const Program* prog);
+void vm_context_free(VMContext* ctx);
+bool vm_execute(Program* prog, VMContext* ctx, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures);
+
+/* One-shot convenience wrapper: creates a context, runs vm_execute once,
+ * frees the context. Fine for a single anchored evaluation; do NOT call
+ * this per start position in a scan loop -- that's the exact per-position
+ * overhead VMContext exists to remove. */
 bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures);
 void vm_get_indices(const uint16_t* original_text, const uint16_t** captures, CaptureIndex* out_indices, int group_count);
 

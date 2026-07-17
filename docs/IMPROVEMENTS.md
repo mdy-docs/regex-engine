@@ -794,6 +794,76 @@ regression coverage in `test/smoke.c`.
 
 ## 2. Performance
 
+**All items below are implemented** (each double-checked against the code
+as it stood after the section-1 fixes — the first two had been overtaken
+by events in ways that changed what the right fix was). Measured on the
+benchmark harness built for this work (patterns compiled once, `-O2`,
+ns/`regex_exec`; harness in the fix's verification history):
+
+| case | before | after | speedup |
+|---|---|---|---|
+| literal scan, no match (200k units) | 989 ms | 5.1 ms | ~192× |
+| literal scan, late match (200k) | 986 ms | 5.0 ms | ~197× |
+| class scan `[0-9][a-z]` (200k) | 985 ms | 5.7 ms | ~172× |
+| `\p{Nd}\p{L}`/u scan (50k) | 250 ms | 1.8 ms | ~138× |
+| `(?=[0-9])[a-z]+` scan (200k) | 2356 ms | 12.6 ms | ~187× |
+| `(cat\|dog\|bird)` scan (200k) | 1002 ms | 13.0 ms | ~77× |
+| `[\p{L}]+`/u match (50k run) | 14.3 ms | 10.9 ms | ~1.3× |
+| `(a+)+b` fail-cache workout | 2.2 ms | 1.8 ms | ~1.2× |
+
+The two-orders-of-magnitude rows are all the same root cause: the second
+bullet below, whose fix (the `VMContext`) dwarfs everything else here.
+**Benchmarking this section also flushed out a text-driven heap overflow**
+(the backtrack stack's pushes were never bounds-checked — any quantifier
+matching a run longer than 512 units corrupted the heap; `[\p{L}]+` over
+one real paragraph was enough). That was fixed first, separately — see
+the growable-stack commit and `test/smoke.c`'s 100k-run regression tests;
+`VM_STACK_MAX` now bounds growth, with over-limit matches abandoned as
+no-match rather than corrupting memory.
+
+Item-by-item status:
+
+- **1.1's root cause is also the biggest performance lever** — **done as
+  part of 1.1's fix** (captures sized to the pattern's actual group
+  count); already stale by the time this section was implemented.
+- **`fail_cache` re-init per call** — **done, but the finding was stale in
+  an important way**: after 1.1 moved these buffers to the heap, the cost
+  wasn't just the 8192-entry reset but a full
+  malloc/init/free cycle of stack + arena + cache — and `regex_exec`'s
+  unanchored scan loop re-enters the VM **once per start position**, so a
+  200k-unit no-match search paid it 200,000 times (~4.9µs/position — the
+  989ms rows above). Fixed by `VMContext` (`regexp.h`/`re_vm.c`): the
+  caller creates one context per exec *call*; each lookaround recursion
+  depth owns a lazily-allocated {stack, arena, cache} set reused across
+  all positions and all recursive entries. The originally-suggested
+  generation counter survives as the cache-clearing mechanism *within*
+  the context (bump one integer per VM entry instead of resetting 8192
+  slots), which is what makes reuse safe: a stale generation reads as
+  empty, so one position's failures never leak into the next.
+- **`if`/`else if` dispatch → `switch`** — **done**, with one structural
+  trap worth recording: the opcode bodies' `path_failed = true; break;`
+  idiom used to break the interpreter's inner `while`; inside a `switch`
+  those same `break`s exit the switch instead, so the loop needs an
+  explicit `if (path_failed) break;` after the switch. A `default:` case
+  now fails the path on unknown opcodes too (the old chain silently
+  infinite-looped).
+- **`OP_CLASS` linear scan → binary search** — **done**
+  (`class_contains`, both forward and backward branches). `add_range`'s
+  sorted+coalesced invariant was re-verified (including its
+  forward-compaction merge paths) before relying on it. This is the
+  `\p{Nd}\p{L}` row's ~10× beyond the context win (`\p{L}` alone is ~700
+  ranges, previously scanned linearly per position).
+- **`hash_state` `%` → `&`** — **done** (`CACHE_SIZE` is a power of two;
+  masked, runs once per backtrack-stack pop).
+
+Verified behavior-preserving against every Node-diffed probe from the
+section-1 fixes (235 property cases, capture-clearing/1.8 semantics,
+nested-group numbering, 1.7's class tables — zero regressions), plus the
+full native/ASan+UBSan/WASM suites.
+
+The original findings, as written (kept as the historical record; the
+status list above is the current truth):
+
 - **1.1's root cause is also the biggest performance lever.** Every
   `vm_execute_internal` call — including the top-level one *and* every
   lookaround's recursive call — pays for a ~2.2MB stack frame and a
