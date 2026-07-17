@@ -76,6 +76,22 @@ static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
     for (int i = 0; i < jmp_count; i++) prog->code[jmp_pcs[i]].arg1 = end_pc;
 }
 
+/* Smallest and largest capture-group id *defined* inside this subtree --
+ * AST_GROUP with id > 0 only (id 0 is a non-capturing group; AST_BACKREF's
+ * id is a reference to a paren, not a paren). Because the parser assigns
+ * ids in source order, a subtree's ids always form the contiguous range
+ * [lo, hi] -- the same parenIndex/parenCount range ECMA-262's RepeatMatcher
+ * is specified over. Recursion depth is bounded by MAX_AST_DEPTH (#1.3). */
+static void group_id_range(ASTNode* node, int* lo, int* hi) {
+    if (!node) return;
+    if (node->type == AST_GROUP && node->id > 0) {
+        if (node->id < *lo) *lo = node->id;
+        if (node->id > *hi) *hi = node->id;
+    }
+    group_id_range(node->left, lo, hi);
+    group_id_range(node->right, lo, hi);
+}
+
 static void compile_node(ASTNode* node, Program* prog, bool rtl) {
     if (!node) return;
     switch (node->type) {
@@ -182,6 +198,19 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
             emit(prog, OP_INIT_COUNTER, counter_id, 0, 0, 0, false);
             int split_pc = prog->code_count;
             int check_idx = emit(prog, OP_CHECK_COUNTER, counter_id, node->min, node->max, 0, node->lazy);
+            /* ECMA-262 RepeatMatcher: captures inside the repeated Atom
+             * reset at the start of every iteration, so a branch that
+             * doesn't participate in the final iteration ends up unset
+             * rather than keeping a stale value from an earlier one
+             * (docs/IMPROVEMENTS.md #1.8 -- OP_CLEAR_CAPTURES existed in
+             * the VM but was never emitted). Placing the clear after
+             * OP_CHECK_COUNTER is what preserves the "last successful
+             * iteration wins" retention on exit: the exit thread
+             * OP_CHECK_COUNTER pushes carries the captures as they were
+             * *before* this instruction runs. */
+            int clear_lo = MAX_GROUPS, clear_hi = 0;
+            group_id_range(node->left, &clear_lo, &clear_hi);
+            if (clear_hi > 0) emit(prog, OP_CLEAR_CAPTURES, clear_lo, clear_hi, 0, 0, false);
             compile_node(node->left, prog, rtl);
             emit(prog, OP_INC_COUNTER, counter_id, 0, 0, 0, false);
             emit(prog, OP_JMP, split_pc, 0, 0, 0, false);

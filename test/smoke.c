@@ -679,6 +679,98 @@ int main(void) {
         regex_free(h);
     }
 
+    /* Captures inside a quantified atom reset at the start of every
+     * iteration (ECMA-262 RepeatMatcher; docs/IMPROVEMENTS.md #1.8).
+     * Regression tests for a confirmed bug: OP_CLEAR_CAPTURES existed in
+     * the VM but was never emitted, so a branch that didn't participate in
+     * the final iteration kept its stale value from an earlier one. Every
+     * expectation below diffed against Node. */
+    {
+        /* The doc's original repro: Node gives ["ab", undefined, "b"] --
+         * group 1 must be unset, not retain "a" from iteration 1. */
+        uint16_t* pattern = to_utf16("(?:(a)|(b))+");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t text[] = { 'a', 'b' };
+        int m = regex_exec(h, text, 2, 0);
+        const int32_t* caps = regex_captures_ptr(h);
+        check(m && caps[0] == 0 && caps[1] == 2, "(?:(a)|(b))+ matches 'ab'");
+        check(m && caps[2] == -1 && caps[3] == -1, "group 1 is unset (was: stale 'a' from iteration 1)");
+        check(m && caps[4] == 1 && caps[5] == 2, "group 2 is 'b' from the final iteration");
+        free(pattern);
+        regex_free(h);
+    }
+    {
+        /* The clear must NOT leak past loop exit: the exit thread carries
+         * the captures of the last successful iteration. Node:
+         * /(?:(a)|(x))+/.exec('a') -> ["a", "a", undefined]. */
+        uint16_t* pattern = to_utf16("(?:(a)|(x))+");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t text[] = { 'a' };
+        int m = regex_exec(h, text, 1, 0);
+        const int32_t* caps = regex_captures_ptr(h);
+        check(m && caps[2] == 0 && caps[3] == 1, "last successful iteration's capture survives loop exit");
+        free(pattern);
+        regex_free(h);
+    }
+    {
+        /* Quantified capturing group with an optional inner group: outer
+         * re-set each iteration, inner cleared when it doesn't participate.
+         * Node: /((a)?b)+/.exec('abb') -> ["abb", "b", undefined]. Also
+         * exercises nested-group numbering inside a quantifier. */
+        uint16_t* pattern = to_utf16("((a)?b)+");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t text[] = { 'a', 'b', 'b' };
+        int m = regex_exec(h, text, 3, 0);
+        const int32_t* caps = regex_captures_ptr(h);
+        check(m && caps[2] == 2 && caps[3] == 3, "((a)?b)+: outer group is final iteration's 'b'");
+        check(m && caps[4] == -1 && caps[5] == -1, "((a)?b)+: inner (a) cleared on final iteration");
+        free(pattern);
+        regex_free(h);
+    }
+    {
+        /* Groups OUTSIDE the quantified atom must be untouched by its
+         * per-iteration clears. Node: /(a)(?:b|(c))+/.exec('abb') ->
+         * ["abb", "a", undefined]. */
+        uint16_t* pattern = to_utf16("(a)(?:b|(c))+");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t text[] = { 'a', 'b', 'b' };
+        int m = regex_exec(h, text, 3, 0);
+        const int32_t* caps = regex_captures_ptr(h);
+        check(m && caps[2] == 0 && caps[3] == 1, "group before the loop is not cleared by it");
+        free(pattern);
+        regex_free(h);
+    }
+    {
+        /* Bounded quantifiers take the same loop shape and clear too.
+         * Node: /(?:(a)|(b)){2}/.exec('ab') -> ["ab", undefined, "b"]. */
+        uint16_t* pattern = to_utf16("(?:(a)|(b)){2}");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t text[] = { 'a', 'b' };
+        int m = regex_exec(h, text, 2, 0);
+        const int32_t* caps = regex_captures_ptr(h);
+        check(m && caps[2] == -1 && caps[3] == -1 && caps[4] == 1 && caps[5] == 2,
+              "{2} bounded quantifier clears per iteration");
+        free(pattern);
+        regex_free(h);
+    }
+    {
+        /* Group inside a lookahead inside the atom clears/re-sets with the
+         * iterations too (RepeatMatcher's range covers the whole atom).
+         * Node: /(?:(?=(a))a|b)+/ on 'ba' -> g1 'a'; on 'ab' -> g1 unset. */
+        uint16_t* pattern = to_utf16("(?:(?=(a))a|b)+");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t ba[] = { 'b', 'a' };
+        int m1 = regex_exec(h, ba, 2, 0);
+        const int32_t* caps1 = regex_captures_ptr(h);
+        check(m1 && caps1[2] == 1 && caps1[3] == 2, "lookahead capture in atom: set by final iteration");
+        uint16_t ab[] = { 'a', 'b' };
+        int m2 = regex_exec(h, ab, 2, 0);
+        const int32_t* caps2 = regex_captures_ptr(h);
+        check(m2 && caps2[2] == -1 && caps2[3] == -1, "lookahead capture in atom: cleared by final iteration");
+        free(pattern);
+        regex_free(h);
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;

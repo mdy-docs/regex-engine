@@ -38,7 +38,7 @@ predictably, along the mapping `docs/ARCHITECTURE.md`'s intro describes.
 | 1.5 | `decode_utf16` reads past buffer end for a trailing lone lead surrogate | P1 — OOB read | ✅ ASan — **FIXED** |
 | 1.6 | Backreference bounds only validated under `/u` — `\999` OOB-reads in Annex B mode | P1 — OOB read | ✅ ASan — **FIXED** |
 | 1.7 | Non-unicode `.`/`\D`/`\W`/`\S` wrongly capped at codepoint 255 instead of 0xFFFF | P1 — wrong results | ✅ diffed vs Node — **FIXED** |
-| 1.8 | `OP_CLEAR_CAPTURES` defined + VM-implemented but never emitted — stale captures leak across alternation | P2 — wrong results | ✅ diffed vs Node |
+| 1.8 | `OP_CLEAR_CAPTURES` defined + VM-implemented but never emitted — stale captures leak across alternation | P2 — wrong results | ✅ diffed vs Node — **FIXED** |
 | 1.9 | Assorted silent-truncation spots | P3 — minor | inspection |
 
 Sections 2–5 below cover performance, testing, and code-quality findings
@@ -672,7 +672,7 @@ dotAll, the in-class `[\s]`/`[\D]`/`[^\S]` path (a different
 `fill_builtin_class` call site than the standalone escapes), and `/u`
 behavior unchanged. Permanent regression coverage in `test/smoke.c`.
 
-### 1.8 [P2] `OP_CLEAR_CAPTURES` is dead code — stale captures leak across alternation
+### 1.8 [P2] `OP_CLEAR_CAPTURES` is dead code — stale captures leak across alternation — **FIXED**
 
 `OP_CLEAR_CAPTURES` is fully defined (`include/regexp.h:25`, `:47`) and
 has a working VM implementation (`re_vm.c:337–343`) but
@@ -698,6 +698,30 @@ execute this time clears rather than keeps its old value. Lower priority
 than 1.1–1.7 since it's a wrong-answer bug, not a memory-safety one — but
 worth fixing given the VM-side plumbing already exists and is just
 unreachable.
+
+**Fixed** exactly as sketched: a new `group_id_range` walk
+(`re_compiler.c`) computes the min/max capture-group id defined inside
+the quantified subtree (`AST_GROUP` with `id > 0` only — backref nodes
+carry group ids too but are references, not parens; since the parser
+assigns ids in source order, a subtree's ids are always the contiguous
+`[parenIndex+1, parenIndex+parenCount]` range ECMA-262's RepeatMatcher is
+specified over), and `AST_QUANTIFIER` emits one `OP_CLEAR_CAPTURES lo,hi`
+per loop, placed immediately after `OP_CHECK_COUNTER` — all four
+quantifier forms (`*`/`+`/`?`/`{m,n}`, greedy and lazy) compile through
+that single counter loop, so one emission point covers them all. That
+placement, not just the emission, is the load-bearing part: the exit
+thread `OP_CHECK_COUNTER` pushes carries the captures as they were
+*before* the clear runs, which is what preserves "last successful
+iteration wins" on exit while still resetting at the top of each new
+attempt. **Verified against Node across 13 capture-span-exact cases**
+(ASan+UBSan): the doc's original repro plus lazy, bounded `{2}`,
+exit-retention, backref-to-just-cleared-group (matches empty),
+capture-inside-lookahead-inside-atom (both the re-set and cleared
+directions), groups outside the loop untouched, and named groups. **This
+verification also flushed out a second, unlisted bug**: nested capture
+groups were numbered by *closing* paren rather than opening paren — see
+"Fixed since this analysis" above; fixed separately, and jsvm2 upstream
+has it too. Permanent regression coverage for both in `test/smoke.c`.
 
 ### 1.9 [P3] Minor / silent-truncation spots (inspection only, not independently repro'd)
 
@@ -917,5 +941,11 @@ If tackling this list, roughly in order of (safety impact) / (effort):
    was already gated on `make test`. Every regression test added by the
    fixes above now runs automatically, including the sanitizer-only
    buffer-edge ones.
-8. **1.8** (emit `OP_CLEAR_CAPTURES`) — lower urgency (wrong answer, not
-   unsafe), tackle once the memory-safety items are clear.
+8. ~~**1.8** (emit `OP_CLEAR_CAPTURES`)~~ — **done**: one
+   `OP_CLEAR_CAPTURES` per quantifier loop, emitted right after
+   `OP_CHECK_COUNTER` over the body's (contiguous) group-id range. Its
+   Node-diffed verification also surfaced and fixed a previously-unknown
+   nested-group numbering bug (see "Fixed since this analysis"). **Every
+   numbered finding in §1 is now closed** except the 1.9 P3 nits;
+   remaining work is §2 (perf), §3 (fuzzing/conformance testing), and §4
+   (code quality).

@@ -429,11 +429,8 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                  * always the worst-case MAX_GROUPS*2 (see the Thread
                  * comment above), so the old `i < MAX_GROUPS` bound would
                  * write past the end of a smaller pattern's arena slice.
-                 * (This opcode is defined and implemented but never
-                 * actually emitted by the compiler today -- see
-                 * docs/IMPROVEMENTS.md #1.8 -- so this bound is currently
-                 * unreachable in practice; fixed anyway rather than left
-                 * as a latent landmine for whenever #1.8 gets addressed.) */
+                 * Emitted by compile_node's AST_QUANTIFIER case at the top
+                 * of every loop iteration (docs/IMPROVEMENTS.md #1.8). */
                 for (int i = inst.arg1; i <= inst.arg2 && i <= prog->group_count; i++) {
                     current.captures[i * 2] = NULL;
                     current.captures[i * 2 + 1] = NULL;
