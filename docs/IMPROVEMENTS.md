@@ -12,6 +12,21 @@ built-in regex engine for the same pattern/flags/input (behavioral/spec-
 compliance findings). None of this is theoretical; every "confirmed" item
 below has a command that reproduces it.
 
+**A note on file references below:** sections 1–3 were written against the
+single-file `src/regexp.c` as it stood at commit `862bf88`, before the
+lexer/parser/compiler/VM split described in section 4 (now resolved — see
+`docs/ARCHITECTURE.md` for the current `re_lexer.c`/`re_parser.c`/
+`re_compiler.c`/`re_vm.c`/`re_internal.h` layout). Prose references to named
+functions have been updated to their current file and line; the verbatim
+ASan/crash-dump transcripts quoted as evidence have deliberately **not**
+been touched or re-run against the split files — they're the historical
+record of exactly what was reproduced and when, and rewriting them to
+show fabricated post-split line numbers would misrepresent them as
+freshly-captured output. If you need to re-run one of those repros against
+the current layout, the underlying bug (all still open as of this split)
+is unaffected by the reorganization — only its file:line address moved,
+predictably, along the mapping `docs/ARCHITECTURE.md`'s intro describes.
+
 ## Priority summary
 
 | # | Finding | Severity | Confirmed |
@@ -40,8 +55,10 @@ regression coverage added to `test/smoke.c`:
   both `true` in Node); this engine's non-unicode ignore-case path only
   handled `A-Z`/`a-z` at all five call sites that implement it (character-
   class expansion, `OP_CHAR` forward/backward, backreference forward/
-  backward). Fixed by `annexb_canonicalize` (`src/regexp.c`, next to
-  `apply_case_folding`), which implements ECMA-262's actual non-Unicode
+  backward). Fixed by `annexb_canonicalize` (`src/re_vm.c:62` — it lives
+  with the VM, not next to `apply_case_folding` in `src/re_lexer.c`, since
+  it's only ever called from match-time code; see `docs/ARCHITECTURE.md`),
+  which implements ECMA-262's actual non-Unicode
   `Canonicalize` operation via the generated `UCD_SIMPLE_UPPERCASE` table,
   including its "don't fold across the ASCII boundary" exception (verified
   against real JS: `KELVIN SIGN U+212A` doesn't fold to/from `k`/`K`;
@@ -62,8 +79,9 @@ regression coverage added to `test/smoke.c`:
   syntax (a `/v`-mode feature that predates this fix) was *also* silently
   broken in exactly the same way, not just the Unicode-property case.
   Fixed by (a) copying `sequences` into `CharClass.strings` in
-  `fill_unicode_property`, and (b) a new `compile_class_with_strings`
-  (`src/regexp.c`, by `compile_node`) that compiles a class containing
+  `fill_unicode_property` (`src/re_lexer.c:342`), and (b) a new
+  `compile_class_with_strings` (`src/re_compiler.c:42`, by `compile_node`)
+  that compiles a class containing
   strings into a real alternation (`OP_SPLIT`/`OP_CHAR`/`OP_JMP` chains,
   one branch per string, falling back to a plain `OP_CLASS` branch for any
   ordinary single-codepoint ranges in the same class) instead of inventing
@@ -106,7 +124,7 @@ Segmentation fault
 
 **Root cause:** every lookaround (`OP_LOOKAHEAD`/`OP_NEG_LOOKAHEAD`/
 `OP_LOOKBEHIND`/`OP_NEG_LOOKBEHIND`) is implemented as a genuine recursive
-call to `vm_execute_internal` (regexp.c:1720–1747), and that function's
+call to `vm_execute_internal` (`re_vm.c:309` onward), and that function's
 stack frame is dominated by two large fixed-size locals declared on entry
 regardless of how deep the search actually goes:
 
@@ -191,10 +209,10 @@ are still the real solution, and any *other* embedder of this engine
 `Program` (heap-allocated) or `Thread` (stack-allocated, see 1.1). Every
 increment of the corresponding counter is unchecked:
 
-- `emit()` (regexp.c:1280): `prog->code[idx] = ...; idx = prog->code_count++;` — no check against `MAX_OPCODES`.
-- Character-class allocation (regexp.c:898, 919, 991, 1045): `int cid = lexer->prog->class_count++;` then `memset(&lexer->prog->classes[cid], ...)` — no check against `MAX_CLASSES`.
-- Group numbering (regexp.c:1153): `node->id = ++lexer->prog->group_count;` — no check against `MAX_GROUPS`.
-- Counter allocation (regexp.c:1370): `int counter_id = prog->counter_count++;` — no check against `MAX_COUNTERS`.
+- `emit()` (`re_compiler.c:24`): `prog->code[idx] = ...; idx = prog->code_count++;` — no check against `MAX_OPCODES`.
+- Character-class allocation (`re_lexer.c:905, 926, 998, 1055`): `int cid = lexer->prog->class_count++;` then `memset(&lexer->prog->classes[cid], ...)` — no check against `MAX_CLASSES`.
+- Group numbering (`re_parser.c:77`): `node->id = ++lexer->prog->group_count;` — no check against `MAX_GROUPS`.
+- Counter allocation (`re_compiler.c:153`): `int counter_id = prog->counter_count++;` — no check against `MAX_COUNTERS`.
 
 **Confirmed repro (character classes, heap corruption via `memset` overrun):**
 ```c
@@ -236,8 +254,8 @@ real limits).
 
 ### 1.3 [P0] Long flat patterns stack-overflow via linear AST recursion
 
-Separately from 1.1/1.2, `parse_concat` (regexp.c:1184) and `parse_alt`
-(regexp.c:1206) build a **linear chain** of `AST_CONCAT`/`AST_ALT` nodes
+Separately from 1.1/1.2, `parse_concat` (`re_parser.c:108`) and `parse_alt`
+(`re_parser.c:130`) build a **linear chain** of `AST_CONCAT`/`AST_ALT` nodes
 for a flat sequence — not a balanced tree. A pattern with N sequential
 atoms (e.g. `N` literal characters with no grouping at all) produces an
 AST that's N nodes deep. Every one of `free_ast`, `validate_group_names`,
@@ -276,7 +294,7 @@ else if (inst.op == OP_WORD_BOUNDARY) {
     bool left_is_word = (current.sp > original_text) && is_word_char(*(current.sp - 1));
     bool right_is_word = is_word_char(*current.sp);   // <-- no current.sp < text_end check
 ```
-(regexp.c:1617–1626, both `OP_WORD_BOUNDARY` and `OP_NON_WORD_BOUNDARY`.)
+(`re_vm.c:206–216`, both `OP_WORD_BOUNDARY` and `OP_NON_WORD_BOUNDARY`.)
 
 Contrast with `OP_ASSERT_END` immediately above it, which correctly
 short-circuits: `current.sp >= text_end || (prog->multiline && *current.sp
@@ -308,8 +326,8 @@ static inline uint32_t decode_utf16(const uint16_t** sp) {
     if (cp >= 0xD800 && cp <= 0xDBFF) {
         if (**sp >= 0xDC00 && **sp <= 0xDFFF) {   // <-- unconditional deref of **sp
 ```
-(regexp.c:17–26.) Called from `OP_CHAR`/`OP_CLASS`'s forward-matching
-branch (regexp.c:1522, 1578) whenever `prog->unicode` is set. If the last
+(`re_vm.c:35–44`.) Called from `OP_CHAR`/`OP_CLASS`'s forward-matching
+branch (`re_vm.c:111, 167`) whenever `prog->unicode` is set. If the last
 code unit in the buffer is a lead surrogate with nothing after it (a
 legitimately malformed-but-possible input — untrusted UTF-16 buffers do
 end mid-surrogate-pair sometimes, and nothing upstream guarantees
@@ -336,13 +354,13 @@ if (!prog->error && prog->unicode) {
     validate_backrefs(ast, prog->group_count, &prog->error);
 }
 ```
-(regexp.c:1468–1471.) This matches spec (ECMAScript makes an
+(`re_compiler.c:251–254`.) This matches spec (ECMAScript makes an
 out-of-range numeric backreference an early `SyntaxError` only under `/u`;
 in Annex B / non-unicode mode, `\9` when there's no group 9 is legal
 syntax that's supposed to fall back to an identity/octal-ish escape for
 small numbers) — but this engine doesn't implement that Annex B fallback
 for backreference-shaped escapes at all; it always tokenizes `\` followed
-by digits `1`–`9` as `TOK_BACKREF` (regexp.c:924–935) regardless of mode,
+by digits `1`–`9` as `TOK_BACKREF` (`re_lexer.c:931–940`) regardless of mode,
 with no upper bound on how many digits, then emits `OP_BACKREF` with
 whatever numeric id it parsed — completely unchecked in non-unicode mode.
 
@@ -374,8 +392,8 @@ require it.
     add_range(cls, 0, '0' - 1);
     add_range(cls, '9' + 1, unicode ? 0x10FFFF : 255);   // <-- should be 0xFFFF
 ```
-Same pattern at regexp.c:339 (`\W`'s upper range), :347/:355/:356
-(`\s`/`\S`'s per-entry `> 255` cutoff), and :900 (`.`'s `max_cp`).
+Same pattern at `re_lexer.c:305` (`\W`'s upper range), :313/:321/:322
+(`\s`/`\S`'s per-entry `> 255` cutoff), and :907 (`.`'s `max_cp`).
 
 **This breaks the engine's own stated invariant** (see
 `docs/ARCHITECTURE.md`'s lexer section): non-unicode mode is supposed to
@@ -395,10 +413,10 @@ not.
 | `/\s/` | `""` | matches | **no match** |
 | `/\W/` | `"Ā"` | matches | **no match** |
 
-**Fix:** replace the four `255` literals at regexp.c:328(`\D`, already
-correct — check this one specifically, see note below), 339, 347, 355,
-356, 900 with `0xFFFF` where they represent "non-unicode-mode upper
-bound." Double check `\d`/`\D` too even though `\D`'s repro wasn't
+**Fix:** replace the `255` literals in `re_lexer.c` at lines 294 (`\D`,
+already correct — check this one specifically, see note below), 305, 313,
+321, 322, and 907 with `0xFFFF` where they represent "non-unicode-mode
+upper bound." Double check `\d`/`\D` too even though `\D`'s repro wasn't
 separately diffed above — `fill_builtin_class`'s `'D'` branch has the
 exact same `: 255` pattern at line 328 and is presumably equally wrong for
 the same reason, just not independently confirmed against Node in the
@@ -407,7 +425,7 @@ table above.
 ### 1.8 [P2] `OP_CLEAR_CAPTURES` is dead code — stale captures leak across alternation
 
 `OP_CLEAR_CAPTURES` is fully defined (`include/regexp.h:25`, `:47`) and
-has a working VM implementation (regexp.c:1748–1754) but
+has a working VM implementation (`re_vm.c:337–343`) but
 **`compile_node` never emits it** — confirmed by grep, its only two
 non-VM references are the enum/macro definitions. The result: when a
 repeated group contains alternation and a later iteration takes a
@@ -433,13 +451,13 @@ unreachable.
 
 ### 1.9 [P3] Minor / silent-truncation spots (inspection only, not independently repro'd)
 
-- `rx_name_append_utf8` (regexp.c:220) silently stops appending past 31
+- `rx_name_append_utf8` (`re_lexer.c:186`) silently stops appending past 31
   bytes rather than erroring — an extremely long capture-group name
   quietly truncates instead of failing compilation. Low practical impact
   (name buffer is generous relative to any real identifier) but worth a
   `prog->error` instead of silent truncation for consistency with how
   every other limit in this file is handled (fail loud).
-- `prop_cache` (regexp.c:362–367, `MAX_PROP_CACHE = 64`) silently stops
+- `prop_cache` (`re_lexer.c:328–332`, `MAX_PROP_CACHE = 64`) silently stops
   caching once full (`if (prop_cache_count < MAX_PROP_CACHE)`) rather than
   evicting — correct (never wrong results, just loses the caching
   speedup for the 65th+ distinct `\p{...}` property used across the
@@ -463,11 +481,11 @@ unreachable.
   array on every `OP_SPLIT` push. Sizing `Thread.captures` to
   `prog->group_count` (see 1.1's fix #1) fixes the crash *and* shrinks
   every `Thread` push/pop and every `memcpy(temp_captures, ...)` in the
-  lookaround opcodes (regexp.c:1721, 1730, 1738) by a large constant
+  lookaround opcodes (`re_vm.c:310, 319, 327`) by a large constant
   factor for typical patterns.
 - `fail_cache[CACHE_SIZE]` (8192 entries) is fully re-initialized
   (`for (int i = 0; i < CACHE_SIZE; i++) fail_cache[i].pc = -1;`,
-  regexp.c:1501) on **every single call**, including every recursive
+  `re_vm.c:90`) on **every single call**, including every recursive
   lookaround call, even when the lookaround body is trivial. For a pattern
   with many small lookaheads evaluated in a hot loop, this is a fixed
   ~8192-iteration cost paid repeatedly for bodies that might only execute
@@ -475,7 +493,7 @@ unreachable.
   full array re-init (bump a `generation` int per call, store it alongside
   each cache entry, treat a stale generation as "empty" — avoids the
   O(CACHE_SIZE) reset entirely).
-- Opcode dispatch is an `if`/`else if` chain (regexp.c:1516 onward), not a
+- Opcode dispatch is an `if`/`else if` chain (`re_vm.c:105` onward), not a
   `switch`. Modern compilers often turn a dense `switch` over a small enum
   into a jump table; an `if`/`else if` chain over the same enum is not
   guaranteed the same treatment and in practice tends to compile to a
@@ -483,13 +501,13 @@ unreachable.
   rewrite — `OP_CHAR`/`OP_CLASS`/`OP_SPLIT` are almost certainly the
   hottest opcodes and are already near the top of the chain, which limits
   the downside today, but this is a cheap, low-risk change to try.
-- `OP_CLASS` matching (regexp.c:1582, 1606) does a **linear scan** over
+- `OP_CLASS` matching (`re_vm.c:171, 195`) does a **linear scan** over
   `cls->ranges[]` to find whether a code point is covered. `add_range`
-  (regexp.c:268) already guarantees ranges are sorted and coalesced —
+  (`re_lexer.c:234`) already guarantees ranges are sorted and coalesced —
   binary search is a straightforward drop-in given that invariant already
   holds, and matters most for large Unicode-property classes (`\p{L}` etc.
   can have hundreds of ranges) matched against long inputs.
-- `hash_state` (regexp.c:1490) uses `% CACHE_SIZE` (a true modulo,
+- `hash_state` (`re_vm.c:79`) uses `% CACHE_SIZE` (a true modulo,
   division) on every thread pop; `CACHE_SIZE` is `8192` — a power of two —
   so `& (CACHE_SIZE - 1)` is equivalent and avoids the division.
 
@@ -541,36 +559,50 @@ guarding against any of them once fixed.
 
 ## 4. Structure & code quality
 
-- `src/regexp.c` is a single 1800-line file spanning lexer, parser,
-  compiler, and VM. That's a lot for one file, but given this is a
-  **verbatim upstream copy from jsvm2** (see README "Provenance" and
-  `CLAUDE.md`), splitting it into `lexer.c`/`parser.c`/`compiler.c`/`vm.c`
-  would diverge from upstream's file layout and complicate diffing future
-  upstream fixes back in — worth raising with whoever owns the jsvm2 side
-  before restructuring, rather than doing it unilaterally here.
+- ~~`src/regexp.c` is a single 1800-line file spanning lexer, parser,
+  compiler, and VM...~~ **RESOLVED.** Split into `src/re_lexer.c`,
+  `src/re_parser.c`, `src/re_compiler.c`, `src/re_vm.c`, and a private
+  `src/re_internal.h` for the cross-file `Lexer`/`Token`/`ASTNode`/
+  `NameSet` types and the handful of function declarations
+  (`next_token`, `parse_alt`, `free_ast`, `validate_group_names`) each
+  stage needs to call into the previous one across translation units now.
+  This *does* diverge from jsvm2's own single-file layout, as originally
+  flagged here — done anyway, by request, on the judgment that the
+  maintainability win outweighs the upstream-diffing cost for this repo.
+  Verified behavior-preserving: full test suite (native, ASan+UBSan, and
+  the real compiled WASM artifact) passes identically before and after,
+  and every one of the original file's ~39 top-level functions was
+  confirmed to appear in exactly one of the four new files (no accidental
+  duplication or drop). See `docs/ARCHITECTURE.md`'s intro for the current
+  layout and which few functions moved by actual cross-file usage rather
+  than jsvm2's original textual position (`decode_utf16`, `is_word_char`,
+  and `annexb_canonicalize` all ended up in `re_vm.c`, the only place that
+  calls them, despite being positioned before jsvm2's "LEXER" section).
 - **Forward/backward branch duplication in the VM** (documented in
   `docs/ARCHITECTURE.md`) is the direct cause of at least one of the bugs
   above having a fix needed in two places conceptually (1.4's `\b`/`\B` is
   actually not direction-dependent, but 1.5's `decode_utf16` forward path
   and the VM's separate inlined backward-surrogate-decode logic — e.g.
-  regexp.c:1544–1552 — are two independently-maintained
+  `re_vm.c:134` onward — are two independently-maintained
   implementations of "decode one code point in this direction," and only
   one of them was probed here). Extracting shared
   `decode_forward(sp, text_end)` / `decode_backward(sp, text_start)`
   helpers used by both `OP_CHAR` and `OP_CLASS` (and the backreference
-  matching code, which duplicates this a *third* time at regexp.c:1653 and
-  :1672) would both shrink the file substantially and remove an entire
-  class of "fixed on one side, not the mirror side" bug risk.
+  matching code, which duplicates this a *third* time at `re_vm.c:242` and
+  `:261`) would both shrink `re_vm.c` substantially and remove an entire
+  class of "fixed on one side, not the mirror side" bug risk — this is
+  independent of and not addressed by the file split above, which
+  reorganized without deduplicating.
 - `include/regexp.h:28–47` defines `OP_CHAR`/`OP_CLASS`/etc. as macros
   aliasing `REGEX_OP_CHAR`/`REGEX_OP_CLASS`/etc. (the actual enum members).
-  Every use site in `src/regexp.c` uses the short `OP_*` form; the
-  `REGEX_OP_*` names are never referenced anywhere except their own
-  enum/macro definitions. This double-naming appears to be a leftover
-  from some prior refactor or namespacing concern — worth collapsing to
-  one name (presumably the enum becomes `OP_*` directly) unless there's
-  an external reason (e.g. a header consumer elsewhere in jsvm2) to keep
-  the `REGEX_OP_*` prefix as the "public" name.
-- `fill_unicode_property` (regexp.c:369–479) is a large `if`/`else if`
+  Every use site across the engine's four `re_*.c` files uses the short
+  `OP_*` form; the `REGEX_OP_*` names are never referenced anywhere except
+  their own enum/macro definitions. This double-naming appears to be a
+  leftover from some prior refactor or namespacing concern — worth
+  collapsing to one name (presumably the enum becomes `OP_*` directly)
+  unless there's an external reason (e.g. a header consumer elsewhere in
+  jsvm2) to keep the `REGEX_OP_*` prefix as the "public" name.
+- `fill_unicode_property` (`re_lexer.c:342–468`) is a large `if`/`else if`
   chain of `strcmp` calls mapping short Unicode general-category aliases
   (`Lu`, `Ll`, `Nd`, ...) to their long names, plus another chain for the
   grouped categories (`L`, `M`, `N`, ...). A small static lookup table
@@ -582,7 +614,7 @@ guarding against any of them once fixed.
   group-name buffer size appears as a literal in multiple structs
   (`Token.name`, `ASTNode.name`, `Program.group_names[MAX_GROUPS][32]`)
   rather than a shared `#define`; the `64`-byte property-name buffer in
-  the `\p{...}` parsing code (regexp.c:652, 980) is similarly a bare
+  the `\p{...}` parsing code (`re_lexer.c:654, 987`) is similarly a bare
   literal repeated at each call site. Not a bug, just a maintainability
   nit — a future change to one and not the others would silently
   reintroduce a truncation bug.

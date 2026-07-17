@@ -27,16 +27,27 @@ case-folding, `\p{...}` property tables). Those three files never touched
 jsvm2's GC-managed `JSString`/`Value`/`Object` types in the first place —
 they operate purely on raw `const uint16_t*` UTF-16 buffers and a
 self-contained `Program` struct, so the extraction is a straight copy. The
-one dependency `regexp.c` had on the rest of jsvm2 was an 8-line inline
-UTF-16 surrogate-pair decoder (`decode_utf16`, originally in jsvm2's
-`js_string.h`); it's copied inline at the top of `src/regexp.c` here rather
-than pulling in that whole header.
+one dependency the extracted engine had on the rest of jsvm2 was an 8-line
+inline UTF-16 surrogate-pair decoder (`decode_utf16`, originally in jsvm2's
+`js_string.h`); it's copied inline here (`src/re_vm.c`) rather than pulling
+in that whole header.
 
 jsvm2's own `src/builtins_regexp.c` (not copied here) is the part that
 stays behind — it's the glue that converts between jsvm2's `Value`/
 `JSString`/`Object` and this engine's raw UTF-16 buffers. `src/regex_wasm.c`
 in this directory is a from-scratch replacement for that glue, aimed at a
 generic WASM host instead of jsvm2 specifically.
+
+**Note on the engine's own file layout:** jsvm2's `src/regexp.c` was
+originally extracted here as a single verbatim file of the same name. It
+has since been split into `src/re_lexer.c` / `re_parser.c` / `re_compiler.c`
+/ `re_vm.c` (plus a private `src/re_internal.h` for what's shared between
+them) for maintainability — see `docs/ARCHITECTURE.md`'s intro for the
+current layout and `docs/IMPROVEMENTS.md` section 4 for why. This is a
+deliberate, acknowledged divergence from jsvm2's own single-file layout: if
+you're porting a fix from (or back to) jsvm2's `regexp.c`, the code itself
+is still line-for-line recognizable, just reorganized by pipeline stage —
+`docs/ARCHITECTURE.md` maps each stage to its file.
 
 ## Layout
 
@@ -46,7 +57,11 @@ include/
   ucd.h          Unicode data tables (generated, header-only, ~40k lines)
   regex_wasm.h   declarations for the WASM shim's exported functions
 src/
-  regexp.c       the engine itself (lexer/parser/compiler + backtracking VM)
+  re_lexer.c     scanner + CharClass/Unicode-property construction
+  re_parser.c    recursive-descent AST builder
+  re_compiler.c  AST -> bytecode compiler, plus compile_into (the top-level entry point)
+  re_vm.c        backtracking VM (vm_execute_internal, vm_get_indices)
+  re_internal.h  private, shared-between-the-above types/declarations (not public API)
   regex_wasm.c   WASM shim: opaque handles, UTF-16-buffer-in/int32-buffer-out API
 scripts/
   generate_ucd.py generates include/ucd.h from unicode.org data (see below)
@@ -185,8 +200,10 @@ build/host-level mitigation, not a fix for the underlying engine bug.
 
 This directory is meant to be copied (or `git subtree`/submodule'd) into
 the target project. From there:
-1. Drop `include/` and `src/` in, add `src/regexp.c` + `src/regex_wasm.c`
-   (or your own replacement shim) to that project's Emscripten build.
+1. Drop `include/` and `src/` in, add `src/re_lexer.c` + `src/re_parser.c` +
+   `src/re_compiler.c` + `src/re_vm.c` + `src/regex_wasm.c` (or your own
+   replacement shim in place of the last one) to that project's Emscripten
+   build.
 2. If the target project has its own opinions about `EXPORTED_FUNCTIONS`/
    `EXPORTED_RUNTIME_METHODS`/`ENVIRONMENT`, merge the flags this
    `Makefile`'s `wasm` target uses into that build rather than running this

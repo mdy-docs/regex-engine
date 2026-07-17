@@ -4,7 +4,8 @@ EMCC ?= emcc
 
 WASM_OUT_DIR = dist
 WASM_TARGET = $(WASM_OUT_DIR)/regex-engine.js
-WASM_SRCS = src/regexp.c src/regex_wasm.c
+ENGINE_SRCS = src/re_lexer.c src/re_parser.c src/re_compiler.c src/re_vm.c
+WASM_SRCS = $(ENGINE_SRCS) src/regex_wasm.c
 
 .PHONY: all clean test test-wasm wasm demo
 
@@ -13,8 +14,8 @@ all: test/smoke
 # Native smoke test -- exercises the actual regex_wasm.c shim API (compiled
 # natively; EMSCRIPTEN_KEEPALIVE is a no-op outside __EMSCRIPTEN__) as a
 # quick sanity check with no Emscripten toolchain required.
-test/smoke: src/regexp.c src/regex_wasm.c test/smoke.c
-	$(CC) $(CFLAGS) src/regexp.c src/regex_wasm.c test/smoke.c -o test/smoke
+test/smoke: $(ENGINE_SRCS) src/regex_wasm.c test/smoke.c
+	$(CC) $(CFLAGS) $(ENGINE_SRCS) src/regex_wasm.c test/smoke.c -o test/smoke
 
 test: test/smoke
 	./test/smoke
