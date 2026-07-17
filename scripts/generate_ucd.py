@@ -35,85 +35,129 @@ def get_ucd_file(url):
         f.write(content)
     return content
 
-# 1. Fetch aliases
-property_aliases = {} # short -> long
+# ECMA-262's property namespaces are disjoint and keyed differently in the
+# pattern grammar -- \p{LoneName} accepts only binary properties and
+# General_Category values; Script/Script_Extensions values require their
+# \p{Key=Value} form -- so every emitted property carries a kind tag and
+# lookup is (name, kind), not name alone. See table-binary-unicode-properties
+# and table-nonbinary-unicode-properties in the spec; the binary list below
+# is that table verbatim (canonical long names). Data-file names outside it
+# (contributory properties like Other_Alphabetic, normalization quick-check
+# values, etc.) are deliberately NOT emitted -- real engines reject them.
+ECMA_BINARY = set("""ASCII ASCII_Hex_Digit Alphabetic Any Assigned Bidi_Control
+Bidi_Mirrored Case_Ignorable Cased Changes_When_Casefolded
+Changes_When_Casemapped Changes_When_Lowercased Changes_When_NFKC_Casefolded
+Changes_When_Titlecased Changes_When_Uppercased Dash
+Default_Ignorable_Code_Point Deprecated Diacritic Emoji Emoji_Component
+Emoji_Modifier Emoji_Modifier_Base Emoji_Presentation Extended_Pictographic
+Extender Grapheme_Base Grapheme_Extend Hex_Digit ID_Continue ID_Start
+IDS_Binary_Operator IDS_Trinary_Operator Ideographic Join_Control
+Logical_Order_Exception Lowercase Math Noncharacter_Code_Point Pattern_Syntax
+Pattern_White_Space Quotation_Mark Radical Regional_Indicator
+Sentence_Terminal Soft_Dotted Terminal_Punctuation Unified_Ideograph
+Uppercase Variation_Selector White_Space XID_Continue XID_Start""".split())
+
+# table-binary-unicode-properties-of-strings (/v mode only; the C side gates
+# on sequence_count > 0 rather than needing a separate kind).
+ECMA_STRING = set("""Basic_Emoji Emoji_Keycap_Sequence RGI_Emoji
+RGI_Emoji_Flag_Sequence RGI_Emoji_Modifier_Sequence RGI_Emoji_Tag_Sequence
+RGI_Emoji_ZWJ_Sequence""".split())
+
+# 1. Aliases. Every alias on a line is a valid spelling in a pattern (the
+# spec's UnicodeMatchProperty/UnicodeMatchPropertyValue accept anything in
+# PropertyAliases.txt / PropertyValueAliases.txt), so each property is
+# emitted once per alias, all sharing one ranges array.
+binary_aliases = {}  # canonical long name -> set of every accepted spelling
 content = get_ucd_file(UCD_BASE + "PropertyAliases.txt")
 for line in content.splitlines():
     line = line.split('#')[0].strip()
     if not line: continue
     parts = [p.strip() for p in line.split(';')]
     if len(parts) >= 2:
-        property_aliases[parts[0]] = parts[1]
+        binary_aliases.setdefault(parts[1], set()).update(p for p in parts if p)
+binary_canonical = {a: c for c, s in binary_aliases.items() for a in s}
 
-prop_value_aliases = {} # (property, short_val) -> long_val
+gc_aliases = {}  # canonical long value -> set of every accepted spelling
+sc_aliases = {}
 content = get_ucd_file(UCD_BASE + "PropertyValueAliases.txt")
 for line in content.splitlines():
     line = line.split('#')[0].strip()
     if not line: continue
     parts = [p.strip() for p in line.split(';')]
     if len(parts) >= 3:
-        prop = parts[0]
-        if prop in ('gc', 'sc', 'scx'):
-            prop_value_aliases[parts[1]] = parts[2]
-            prop_value_aliases[parts[2]] = parts[2]
+        target = gc_aliases if parts[0] == 'gc' else sc_aliases if parts[0] == 'sc' else None
+        if target is not None:
+            target.setdefault(parts[2], set()).update(p for p in parts[1:] if p)
+gc_canonical = {a: c for c, s in gc_aliases.items() for a in s}
+sc_canonical = {a: c for c, s in sc_aliases.items() for a in s}
 
-UCD_URLS = [
-    UCD_BASE + "DerivedCoreProperties.txt",
-    UCD_BASE + "Scripts.txt",
-    UCD_BASE + "extracted/DerivedGeneralCategory.txt",
-    UCD_BASE + "PropList.txt",
-    UCD_BASE + "DerivedNormalizationProps.txt",
-]
-
-properties = {}
-
-for url in UCD_URLS:
-    content = get_ucd_file(url)
-    for line in content.splitlines():
+def parse_ranges(url):
+    out = []
+    for line in get_ucd_file(url).splitlines():
         line = line.split('#')[0].strip()
         if not line: continue
         parts = [p.strip() for p in line.split(';')]
         if len(parts) < 2: continue
-        
-        range_str, prop_name = parts[0], parts[1]
-        
-        # Only process known binary properties or specific properties we want
-        # Actually, let's keep it simple: normalize the property name.
-        if prop_name in prop_value_aliases:
-            prop_name = prop_value_aliases[prop_name]
-        elif prop_name in property_aliases:
-            prop_name = property_aliases[prop_name]
-            
+        range_str = parts[0]
         if '..' in range_str:
-            start, end = range_str.split('..')
-            start, end = int(start, 16), int(end, 16)
+            start, end = (int(x, 16) for x in range_str.split('..'))
         else:
             start = end = int(range_str, 16)
-            
-        if prop_name not in properties:
-            properties[prop_name] = []
-        properties[prop_name].append((start, end))
+        out.append((start, end, parts[1]))
+    return out
 
-# Handle emoji-data
-emoji_content = get_ucd_file(UCD_BASE + "emoji/emoji-data.txt")
-for line in emoji_content.splitlines():
-    line = line.split('#')[0].strip()
-    if not line: continue
-    parts = [p.strip() for p in line.split(';')]
-    if len(parts) < 2: continue
-    range_str, prop_name = parts[0], parts[1]
-    
-    if '..' in range_str:
-        start, end = range_str.split('..')
-        start, end = int(start, 16), int(end, 16)
-    else:
-        start = end = int(range_str, 16)
-        
-    if prop_name not in properties:
-        properties[prop_name] = []
-    properties[prop_name].append((start, end))
+# 2. Binary properties (kind BINARY), whitelisted to the ECMA table.
+binary_props = {}  # canonical -> [(start, end)]
+for url in (UCD_BASE + "DerivedCoreProperties.txt",
+            UCD_BASE + "PropList.txt",
+            UCD_BASE + "DerivedNormalizationProps.txt",
+            UCD_BASE + "extracted/DerivedBinaryProperties.txt",
+            UCD_BASE + "emoji/emoji-data.txt"):
+    for start, end, name in parse_ranges(url):
+        canonical = binary_canonical.get(name, name)
+        if canonical in ECMA_BINARY:
+            binary_props.setdefault(canonical, []).append((start, end))
+
+# 3. General_Category values (kind GC). DerivedGeneralCategory.txt lists the
+# 30 concrete categories; the grouped values (Letter, Mark, ...) are unions
+# synthesized here so the C side needs no special cases for them.
+gc_props = {}
+for start, end, name in parse_ranges(UCD_BASE + "extracted/DerivedGeneralCategory.txt"):
+    gc_props.setdefault(gc_canonical.get(name, name), []).append((start, end))
+GC_GROUPS = {
+    'Letter': ['Lu', 'Ll', 'Lt', 'Lm', 'Lo'],
+    'Cased_Letter': ['Lu', 'Ll', 'Lt'],
+    'Mark': ['Mn', 'Mc', 'Me'],
+    'Number': ['Nd', 'Nl', 'No'],
+    'Punctuation': ['Pc', 'Pd', 'Ps', 'Pe', 'Pi', 'Pf', 'Po'],
+    'Symbol': ['Sm', 'Sc', 'Sk', 'So'],
+    'Separator': ['Zs', 'Zl', 'Zp'],
+    'Other': ['Cc', 'Cf', 'Cs', 'Co', 'Cn'],
+}
+for group, members in GC_GROUPS.items():
+    gc_props[group] = [r for m in members for r in gc_props[gc_canonical[m]]]
+
+# Spec-defined synthetics with no data file of their own.
+binary_props['Any'] = [(0, 0x10FFFF)]
+binary_props['ASCII'] = [(0, 0x7F)]
+assigned, cursor = [], 0
+for start, end in sorted(gc_props[gc_canonical['Cn']]):
+    if start > cursor: assigned.append((cursor, start - 1))
+    cursor = max(cursor, end + 1)
+if cursor <= 0x10FFFF: assigned.append((cursor, 0x10FFFF))
+binary_props['Assigned'] = assigned
+
+# 4. Scripts (kind SCRIPT), as code-point sets because Script_Extensions
+# needs set arithmetic below.
+script_cps = {}  # canonical -> set of code points
+for start, end, name in parse_ranges(UCD_BASE + "Scripts.txt"):
+    script_cps.setdefault(sc_canonical.get(name, name), set()).update(range(start, end + 1))
 
 string_properties = {}
+
+# 5. Properties of strings: multi-code-point entries become sequences,
+# single-code-point entries become ordinary ranges on the same property.
+string_ranges = {}
 
 def parse_emoji_sequences(url):
     content = get_ucd_file(url)
@@ -122,62 +166,61 @@ def parse_emoji_sequences(url):
         if not line: continue
         parts = [p.strip() for p in line.split(';')]
         if len(parts) < 2: continue
-        
+
         cps_str = parts[0]
-        prop_name = parts[1]
-        
-        props_to_add = [prop_name, "RGI_Emoji"]
-        
+        props_to_add = [p for p in (parts[1], "RGI_Emoji") if p in ECMA_STRING]
+
         if '..' in cps_str:
             start_str, end_str = cps_str.split('..')
             start_seq = [int(x, 16) for x in start_str.split()]
             end_seq = [int(x, 16) for x in end_str.split()]
-            
+
             if len(start_seq) == 1:
                 for p in props_to_add:
-                    if p not in properties: properties[p] = []
-                    properties[p].append((start_seq[0], end_seq[0]))
+                    string_ranges.setdefault(p, []).append((start_seq[0], end_seq[0]))
             else:
                 prefix = start_seq[:-1]
                 for cp in range(start_seq[-1], end_seq[-1] + 1):
                     for p in props_to_add:
-                        if p not in string_properties: string_properties[p] = []
-                        string_properties[p].append(prefix + [cp])
+                        string_properties.setdefault(p, []).append(prefix + [cp])
         else:
             seq = [int(x, 16) for x in cps_str.split()]
             for p in props_to_add:
                 if len(seq) == 1:
-                    if p not in properties: properties[p] = []
-                    properties[p].append((seq[0], seq[0]))
+                    string_ranges.setdefault(p, []).append((seq[0], seq[0]))
                 else:
-                    if p not in string_properties: string_properties[p] = []
-                    string_properties[p].append(seq)
+                    string_properties.setdefault(p, []).append(seq)
 
 parse_emoji_sequences(EMOJI_URL + "emoji-sequences.txt")
 parse_emoji_sequences(EMOJI_URL + "emoji-zwj-sequences.txt")
 
-# Handle ScriptExtensions.txt
-scx_content = get_ucd_file(UCD_BASE + "ScriptExtensions.txt")
-for line in scx_content.splitlines():
+# 6. Script_Extensions (kind SCX). ScriptExtensions.txt only lists code
+# points whose scx differs from their sc; per UAX #24 every unlisted code
+# point defaults to scx = { its sc }. The complete set for a script is
+# therefore (listed scx members) union (sc members not listed at all) --
+# emitting only the file's contents, as this generator originally did,
+# produces sets missing their own script's ordinary characters (e.g.
+# scx=Greek without alpha/beta/gamma).
+scx_listed = {}   # canonical -> set of code points the file assigns it
+scx_any = set()   # every code point the file mentions at all
+for line in get_ucd_file(UCD_BASE + "ScriptExtensions.txt").splitlines():
     line = line.split('#')[0].strip()
     if not line: continue
     parts = [p.strip() for p in line.split(';')]
     if len(parts) < 2: continue
     range_str = parts[0]
-    scripts = parts[1].split()
-    
     if '..' in range_str:
-        start, end = range_str.split('..')
-        start, end = int(start, 16), int(end, 16)
+        start, end = (int(x, 16) for x in range_str.split('..'))
     else:
         start = end = int(range_str, 16)
-        
-    for script in scripts:
-        long_script = prop_value_aliases.get(script, script)
-        prop_name = f"Script_Extensions={long_script}"
-        if prop_name not in properties:
-            properties[prop_name] = []
-        properties[prop_name].append((start, end))
+    cps = set(range(start, end + 1))
+    scx_any |= cps
+    for script in parts[1].split():
+        scx_listed.setdefault(sc_canonical.get(script, script), set()).update(cps)
+
+scx_props = {}
+for canonical in set(script_cps) | set(scx_listed):
+    scx_props[canonical] = scx_listed.get(canonical, set()) | (script_cps.get(canonical, set()) - scx_any)
 
 UCD_CASE_FOLD_URL = UCD_BASE + "CaseFolding.txt"
 case_folds = []
@@ -250,7 +293,14 @@ print("#include <stdbool.h>")
 print("#include <string.h>\n")
 print("typedef struct { uint32_t start; uint32_t end; } UCDRange;")
 print("typedef struct { uint32_t cps[16]; int length; } UCDStringSequence;")
-print("typedef struct { const char* name; const UCDRange* ranges; int count; const UCDStringSequence* sequences; int sequence_count; } UCDProperty;\n")
+print("/* Which \\p{...} namespace an entry answers to -- lookup is (name, kind),")
+print(" * matching ECMA-262's grammar: bare \\p{Name} may only be BINARY or GC;")
+print(" * SCRIPT/SCX require the \\p{Script=...}/\\p{Script_Extensions=...} form. */")
+print("#define UCD_KIND_BINARY 0")
+print("#define UCD_KIND_GC     1")
+print("#define UCD_KIND_SCRIPT 2")
+print("#define UCD_KIND_SCX    3")
+print("typedef struct { const char* name; uint8_t kind; const UCDRange* ranges; int count; const UCDStringSequence* sequences; int sequence_count; } UCDProperty;\n")
 print("typedef struct { uint32_t from; uint32_t to; } CaseFoldMapping;\n")
 print("typedef struct { uint32_t cp; uint32_t mapping; } SimpleCaseMapping;")
 print("typedef struct { uint32_t cp; uint8_t lower_len; uint32_t lower[3]; uint8_t title_len; uint32_t title[3]; uint8_t upper_len; uint32_t upper[3]; } SpecialCaseMapping;")
@@ -261,42 +311,78 @@ print("typedef struct { uint32_t cp; bool is_compat; uint8_t len; uint32_t mappi
 def c_ident(name):
     return name.replace('=', '_').replace('-', '_').replace(' ', '_').replace('.', '_')
 
-prop_names = sorted(set(list(properties.keys()) + list(string_properties.keys())))
+def merge_ranges(ranges):
+    merged = []
+    for r in sorted(ranges):
+        if merged and r[0] <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], r[1]))
+        else:
+            merged.append(r)
+    return merged
 
-for prop in prop_names:
-    if prop in properties:
-        ranges = sorted(properties[prop])
-        merged = []
+def cps_to_ranges(cps):
+    ranges, run_start, prev = [], None, None
+    for cp in sorted(cps):
+        if run_start is None:
+            run_start = prev = cp
+        elif cp == prev + 1:
+            prev = cp
+        else:
+            ranges.append((run_start, prev))
+            run_start = prev = cp
+    if run_start is not None:
+        ranges.append((run_start, prev))
+    return ranges
+
+# One ranges/sequences array per (kind, canonical name); one UCD_PROPERTIES
+# entry per accepted alias spelling, all sharing that array. entries:
+# (spelling, kind macro, array ident, has_ranges, has_seqs)
+entries = []
+
+def emit_property(kind_tag, kind_macro, canonical, ranges, seqs, aliases):
+    ident = f"{kind_tag}_{c_ident(canonical)}"
+    if ranges:
+        print(f"static const UCDRange ucd_{ident}_ranges[] = {{")
         for r in ranges:
-            if not merged: merged.append(r)
-            else:
-                if r[0] <= merged[-1][1] + 1: merged[-1] = (merged[-1][0], max(merged[-1][1], r[1]))
-                else: merged.append(r)
-                
-        print(f"static const UCDRange ucd_prop_{c_ident(prop)}_ranges[] = {{")
-        for r in merged:
             print(f"    {{0x{r[0]:04X}, 0x{r[1]:04X}}},")
         print("};\n")
-
-    if prop in string_properties:
-        print(f"static const UCDStringSequence ucd_prop_{c_ident(prop)}_seqs[] = {{")
-        for seq in string_properties[prop]:
+    if seqs:
+        print(f"static const UCDStringSequence ucd_{ident}_seqs[] = {{")
+        for seq in seqs:
             cps_str = ", ".join(f"0x{cp:04X}" for cp in seq)
             print(f"    {{{{{cps_str}}}, {len(seq)}}},")
         print("};\n")
+    for spelling in sorted(aliases | {canonical}):
+        entries.append((spelling, kind_macro, ident, bool(ranges), bool(seqs)))
+
+for canonical in sorted(binary_props):
+    emit_property("bin", "UCD_KIND_BINARY", canonical, merge_ranges(binary_props[canonical]),
+                  None, binary_aliases.get(canonical, set()))
+for canonical in sorted(string_properties):
+    emit_property("bin", "UCD_KIND_BINARY", canonical, merge_ranges(string_ranges.get(canonical, [])),
+                  string_properties[canonical], set())
+for canonical in sorted(gc_props):
+    emit_property("gc", "UCD_KIND_GC", canonical, merge_ranges(gc_props[canonical]),
+                  None, gc_aliases.get(canonical, set()))
+for canonical in sorted(script_cps):
+    emit_property("sc", "UCD_KIND_SCRIPT", canonical, cps_to_ranges(script_cps[canonical]),
+                  None, sc_aliases.get(canonical, set()))
+for canonical in sorted(scx_props):
+    emit_property("scx", "UCD_KIND_SCX", canonical, cps_to_ranges(scx_props[canonical]),
+                  None, sc_aliases.get(canonical, set()))
 
 print("static const UCDProperty UCD_PROPERTIES[] = {")
-for prop in prop_names:
-    range_ptr = f"ucd_prop_{c_ident(prop)}_ranges" if prop in properties else "NULL"
-    range_count = f"sizeof(ucd_prop_{c_ident(prop)}_ranges)/sizeof(UCDRange)" if prop in properties else "0"
-    seq_ptr = f"ucd_prop_{c_ident(prop)}_seqs" if prop in string_properties else "NULL"
-    seq_count = f"sizeof(ucd_prop_{c_ident(prop)}_seqs)/sizeof(UCDStringSequence)" if prop in string_properties else "0"
-    print(f"    {{\"{prop}\", {range_ptr}, {range_count}, {seq_ptr}, {seq_count}}},")
+for spelling, kind_macro, ident, has_ranges, has_seqs in sorted(entries):
+    range_ptr = f"ucd_{ident}_ranges" if has_ranges else "NULL"
+    range_count = f"sizeof(ucd_{ident}_ranges)/sizeof(UCDRange)" if has_ranges else "0"
+    seq_ptr = f"ucd_{ident}_seqs" if has_seqs else "NULL"
+    seq_count = f"sizeof(ucd_{ident}_seqs)/sizeof(UCDStringSequence)" if has_seqs else "0"
+    print(f"    {{\"{spelling}\", {kind_macro}, {range_ptr}, {range_count}, {seq_ptr}, {seq_count}}},")
 print("};\n")
 
-print("static inline const UCDProperty* lookup_unicode_property(const char* name) {")
+print("static inline const UCDProperty* lookup_unicode_property(const char* name, int kind) {")
 print("    for (size_t i = 0; i < sizeof(UCD_PROPERTIES)/sizeof(UCD_PROPERTIES[0]); i++) {")
-print("        if (strcmp(UCD_PROPERTIES[i].name, name) == 0) return &UCD_PROPERTIES[i];")
+print("        if (UCD_PROPERTIES[i].kind == kind && strcmp(UCD_PROPERTIES[i].name, name) == 0) return &UCD_PROPERTIES[i];")
 print("    }\n    return NULL;\n}")
 
 print(f"\nstatic const CaseFoldMapping UCD_CASE_FOLD[] = {{")

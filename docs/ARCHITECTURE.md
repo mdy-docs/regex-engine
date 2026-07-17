@@ -318,10 +318,23 @@ integer offsets relative to `original_text`, which is what
 unicode.org (`UNICODE_VERSION` at the top of the script; results are cached
 under `.ucd_cache/`, gitignored) and emits, per Unicode property, a sorted
 `UCDRange[]` array plus a linear `UCD_PROPERTIES[]` table with a
-linear-scan `lookup_unicode_property(name)` (property count is small — tens
-of properties — so linear scan is fine; it's the *ranges within* a property
+linear-scan `lookup_unicode_property(name, kind)` (entry count is a few
+hundred — every accepted alias spelling is its own entry sharing one
+ranges array — so linear scan is fine; it's the *ranges within* a property
 that are binary-searched, via `rx_cp_in_ucd` in `re_lexer.c` and the inline
-lookup in `ucd.h` itself). Also generated: case-folding pairs
+lookup in `ucd.h` itself). The `kind` tag (`UCD_KIND_BINARY`/`GC`/
+`SCRIPT`/`SCX`) mirrors ECMA-262's `\p{...}` grammar: bare `\p{Name}` may
+only name a binary property or General_Category value, while Script and
+Script_Extensions values require their `\p{Script=...}`/
+`\p{Script_Extensions=...}` key — the same name (e.g. `Greek`) exists
+under both `SCRIPT` and `SCX` kinds with *different* range sets, since
+`scx` completes the file's listed exceptions with each script's own
+unlisted members per UAX #24. Binary properties are whitelisted to the
+spec's table-binary-unicode-properties (data-file extras like contributory
+properties are deliberately not emitted — real engines reject them), and
+the grouped General_Category values (`Letter`, `LC`, `punct`, ...) are
+pre-computed unions, so `re_lexer.c` needs no alias/grouping special
+cases. Also generated: case-folding pairs
 (`UCD_CASE_FOLD[]`, binary-searched by `unicode_casefold`), simple upper/
 lowercase mappings, combining-class/decomposition/composition-exclusion
 tables (present in `ucd.h` but currently **unused** by the engine — no

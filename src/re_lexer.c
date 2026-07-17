@@ -124,7 +124,7 @@ static bool rx_is_id_start(uint32_t cp) {
     if (cp == '$' || cp == '_') return true;
     if (cp < 0x80) return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z');
     static const UCDProperty* prop = NULL;
-    if (!prop) prop = lookup_unicode_property("ID_Start");
+    if (!prop) prop = lookup_unicode_property("ID_Start", UCD_KIND_BINARY);
     return rx_cp_in_ucd(prop, cp);
 }
 
@@ -133,7 +133,7 @@ static bool rx_is_id_continue(uint32_t cp) {
     if (cp == '$' || cp == '_' || cp == 0x200C || cp == 0x200D) return true;
     if (cp < 0x80) return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') || (cp >= '0' && cp <= '9');
     static const UCDProperty* prop = NULL;
-    if (!prop) prop = lookup_unicode_property("ID_Continue");
+    if (!prop) prop = lookup_unicode_property("ID_Continue", UCD_KIND_BINARY);
     return rx_cp_in_ucd(prop, cp);
 }
 
@@ -372,110 +372,62 @@ static void fill_builtin_class(CharClass* cls, char type, bool unicode) {
  * must add its own serialization around regex_compile. */
 #define MAX_PROP_CACHE 64
 static struct {
+    int kind;
     char name[64];
     CharClass cls;
 } prop_cache[MAX_PROP_CACHE];
 static int prop_cache_count = 0;
 
-/* Returns false iff the property name is unknown, or `negate` was requested
- * on a "property of strings" (e.g. \P{RGI_Emoji_Flag_Sequence}) -- negating
- * a set that contains multi-codepoint strings has no well-defined single-
- * codepoint complement, and real engines reject it as a SyntaxError
- * (confirmed: `\P{Basic_Emoji}` and `[\P{Basic_Emoji}]` both fail to
- * compile in a spec-compliant engine, not just the already-handled
- * `[^\p{Basic_Emoji}]` negated-class case). Unknown names used to be
- * silently accepted as an empty class -- so `\p{Bogus}` never matched and
- * `\P{Bogus}` matched everything, where real engines raise SyntaxError:
- * Invalid property name for both (docs/IMPROVEMENTS.md #1.9). Callers must
- * check this and set prog->error accordingly. */
-static bool fill_unicode_property(CharClass* cls, const char* prop, bool negate) {
+/* Returns false iff the \p{...} expression is invalid per ECMA-262's
+ * UnicodePropertyValueExpression grammar:
+ *   - `key` is non-NULL (the pattern was \p{Key=Value}) but isn't one of
+ *     General_Category/gc, Script/sc, Script_Extensions/scx -- the only
+ *     keys the spec admits, case-sensitively (\p{script=Greek} and
+ *     \p{Foo=Greek} are SyntaxErrors in real engines, confirmed vs Node);
+ *   - `name` isn't a valid value for that key's namespace, or (bare form,
+ *     key == NULL) isn't a binary property or General_Category value.
+ *     Every namespace's aliases (Grek/Greek, Lu/Uppercase_Letter, LC,
+ *     punct, AHex, ...) and the grouped GC values are direct table entries
+ *     in the generated ucd.h, so one kind-filtered lookup covers them all;
+ *   - the resolved property is a "property of strings" (Basic_Emoji,
+ *     RGI_Emoji, ...) and `allow_strings` is false -- callers pass
+ *     prog->unicode_sets, since those properties exist only in /v mode
+ *     (\p{Basic_Emoji}/u is a SyntaxError in real engines);
+ *   - `negate` was requested on a property of strings -- negating a set
+ *     containing multi-codepoint strings has no well-defined single-
+ *     codepoint complement (`\P{Basic_Emoji}` fails to compile even in /v).
+ * Rejected expressions are never cached (a stream of distinct bogus names
+ * must not fill the cache's 64 slots), and unknown names used to be
+ * silently accepted as an empty class -- see docs/IMPROVEMENTS.md #1.9 and
+ * the spec-compliance item below it. Callers must check the return value
+ * and set prog->error accordingly. */
+static bool fill_unicode_property(CharClass* cls, const char* key, const char* name, bool negate, bool allow_strings) {
+    int kind = -1; /* -1 = bare \p{Name}: binary or GC value */
+    if (key) {
+        if (strcmp(key, "General_Category") == 0 || strcmp(key, "gc") == 0) kind = UCD_KIND_GC;
+        else if (strcmp(key, "Script") == 0 || strcmp(key, "sc") == 0) kind = UCD_KIND_SCRIPT;
+        else if (strcmp(key, "Script_Extensions") == 0 || strcmp(key, "scx") == 0) kind = UCD_KIND_SCX;
+        else return false;
+    }
+
     CharClass temp = {0};
-    
     bool cached = false;
     for (int i = 0; i < prop_cache_count; i++) {
-        if (strcmp(prop_cache[i].name, prop) == 0) {
+        if (prop_cache[i].kind == kind && strcmp(prop_cache[i].name, name) == 0) {
             temp = prop_cache[i].cls;
             cached = true;
             break;
         }
     }
-    
-    if (!cached) {
-        if (strcmp(prop, "L") == 0 || strcmp(prop, "Letter") == 0) {
-            fill_unicode_property(&temp, "Lowercase_Letter", false);
-            fill_unicode_property(&temp, "Uppercase_Letter", false);
-            fill_unicode_property(&temp, "Titlecase_Letter", false);
-            fill_unicode_property(&temp, "Modifier_Letter", false);
-            fill_unicode_property(&temp, "Other_Letter", false);
-    } else if (strcmp(prop, "M") == 0 || strcmp(prop, "Mark") == 0 || strcmp(prop, "Combining_Mark") == 0) {
-        fill_unicode_property(&temp, "Nonspacing_Mark", false);
-        fill_unicode_property(&temp, "Spacing_Mark", false);
-        fill_unicode_property(&temp, "Enclosing_Mark", false);
-    } else if (strcmp(prop, "N") == 0 || strcmp(prop, "Number") == 0) {
-        fill_unicode_property(&temp, "Decimal_Number", false);
-        fill_unicode_property(&temp, "Letter_Number", false);
-        fill_unicode_property(&temp, "Other_Number", false);
-    } else if (strcmp(prop, "P") == 0 || strcmp(prop, "Punctuation") == 0 || strcmp(prop, "punct") == 0) {
-        fill_unicode_property(&temp, "Connector_Punctuation", false);
-        fill_unicode_property(&temp, "Dash_Punctuation", false);
-        fill_unicode_property(&temp, "Open_Punctuation", false);
-        fill_unicode_property(&temp, "Close_Punctuation", false);
-        fill_unicode_property(&temp, "Initial_Punctuation", false);
-        fill_unicode_property(&temp, "Final_Punctuation", false);
-        fill_unicode_property(&temp, "Other_Punctuation", false);
-    } else if (strcmp(prop, "S") == 0 || strcmp(prop, "Symbol") == 0) {
-        fill_unicode_property(&temp, "Math_Symbol", false);
-        fill_unicode_property(&temp, "Currency_Symbol", false);
-        fill_unicode_property(&temp, "Modifier_Symbol", false);
-        fill_unicode_property(&temp, "Other_Symbol", false);
-    } else if (strcmp(prop, "Z") == 0 || strcmp(prop, "Separator") == 0) {
-        fill_unicode_property(&temp, "Space_Separator", false);
-        fill_unicode_property(&temp, "Line_Separator", false);
-        fill_unicode_property(&temp, "Paragraph_Separator", false);
-    } else if (strcmp(prop, "C") == 0 || strcmp(prop, "Other") == 0) {
-        fill_unicode_property(&temp, "Control", false);
-        fill_unicode_property(&temp, "Format", false);
-        fill_unicode_property(&temp, "Surrogate", false);
-        fill_unicode_property(&temp, "Private_Use", false);
-        fill_unicode_property(&temp, "Unassigned", false);
-    } else {
-        const char* long_prop = prop;
-        if (strcmp(prop, "Lu") == 0) long_prop = "Uppercase_Letter";
-        else if (strcmp(prop, "Ll") == 0) long_prop = "Lowercase_Letter";
-        else if (strcmp(prop, "Lt") == 0) long_prop = "Titlecase_Letter";
-        else if (strcmp(prop, "Lm") == 0) long_prop = "Modifier_Letter";
-        else if (strcmp(prop, "Lo") == 0) long_prop = "Other_Letter";
-        else if (strcmp(prop, "Mn") == 0) long_prop = "Nonspacing_Mark";
-        else if (strcmp(prop, "Mc") == 0) long_prop = "Spacing_Mark";
-        else if (strcmp(prop, "Me") == 0) long_prop = "Enclosing_Mark";
-        else if (strcmp(prop, "Nd") == 0) long_prop = "Decimal_Number";
-        else if (strcmp(prop, "Nl") == 0) long_prop = "Letter_Number";
-        else if (strcmp(prop, "No") == 0) long_prop = "Other_Number";
-        else if (strcmp(prop, "Pc") == 0) long_prop = "Connector_Punctuation";
-        else if (strcmp(prop, "Pd") == 0) long_prop = "Dash_Punctuation";
-        else if (strcmp(prop, "Ps") == 0) long_prop = "Open_Punctuation";
-        else if (strcmp(prop, "Pe") == 0) long_prop = "Close_Punctuation";
-        else if (strcmp(prop, "Pi") == 0) long_prop = "Initial_Punctuation";
-        else if (strcmp(prop, "Pf") == 0) long_prop = "Final_Punctuation";
-        else if (strcmp(prop, "Po") == 0) long_prop = "Other_Punctuation";
-        else if (strcmp(prop, "Sm") == 0) long_prop = "Math_Symbol";
-        else if (strcmp(prop, "Sc") == 0) long_prop = "Currency_Symbol";
-        else if (strcmp(prop, "Sk") == 0) long_prop = "Modifier_Symbol";
-        else if (strcmp(prop, "So") == 0) long_prop = "Other_Symbol";
-        else if (strcmp(prop, "Zs") == 0) long_prop = "Space_Separator";
-        else if (strcmp(prop, "Zl") == 0) long_prop = "Line_Separator";
-        else if (strcmp(prop, "Zp") == 0) long_prop = "Paragraph_Separator";
-        else if (strcmp(prop, "Cc") == 0) long_prop = "Control";
-        else if (strcmp(prop, "Cf") == 0) long_prop = "Format";
-        else if (strcmp(prop, "Cs") == 0) long_prop = "Surrogate";
-        else if (strcmp(prop, "Co") == 0) long_prop = "Private_Use";
-        else if (strcmp(prop, "Cn") == 0) long_prop = "Unassigned";
 
-        const UCDProperty* ucd_prop = lookup_unicode_property(long_prop);
-        /* Unknown name: fail (and don't cache) rather than fall through
-         * with an empty class -- see the contract comment above. Returning
-         * before the cache write also stops a stream of distinct bogus
-         * names from filling the cache's 64 slots with useless entries. */
+    if (!cached) {
+        const UCDProperty* ucd_prop;
+        if (kind == -1) {
+            ucd_prop = lookup_unicode_property(name, UCD_KIND_GC);
+            if (!ucd_prop) ucd_prop = lookup_unicode_property(name, UCD_KIND_BINARY);
+        } else {
+            ucd_prop = lookup_unicode_property(name, kind);
+        }
         if (!ucd_prop) return false;
         for (int i = 0; i < ucd_prop->count; i++) {
             add_range(&temp, ucd_prop->ranges[i].start, ucd_prop->ranges[i].end);
@@ -496,15 +448,17 @@ static bool fill_unicode_property(CharClass* cls, const char* prop, bool negate)
             for (int k = 0; k < seq->length; k++) out->cps[k] = seq->cps[k];
             out->length = seq->length;
         }
-    }
 
         if (prop_cache_count < MAX_PROP_CACHE) {
-            strncpy(prop_cache[prop_cache_count].name, prop, 63);
+            prop_cache[prop_cache_count].kind = kind;
+            strncpy(prop_cache[prop_cache_count].name, name, 63);
             prop_cache[prop_cache_count].cls = temp;
             prop_cache_count++;
         }
     }
-    
+
+    if (temp.string_count > 0 && !allow_strings) return false;
+
     if (negate) {
         if (temp.string_count > 0) return false;
         uint32_t current = 0;
@@ -719,8 +673,12 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                             }
                             if (lexer->src[lexer->pos] == '}') lexer->pos++;
                             else lexer->prog->error = "SyntaxError: Unterminated Unicode property escape";
-                            
-                            if (!fill_unicode_property(&current_union, val, esc == 'P')) {
+
+                            /* \p{Key=Value}: NUL-terminate the key in place
+                             * (val already points past the '='). */
+                            const char* pkey = NULL;
+                            if (val != prop) { prop[val - prop - 1] = '\0'; pkey = prop; }
+                            if (!fill_unicode_property(&current_union, pkey, val, esc == 'P', lexer->prog->unicode_sets)) {
                                 lexer->prog->error = "SyntaxError: Invalid property name";
                                 return;
                             }
@@ -1052,8 +1010,10 @@ void next_token(Lexer* lexer) {
                         if (lexer->src[lexer->pos] == '}') lexer->pos++;
                         else lexer->prog->error = "SyntaxError: Unterminated Unicode property escape";
 
+                        const char* pkey = NULL;
+                        if (val != prop) { prop[val - prop - 1] = '\0'; pkey = prop; }
                         int cid = alloc_class(lexer->prog);
-                        if (!fill_unicode_property(&lexer->prog->classes[cid], val, esc == 'P')) {
+                        if (!fill_unicode_property(&lexer->prog->classes[cid], pkey, val, esc == 'P', lexer->prog->unicode_sets)) {
                             lexer->prog->error = "SyntaxError: Invalid property name";
                             return;
                         }

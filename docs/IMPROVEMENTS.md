@@ -779,13 +779,45 @@ bug in the same function the second bullet points at:
   a dependency the engine otherwise doesn't have — neither is warranted
   for a P3 with a documented workaround.
 
-**Residual deviation observed while verifying (not new, not fixed):** the
-`\p{...}` parser discards everything before an `=`, so `\p{Script=Greek}`,
-`\p{Foo=Greek}`, and bare `\p{Greek}` are all treated as `Greek` — real
-engines require the `Script=`/`sc=` key for script values and reject bare
-`\p{Greek}` (confirmed in Node), and would reject a bogus key. This engine
-is *more permissive* than spec here (never wrongly rejects, never wrongly
-matches a wrong class); tightening it is a separate spec-compliance item.
+~~**Residual deviation observed while verifying (not new, not fixed):** the
+`\p{...}` parser discards everything before an `=`~~ — **FIXED**, as a
+follow-up pass that went deeper than the parser: `\p{...}` now implements
+ECMA-262's actual `UnicodePropertyValueExpression` grammar, verified
+against Node across **235 cases with zero mismatches**. What that took:
+
+- **The generated `ucd.h` table is now kind-tagged** (`UCD_KIND_BINARY`/
+  `GC`/`SCRIPT`/`SCX`; lookup is `(name, kind)`), because the spec's
+  namespaces are disjoint: bare `\p{Name}` accepts only binary properties
+  and General_Category values; `Script=`/`sc=` and
+  `Script_Extensions=`/`scx=` values require their key; keys are
+  case-sensitive (`\p{script=Greek}` and `\p{Foo=Bar}` are SyntaxErrors);
+  `\p{gc=Alphabetic}` (a binary property under the gc key) is rejected.
+- **`Script_Extensions` is now real data, not dead weight.** The old
+  generator emitted scx entries under names like
+  `"Script_Extensions=Greek"` that the lexer's key-discarding could never
+  look up (confirmed unreachable), and the sets themselves were wrong —
+  `ScriptExtensions.txt` only lists code points whose scx *differs* from
+  their sc, so the file's raw contents omit each script's own ordinary
+  members (scx=Greek without α). Sets are now completed per UAX #24
+  (listed members ∪ unlisted sc members), verified on the classic
+  discriminator: U+0342 matches `\p{scx=Greek}` but not `\p{sc=Greek}`.
+- **Binary properties are whitelisted to the spec's
+  table-binary-unicode-properties** — contributory/data-file extras this
+  table used to carry (`Other_Alphabetic`, normalization quick-check
+  names, ...) are gone, matching Node's rejection of them; the spec's
+  synthetics (`Any`, `ASCII`, `Assigned`) are generated.
+- **Every accepted alias spelling is a direct table entry** sharing one
+  ranges array (`Grek`→Greek, `AHex`, `LC`, `punct`, `space`, ...), and
+  the grouped GC values (`Letter`, `Cased_Letter`, ...) are pre-computed
+  unions — which deleted `fill_unicode_property`'s ~80-line `strcmp`
+  alias/grouping chain outright (the thing §4 flagged as the least
+  readable code in the file).
+- **Properties of strings now require `/v`**: `\p{Basic_Emoji}/u` is a
+  SyntaxError, matching Node, instead of quietly working.
+
+`prop_cache` keys on `(kind, name)` now, so `sc=Greek` and `scx=Greek`
+cache separately. Regression coverage in `test/smoke.c`;
+`docs/ARCHITECTURE.md`'s UCD section describes the new table layout.
 
 Verified under ASan+UBSan against Node for every case above; permanent
 regression coverage in `test/smoke.c`.

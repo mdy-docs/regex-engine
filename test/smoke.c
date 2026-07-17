@@ -820,6 +820,99 @@ int main(void) {
         free(pfit);
     }
 
+    /* \p{...} key/namespace handling per ECMA-262 (the spec-compliance item
+     * under docs/IMPROVEMENTS.md #1.9): bare names may only be binary
+     * properties or General_Category values; Script/Script_Extensions
+     * require their keyed form; keys are case-sensitive; contributory
+     * properties are rejected; properties of strings require /v. All of
+     * this previously collapsed into "ignore everything before '=' and
+     * look the value up in one flat table" -- bare \p{Greek} was accepted,
+     * \p{Foo=Greek} was accepted, sc= and scx= were conflated. Every
+     * expectation here (and 235 cases total, in the fix's verification run)
+     * diffed against Node. */
+    {
+        uint16_t alpha[] = { 0x03B1 };   /* α: Script=Greek */
+        uint16_t perisp[] = { 0x0342 };  /* combining perispomeni: sc=Inherited, scx includes Greek */
+        int u = regex_flag_bit('u');
+
+        uint16_t* p1 = to_utf16("\\p{Greek}");
+        uintptr_t h1 = regex_compile(p1, 0, u);
+        check(h1 == 0, "bare \\p{Greek} is a SyntaxError (scripts require Script=)");
+        if (h1) regex_free(h1);
+        free(p1);
+
+        uint16_t* p2 = to_utf16("\\p{Script=Greek}");
+        uintptr_t h2 = regex_compile(p2, 0, u);
+        check(h2 != 0 && regex_exec(h2, alpha, 1, 0), "\\p{Script=Greek} matches alpha");
+        check(h2 != 0 && !regex_exec(h2, perisp, 1, 0), "\\p{Script=Greek} does NOT match U+0342 (sc=Inherited)");
+        if (h2) regex_free(h2);
+        free(p2);
+
+        uint16_t* p3 = to_utf16("\\p{Script_Extensions=Greek}");
+        uintptr_t h3 = regex_compile(p3, 0, u);
+        check(h3 != 0 && regex_exec(h3, perisp, 1, 0), "\\p{Script_Extensions=Greek} DOES match U+0342 (scx != sc)");
+        check(h3 != 0 && regex_exec(h3, alpha, 1, 0), "\\p{Script_Extensions=Greek} still matches alpha (scx completed per UAX #24)");
+        if (h3) regex_free(h3);
+        free(p3);
+
+        uint16_t* p4 = to_utf16("\\p{sc=Grek}");
+        uintptr_t h4 = regex_compile(p4, 0, u);
+        check(h4 != 0 && regex_exec(h4, alpha, 1, 0), "\\p{sc=Grek} (short key + script alias) works");
+        if (h4) regex_free(h4);
+        free(p4);
+    }
+    {
+        /* Invalid keys and namespace mixups are SyntaxErrors, matching Node:
+         * keys are case-sensitive, unknown keys rejected, a binary property
+         * is not a gc value, contributory properties aren't in the spec's
+         * binary table. */
+        const char* bad[] = { "\\p{script=Greek}", "\\p{Foo=Bar}", "\\p{gc=Alphabetic}",
+                              "\\p{gc=Greek}", "\\p{Other_Alphabetic}", "\\p{lu}" };
+        for (size_t i = 0; i < sizeof(bad)/sizeof(bad[0]); i++) {
+            uint16_t* p = to_utf16(bad[i]);
+            uintptr_t h = regex_compile(p, 0, regex_flag_bit('u'));
+            char what[96];
+            snprintf(what, sizeof(what), "%s is a SyntaxError", bad[i]);
+            check(h == 0, what);
+            if (h) regex_free(h);
+            free(p);
+        }
+    }
+    {
+        /* Aliases and grouped GC values are direct table entries now. */
+        uint16_t bang[] = { '!' };
+        uint16_t cap_a[] = { 'A' };
+        uint16_t* pp = to_utf16("\\p{punct}");
+        uintptr_t hp = regex_compile(pp, 0, regex_flag_bit('u'));
+        check(hp != 0 && regex_exec(hp, bang, 1, 0), "\\p{punct} (gc alias) matches '!'");
+        if (hp) regex_free(hp);
+        free(pp);
+
+        uint16_t* pl = to_utf16("\\p{LC}");
+        uintptr_t hl = regex_compile(pl, 0, regex_flag_bit('u'));
+        check(hl != 0 && regex_exec(hl, cap_a, 1, 0), "\\p{LC} (Cased_Letter group) matches 'A'");
+        if (hl) regex_free(hl);
+        free(pl);
+
+        uint16_t* pa = to_utf16("\\p{AHex}");
+        uintptr_t ha = regex_compile(pa, 0, regex_flag_bit('u'));
+        check(ha != 0 && regex_exec(ha, cap_a, 1, 0), "\\p{AHex} (binary alias) matches 'A'");
+        if (ha) regex_free(ha);
+        free(pa);
+    }
+    {
+        /* Properties of strings exist only in /v mode -- \p{Basic_Emoji}/u
+         * is a SyntaxError in real engines (previously accepted here). */
+        uint16_t* pattern = to_utf16("\\p{Basic_Emoji}");
+        uintptr_t hu = regex_compile(pattern, 0, regex_flag_bit('u'));
+        check(hu == 0, "\\p{Basic_Emoji} under /u is a SyntaxError (strings need /v)");
+        if (hu) regex_free(hu);
+        uintptr_t hv = regex_compile(pattern, 0, regex_flag_bit('v'));
+        check(hv != 0, "\\p{Basic_Emoji} under /v still compiles");
+        if (hv) regex_free(hv);
+        free(pattern);
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;
