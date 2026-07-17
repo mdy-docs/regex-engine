@@ -35,12 +35,17 @@
 
 /* Decode one UTF-16 code point starting at *sp, advancing *sp past it (2
  * units for a valid surrogate pair, 1 otherwise -- an unpaired surrogate
- * decodes as itself). Extracted verbatim from jsvm2's include/js_string.h;
- * this is the one dependency regexp.c has on that header, and it doesn't
- * need any of the JSString/interning machinery that comes with it. */
-static inline uint32_t decode_utf16(const uint16_t** sp) {
+ * decodes as itself). Extracted from jsvm2's include/js_string.h; this is
+ * the one dependency regexp.c has on that header, and it doesn't need any
+ * of the JSString/interning machinery that comes with it. `limit` bounds
+ * the trail-surrogate peek and is a deliberate divergence from upstream:
+ * jsvm2 only decodes NUL-terminated JSStrings, but here text need not be
+ * NUL-terminated, so a buffer whose last unit is a lead surrogate would
+ * otherwise be read one unit past its end (docs/IMPROVEMENTS.md #1.5,
+ * confirmed OOB read). */
+static inline uint32_t decode_utf16(const uint16_t** sp, const uint16_t* limit) {
     uint32_t cp = *(*sp)++;
-    if (cp >= 0xD800 && cp <= 0xDBFF) {
+    if (cp >= 0xD800 && cp <= 0xDBFF && *sp < limit) {
         if (**sp >= 0xDC00 && **sp <= 0xDFFF) {
             uint32_t trail = *(*sp)++;
             return ((cp - 0xD800) << 10) + (trail - 0xDC00) + 0x10000;
@@ -176,7 +181,7 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                     if (current.sp < text_end) {
                         uint32_t cp;
                         const uint16_t* next_sp = current.sp;
-                        if (prog->unicode) cp = decode_utf16(&next_sp);
+                        if (prog->unicode) cp = decode_utf16(&next_sp, text_end);
                         else cp = *next_sp++;
                         
                         if (prog->ignore_case) {
@@ -232,7 +237,7 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                     if (current.sp < text_end) {
                         uint32_t cp;
                         const uint16_t* next_sp = current.sp;
-                        if (prog->unicode) cp = decode_utf16(&next_sp);
+                        if (prog->unicode) cp = decode_utf16(&next_sp, text_end);
                         else cp = *next_sp++;
                         bool matched = false;
                         CharClass* cls = &prog->classes[inst.arg1];
@@ -272,13 +277,18 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
             else if (inst.op == OP_ASSERT_START) { if (current.sp == original_text || (prog->multiline && current.sp > original_text && *(current.sp - 1) == '\n')) current.pc++; else { path_failed = true; break; } }
             else if (inst.op == OP_ASSERT_END)   { if (current.sp >= text_end || (prog->multiline && *current.sp == '\n')) current.pc++; else { path_failed = true; break; } }
             else if (inst.op == OP_WORD_BOUNDARY) {
+                /* The sp < text_end guard mirrors OP_ASSERT_END's: text need
+                 * not be NUL-terminated (text_units is authoritative, per
+                 * README), so end-of-text must be detected by bound, not by
+                 * reading a terminator (docs/IMPROVEMENTS.md #1.4, confirmed
+                 * OOB read one past a tightly-sized buffer). */
                 bool left_is_word = (current.sp > original_text) && is_word_char(*(current.sp - 1));
-                bool right_is_word = is_word_char(*current.sp);
+                bool right_is_word = (current.sp < text_end) && is_word_char(*current.sp);
                 if (left_is_word != right_is_word) current.pc++; else { path_failed = true; break; }
             }
             else if (inst.op == OP_NON_WORD_BOUNDARY) {
                 bool left_is_word = (current.sp > original_text) && is_word_char(*(current.sp - 1));
-                bool right_is_word = is_word_char(*current.sp);
+                bool right_is_word = (current.sp < text_end) && is_word_char(*current.sp);
                 if (left_is_word == right_is_word) current.pc++; else { path_failed = true; break; }
             }
             else if (inst.op == OP_BACKREF || inst.op == OP_NAMED_BACKREF) {
@@ -308,8 +318,13 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                                 if (temp_sp >= text_end) { match = false; break; }
                                 uint32_t cp1, cp2;
                                 if (prog->unicode) {
-                                    cp1 = decode_utf16(&temp_sp);
-                                    cp2 = decode_utf16(&temp_start);
+                                    /* The capture-side decode is bounded by the
+                                     * capture's own end, not text_end: a capture
+                                     * ending in a lone lead surrogate must decode
+                                     * it as itself, not pair it with whatever
+                                     * text unit happens to follow the capture. */
+                                    cp1 = decode_utf16(&temp_sp, text_end);
+                                    cp2 = decode_utf16(&temp_start, end);
                                     cp1 = unicode_casefold(cp1);
                                     cp2 = unicode_casefold(cp2);
                                 } else {

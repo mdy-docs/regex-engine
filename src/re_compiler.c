@@ -276,8 +276,15 @@ void compile_into(Program* prog, const uint16_t* regex, int flags) {
         validate_named_backrefs(ast, prog, &prog->error);
     }
 
-    /* In unicode mode, backreferences to non-existent groups are early errors */
-    if (!prog->error && prog->unicode) {
+    /* Spec-wise an out-of-range numeric backreference is an early error only
+     * under /u -- Annex B instead re-reads small ones as octal/identity
+     * escapes -- but this engine has no such fallback: the lexer tokenizes
+     * backslash-digits as TOK_BACKREF in every mode, so an unvalidated id
+     * indexes captures[] far out of bounds at match time
+     * (docs/IMPROVEMENTS.md #1.6, confirmed OOB read via /(a)\999/).
+     * Validating unconditionally trades exact Annex B semantics for a
+     * SyntaxError, which is strictly safer than the UB it replaces. */
+    if (!prog->error) {
         validate_backrefs(ast, prog->group_count, &prog->error);
     }
 

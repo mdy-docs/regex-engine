@@ -1,6 +1,8 @@
 dist/
 test/smoke
 test/smoke.dSYM/
+test/smoke-asan
+test/smoke-asan.dSYM/
 *.o
 .ucd_cache/
 web/regex-engine.js

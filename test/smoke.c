@@ -479,6 +479,95 @@ int main(void) {
         regex_free(h);
     }
 
+    /* The three P1 OOB reads (docs/IMPROVEMENTS.md #1.4/#1.5/#1.6). The
+     * buffer-edge cases below use exactly-sized heap buffers with no NUL
+     * terminator and no slack -- explicitly allowed by regex_exec's contract
+     * (text_units is authoritative; see README) -- so that the pre-fix
+     * one-past-the-end reads are hard ASan violations under `make test-asan`
+     * rather than silently reading whatever byte happens to follow. */
+    {
+        /* #1.4: \b/\B at the very end of the text used to dereference one
+         * unit past text_end unconditionally (OP_ASSERT_END has the sp <
+         * text_end guard; the word-boundary ops were missing it). Behavior
+         * checked against Node: /abc\b/ matches 'abc', /abc\B/ does not. */
+        uint16_t* pattern_b = to_utf16("abc\\b");
+        uintptr_t hb = regex_compile(pattern_b, 0, 0);
+        uint16_t* text = (uint16_t*)malloc(sizeof(uint16_t) * 3);
+        text[0] = 'a'; text[1] = 'b'; text[2] = 'c';
+        check(regex_exec(hb, text, 3, 0), "\\b matches at end of a tightly-sized buffer (was: OOB read)");
+        free(pattern_b);
+        regex_free(hb);
+
+        uint16_t* pattern_nb = to_utf16("abc\\B");
+        uintptr_t hnb = regex_compile(pattern_nb, 0, 0);
+        check(!regex_exec(hnb, text, 3, 0), "\\B does not match at end of text (end-of-text is a boundary)");
+        free(pattern_nb);
+        regex_free(hnb);
+        free(text);
+    }
+    {
+        /* #1.5: decode_utf16's trail-surrogate peek used to be unbounded, so
+         * a buffer ending in a lone lead surrogate was read one unit past its
+         * end. A lone surrogate must decode as itself (Node: /./u.exec of a
+         * bare U+D83D matches it). */
+        uint16_t* pattern = to_utf16(".");
+        uintptr_t h = regex_compile(pattern, 0, regex_flag_bit('u'));
+        uint16_t* text = (uint16_t*)malloc(sizeof(uint16_t));
+        text[0] = 0xD83D;
+        int matched = regex_exec(h, text, 1, 0);
+        check(matched, "/./u matches a trailing lone lead surrogate (was: OOB read)");
+        if (matched) {
+            const int32_t* caps = regex_captures_ptr(h);
+            check(caps[0] == 0 && caps[1] == 1, "lone lead surrogate decodes as one unit, not a phantom pair");
+        }
+        free(pattern);
+        free(text);
+        regex_free(h);
+    }
+    {
+        /* #1.5, backreference path: the ignore-case backref comparison has
+         * its own decode_utf16 calls; text of two lone lead surrogates puts
+         * the second decode exactly at the buffer edge. Node:
+         * /(.)\1/iu.exec('\uD83D\uD83D') matches the whole 2-unit string. */
+        uint16_t* pattern = to_utf16("(.)\\1");
+        uintptr_t h = regex_compile(pattern, 0, regex_flag_bit('i') | regex_flag_bit('u'));
+        uint16_t* text = (uint16_t*)malloc(sizeof(uint16_t) * 2);
+        text[0] = 0xD83D; text[1] = 0xD83D;
+        int matched = regex_exec(h, text, 2, 0);
+        check(matched, "/(.)\\1/iu matches two lone lead surrogates (backref decode at buffer edge)");
+        if (matched) {
+            const int32_t* caps = regex_captures_ptr(h);
+            check(caps[0] == 0 && caps[1] == 2, "backref match spans both units");
+        }
+        free(pattern);
+        free(text);
+        regex_free(h);
+    }
+    {
+        /* #1.6: out-of-range numeric backreferences were only validated
+         * under /u; in non-unicode mode /(a)\999/ emitted OP_BACKREF 999,
+         * indexing captures[] far out of bounds at match time. Now a
+         * SyntaxError in every mode -- a documented deviation from Annex B
+         * (which re-reads small out-of-range \N as octal/identity escapes,
+         * a fallback this engine has never implemented) in exchange for
+         * closing the OOB read. */
+        uint16_t* bad = to_utf16("(a)\\999");
+        uintptr_t hbad = regex_compile(bad, 0, 0);
+        check(hbad == 0, "non-/u (a)\\999 is a clean compile error, not an OOB read at match time");
+        check(hbad == 0 && strstr(regex_last_error(), "backreference") != NULL,
+              "out-of-range backref error message names the problem");
+        if (hbad) regex_free(hbad);
+        free(bad);
+
+        uint16_t* good = to_utf16("(a)\\1");
+        uintptr_t hgood = regex_compile(good, 0, 0);
+        check(hgood != 0, "non-/u (a)\\1 (in-range backref) still compiles");
+        uint16_t text[] = { 'a', 'a' };
+        check(regex_exec(hgood, text, 2, 0), "non-/u (a)\\1 still matches 'aa'");
+        free(good);
+        regex_free(hgood);
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;

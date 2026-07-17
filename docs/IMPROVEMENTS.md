@@ -34,9 +34,9 @@ predictably, along the mapping `docs/ARCHITECTURE.md`'s intro describes.
 | 1.1 | 3 nested lookarounds crashes the process (stack overflow) | **P0 — crash/DoS** | ✅ ASan + plain build — **FIXED** |
 | 1.2 | `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS`/`MAX_COUNTERS` never bounds-checked → heap/stack corruption | **P0 — memory corruption** | ✅ ASan — **FIXED** |
 | 1.3 | Flat (non-nested) long patterns also stack-overflow via linear AST recursion | **P0 — crash/DoS** | ✅ ASan — **FIXED** |
-| 1.4 | `\b`/`\B` read one code unit past `text_end` unconditionally | P1 — OOB read | ✅ ASan |
-| 1.5 | `decode_utf16` reads past buffer end for a trailing lone lead surrogate | P1 — OOB read | ✅ ASan |
-| 1.6 | Backreference bounds only validated under `/u` — `\999` OOB-reads in Annex B mode | P1 — OOB read | ✅ ASan |
+| 1.4 | `\b`/`\B` read one code unit past `text_end` unconditionally | P1 — OOB read | ✅ ASan — **FIXED** |
+| 1.5 | `decode_utf16` reads past buffer end for a trailing lone lead surrogate | P1 — OOB read | ✅ ASan — **FIXED** |
+| 1.6 | Backreference bounds only validated under `/u` — `\999` OOB-reads in Annex B mode | P1 — OOB read | ✅ ASan — **FIXED** |
 | 1.7 | Non-unicode `.`/`\D`/`\W`/`\S` wrongly capped at codepoint 255 instead of 0xFFFF | P1 — wrong results | ✅ diffed vs Node |
 | 1.8 | `OP_CLEAR_CAPTURES` defined + VM-implemented but never emitted — stale captures leak across alternation | P2 — wrong results | ✅ diffed vs Node |
 | 1.9 | Assorted silent-truncation spots | P3 — minor | inspection |
@@ -439,7 +439,7 @@ stack frame or a separate, much tighter (single-digit) lookaround-nesting
 cap at parse time — deliberately not bundled into this fix, which was
 scoped to the `validate_group_names`-and-siblings bug specifically.
 
-### 1.4 [P1] `\b`/`\B` read one past `text_end` unconditionally
+### 1.4 [P1] `\b`/`\B` read one past `text_end` unconditionally — **FIXED**
 
 ```c
 else if (inst.op == OP_WORD_BOUNDARY) {
@@ -470,7 +470,23 @@ fault.
 
 **Fix:** `bool right_is_word = (current.sp < text_end) && is_word_char(*current.sp);`
 
-### 1.5 [P1] `decode_utf16` reads past the buffer for a trailing lone lead surrogate
+**Fixed** exactly as suggested above, applied to both `OP_WORD_BOUNDARY` and
+`OP_NON_WORD_BOUNDARY`. **Verified** (ASan+UBSan, zero warnings under
+`-Wall -Wextra`): the original repro (`/abc\b/` against an exactly-3-unit
+heap buffer, no NUL, no slack) now matches cleanly with no sanitizer report,
+and the same buffer under `/abc\B/` correctly fails to match (end-of-text is
+a word boundary). `\b`/`\B` against a zero-length text also checked against
+Node (`/\b/.test('')` is `false`, `/\B/.test('')` is `true` — this engine
+agrees). The pre-fix code was re-confirmed to trip ASan
+(`heap-buffer-overflow` in the `OP_WORD_BOUNDARY` handler) on the new
+regression test before the fix was applied — i.e. the test genuinely guards
+this, it doesn't just pass vacuously. Permanent regression coverage in
+`test/smoke.c`, which is now also runnable under sanitizers via a new
+`make test-asan` target (see §3 — a plain build can pass these
+buffer-edge tests by silently reading adjacent memory; only the sanitizer
+build actually proves them).
+
+### 1.5 [P1] `decode_utf16` reads past the buffer for a trailing lone lead surrogate — **FIXED**
 
 ```c
 static inline uint32_t decode_utf16(const uint16_t** sp) {
@@ -498,7 +514,29 @@ it only receives the moving pointer, not a limit. This is a slightly more
 invasive fix than 1.4 since it changes a shared helper's signature, but
 every call site already has `text_end` in scope.
 
-### 1.6 [P1] Backreference bounds only validated under `/u`
+**Fixed** as suggested: `decode_utf16` now takes a `limit` parameter
+bounding the trail-surrogate peek (a lone lead surrogate at the limit
+decodes as itself, per spec), threaded through all four call sites. Three
+pass `text_end`; the fourth — the ignore-case backreference comparison's
+*capture-side* decode (`re_vm.c`, `OP_BACKREF`'s `/iu` loop) — deliberately
+passes the capture's own `end` instead, since a capture ending in a lone
+lead surrogate must decode it as itself rather than pairing it with
+whatever text unit happens to follow the capture (that decode could
+otherwise never read out of bounds of the *text*, but could read past the
+*capture*, which is a semantic bug of the same shape). The helper's
+"extracted verbatim from jsvm2" status is now "extracted, plus a bounds
+parameter" — jsvm2 only ever decodes NUL-terminated JSStrings, so upstream
+doesn't have this bug in practice, but the divergence is called out in the
+comment on the function. **Verified** (ASan+UBSan, zero warnings): the
+original repro (`/./u` against a 1-unit buffer holding only `0xD83D`, no
+NUL, no slack) matches the lone surrogate as a single unit with no
+sanitizer report, and `/(.)\1/iu` against two lone lead surrogates
+(exercising the backreference decode exactly at the buffer edge) matches
+the full 2-unit span — both outcomes confirmed identical in Node.
+Permanent regression coverage for both in `test/smoke.c` (meaningful under
+`make test-asan`, same caveat as 1.4).
+
+### 1.6 [P1] Backreference bounds only validated under `/u` — **FIXED**
 
 ```c
 /* In unicode mode, backreferences to non-existent groups are early errors */
@@ -536,6 +574,20 @@ semantics (treating small out-of-range backrefs as octal/identity escapes
 instead of hard errors). Doing the full Annex B fallback is a bigger,
 separate spec-compliance project; closing the memory-safety hole doesn't
 require it.
+
+**Fixed** with the minimal option: the `&& prog->unicode` gate on
+`validate_backrefs` in `compile_into` (`re_compiler.c`) is gone, so
+out-of-range numeric backreferences are a compile-time `SyntaxError` in
+every mode. This is a **known, deliberate deviation from Annex B** (Node
+accepts `/(a)\999/` un-flagged and treats `\9`-ish escapes as
+octal/identity fallbacks; this engine now rejects it) — documented in the
+comment at the validation site. The full Annex B fallback remains a
+separate spec-compliance project, per the paragraph above. **Verified**
+(ASan+UBSan, zero warnings): `/(a)\999/` un-flagged now fails compilation
+with `SyntaxError: Invalid backreference` instead of OOB-reading
+`captures[]` at match time; in-range non-`/u` backrefs (`/(a)\1/` against
+`"aa"`) still compile and match. Permanent regression coverage in
+`test/smoke.c`.
 
 ### 1.7 [P1] Non-unicode-mode builtin classes wrongly capped at codepoint 255
 
@@ -681,10 +733,13 @@ guarding against any of them once fixed.
   `docs/ARCHITECTURE.md`/README, could double as this if it's split into
   a `test` job that gates the `deploy` job.)
 - **No memory-safety testing.** Every finding in §1 above was found with
-  a throwaway ASan probe in ten minutes. Adding a `make test-asan` target
-  (same `test/smoke.c`, built with `-fsanitize=address,undefined`) and
-  running it in CI would have caught 1.1–1.6 automatically, and cheaply
-  guards against regressions once fixed.
+  a throwaway ASan probe in ten minutes. ~~Adding a `make test-asan` target
+  (same `test/smoke.c`, built with `-fsanitize=address,undefined`)~~ —
+  **the target now exists** (added alongside the 1.4/1.5 fixes, whose
+  buffer-edge regression tests are only meaningful under a sanitizer: a
+  plain build can pass them by silently reading adjacent memory). Still
+  outstanding: running it in CI, which doesn't exist yet (previous
+  bullet).
 - **No fuzzing.** `regex_compile` + `regex_exec` is an unusually clean
   fuzz target — two pure functions, deterministic, small state, already
   isolated behind a stable C API. A libFuzzer harness that feeds random
@@ -790,10 +845,16 @@ If tackling this list, roughly in order of (safety impact) / (effort):
    copy instead of relying on struct-assignment). All four original P0
    crash/memory-corruption findings (1.1, 1.2, 1.3, and the 1.2-shaped
    1.3 interaction above) are now fixed.
-4. **1.4** and **1.5** (the two unconditional OOB reads) — one-line-ish
-   guards each.
-5. **1.6** (unconditional backref bounds validation) — drop one `&&
-   prog->unicode` condition.
+4. ~~**1.4** and **1.5** (the two unconditional OOB reads)~~ — **done**:
+   `\b`/`\B` now bound their right-side peek by `text_end`, and
+   `decode_utf16` takes a `limit` parameter (with the backreference
+   comparison's capture-side decode bounded by the capture's own `end`,
+   not `text_end` — see 1.5's write-up). Both came with a new
+   `make test-asan` target, since a plain build can't observe these.
+5. ~~**1.6** (unconditional backref bounds validation)~~ — **done**: the
+   `&& prog->unicode` gate is dropped; out-of-range numeric backrefs are
+   now a `SyntaxError` in every mode (a documented Annex B deviation —
+   see 1.6's write-up). All three P1 OOB reads are now closed.
 6. **1.7** (the `255` → `0xFFFF` cap fix) — mechanical, but grep carefully
    for every occurrence and verify each one against real JS behavior
    rather than pattern-matching blindly, since not every `255`/`0x10FFFF`

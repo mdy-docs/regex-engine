@@ -63,6 +63,7 @@ web/                   browser regex-playground demo, deployed to GitHub Pages
 
 ```sh
 make test       # native smoke test, cc only, fast — run this after any src/re_*.c change
+make test-asan  # same suite under ASan+UBSan — run this too if you touched the VM or any buffer handling
 make wasm       # emcc build -> dist/regex-engine.js + .wasm (needs emcc on PATH)
 make test-wasm  # builds wasm, runs test/node_smoke.mjs against the real artifact
 make demo       # builds wasm, copies artifacts into web/, so the demo runs locally
@@ -85,22 +86,20 @@ for the cases you changed.
   `MAX_GROUPS`, `MAX_COUNTERS` in `include/regexp.h`), always heap-allocated,
   never on the stack, and **compiled once and reused** across many
   `regex_exec` calls — don't recompile per match attempt.
-- **None of those `MAX_*` bounds are enforced at compile time.** A pattern
-  with more than 64 character classes, 255 capture groups, 16 bounded
-  quantifiers, or 16384 opcodes overflows a fixed-size array inside
-  `compile_into` (`re_compiler.c`) or `vm_execute_internal` (`re_vm.c`) —
-  confirmed via ASan as real heap/
-  stack corruption, not a theoretical concern. See `docs/IMPROVEMENTS.md`
-  §Correctness (P0 items) before exposing pattern compilation to
-  untrusted/adversarial input (e.g. the web demo, or any embedding project
-  that takes user-supplied patterns) — either add bounds checks or clamp
-  input size upstream first.
+- **All of those `MAX_*` bounds are now enforced at compile time** (they
+  weren't originally — see `docs/IMPROVEMENTS.md` §Correctness, P0 items,
+  all fixed): exceeding one sets `prog->error` and fails compilation
+  cleanly instead of overflowing a fixed-size array. If you add a new
+  allocation site against any of these arrays, follow the same
+  check-before-index pattern (`docs/IMPROVEMENTS.md` #1.2) — the bound
+  being enforced elsewhere won't protect your new site.
 - `regex_compile`'s `pattern` **must be NUL-terminated**; `regex_exec`'s
-  `text` does **not** need to be, and `text_units` is authoritative. `\b`/
-  `\B` currently dereference one past `text_end` unconditionally (see
-  `docs/IMPROVEMENTS.md`) — a real overread on a tightly-sized non-NUL-
-  terminated buffer. Until fixed, over-allocate `text` by at least one
-  spare readable unit if you're calling `regex_exec` directly.
+  `text` does **not** need to be, and `text_units` is authoritative — a
+  tightly-sized, non-NUL-terminated buffer is fully supported (the
+  `\b`/`\B` and lone-surrogate overreads that used to violate this are
+  fixed; `make test-asan` guards them). New match-time code that peeks
+  ahead must bound the peek by `text_end`, never by looking for a
+  terminator.
 - `include/ucd.h` is **generated** — never hand-edit it; change
   `scripts/generate_ucd.py` and regenerate (`python3 scripts/generate_ucd.py
   > include/ucd.h`).

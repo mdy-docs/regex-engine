@@ -7,7 +7,7 @@ WASM_TARGET = $(WASM_OUT_DIR)/regex-engine.js
 ENGINE_SRCS = src/re_lexer.c src/re_parser.c src/re_compiler.c src/re_vm.c
 WASM_SRCS = $(ENGINE_SRCS) src/regex_wasm.c
 
-.PHONY: all clean test test-wasm wasm demo
+.PHONY: all clean test test-asan test-wasm wasm demo
 
 all: test/smoke
 
@@ -19,6 +19,16 @@ test/smoke: $(ENGINE_SRCS) src/regex_wasm.c test/smoke.c
 
 test: test/smoke
 	./test/smoke
+
+# Same smoke test under ASan+UBSan. The OOB-read regression tests
+# (docs/IMPROVEMENTS.md #1.4/#1.5) exercise one-past-the-end reads on
+# tightly-sized buffers -- a plain build can pass those by silently reading
+# adjacent memory, so only this target actually proves them fixed.
+test/smoke-asan: $(ENGINE_SRCS) src/regex_wasm.c test/smoke.c
+	$(CC) $(CFLAGS) -fsanitize=address,undefined $(ENGINE_SRCS) src/regex_wasm.c test/smoke.c -o test/smoke-asan
+
+test-asan: test/smoke-asan
+	./test/smoke-asan
 
 # End-to-end check of the actual compiled dist/regex-engine.wasm through its
 # real JS glue (requires `make wasm` first, and Node).
@@ -68,4 +78,4 @@ demo: wasm
 	@echo "  python3 -m http.server -d web"
 
 clean:
-	rm -rf test/smoke test/smoke.dSYM $(WASM_OUT_DIR) web/regex-engine.js web/regex-engine.wasm
+	rm -rf test/smoke test/smoke.dSYM test/smoke-asan test/smoke-asan.dSYM $(WASM_OUT_DIR) web/regex-engine.js web/regex-engine.wasm
