@@ -913,6 +913,36 @@ int main(void) {
         free(pattern);
     }
 
+    /* The backtrack stack grows on demand. Regression test for a confirmed
+     * crash (found while benchmarking, unlisted in docs/IMPROVEMENTS.md's
+     * original section 1): the greedy-quantifier loop pushes one backtrack
+     * entry per iteration into what was a fixed 512-slot heap array with
+     * UNCHECKED pushes -- [a-z]+ against ~600 consecutive matching units
+     * wrote past its end (ASan: heap-buffer-overflow in thread_copy_state).
+     * Text-driven, unlike the pattern-driven overflows of #1.2: any
+     * quantifier over a long enough run of ordinary text triggered it. */
+    {
+        int n = 100000;
+        uint16_t* text = (uint16_t*)malloc(sizeof(uint16_t) * n);
+        for (int i = 0; i < n; i++) text[i] = (uint16_t)('a' + (i % 26));
+        uint16_t* pattern = to_utf16("[a-z]+");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        int m = regex_exec(h, text, n, 0);
+        const int32_t* caps = regex_captures_ptr(h);
+        check(m && caps[0] == 0 && caps[1] == n, "[a-z]+ matches a 100k-unit run (was: heap overflow past 512 backtrack slots)");
+        free(pattern);
+        regex_free(h);
+
+        uint16_t* pu = to_utf16("\\p{L}+");
+        uintptr_t hu = regex_compile(pu, 0, regex_flag_bit('u'));
+        int mu = regex_exec(hu, text, n, 0);
+        const int32_t* capsu = regex_captures_ptr(hu);
+        check(mu && capsu[0] == 0 && capsu[1] == n, "\\p{L}+/u matches the same 100k-unit run");
+        free(pu);
+        regex_free(hu);
+        free(text);
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;

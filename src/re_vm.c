@@ -129,33 +129,74 @@ static inline void thread_copy_state(Thread* dst, const Thread* src, int cap_pai
 }
 
 #define VM_STACK_CAPACITY 512
+/* Hard ceiling for backtrack-stack growth. The greedy-quantifier loop
+ * (OP_CHECK_COUNTER) pushes one backtrack entry per iteration, so a single
+ * quantifier matching a run of N units needs N live entries -- the stack
+ * was a fixed Thread[512] with UNCHECKED pushes, meaning e.g. [a-z]+
+ * against 600 consecutive letters wrote past its end (confirmed via ASan:
+ * heap-buffer-overflow in thread_copy_state -- a text-driven memory-safety
+ * bug, unlike the pattern-driven ones in docs/IMPROVEMENTS.md #1.2). The
+ * stack now doubles on demand up to this many entries; a match needing
+ * more is abandoned as no-match (a documented engine limit, like
+ * MAX_GROUPS -- there's no error channel on the exec path) rather than
+ * corrupting memory. 2^19 entries * ~250B/entry caps the worst case
+ * around 130MB, tolerable transiently even under WASM's default heap. */
+#define VM_STACK_MAX (1 << 19)
+
+/* Doubles the backtrack stack and its captures arena in tandem. Every
+ * stack slot's .captures points into the arena at a fixed stride, so a
+ * realloc that moves the arena invalidates all of them -- they're rebased
+ * below. (The capture *data* -- pointers into the subject text -- moves
+ * with the realloc and stays valid; it's only the slot->arena pointers
+ * that need recomputing. `current`'s captures live in their own
+ * allocation, not the arena, precisely so growth never moves them.)
+ * Returns false only at VM_STACK_MAX; allocation failure stays fatal,
+ * matching the existing OOM policy at the top of vm_execute_internal. */
+static bool vm_grow_stack(Thread** stack, const uint16_t*** arena, int* capacity, int cap_pairs) {
+    if (*capacity >= VM_STACK_MAX) return false;
+    int new_capacity = *capacity * 2;
+    Thread* new_stack = realloc(*stack, sizeof(Thread) * (size_t)new_capacity);
+    const uint16_t** new_arena = realloc((void*)*arena, sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)new_capacity);
+    if (!new_stack || !new_arena) {
+        fprintf(stderr, "Fatal Error: Out of memory\n");
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < new_capacity; i++) new_stack[i].captures = new_arena + (size_t)i * cap_pairs;
+    *stack = new_stack;
+    *arena = new_arena;
+    *capacity = new_capacity;
+    return true;
+}
 
 bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures) {
     int cap_pairs = (prog->group_count + 1) * 2;
 
-    /* One arena for every backtrack-stack thread's captures, plus one more
-     * slice for `current` (the thread actively being stepped through
-     * instructions, outside the stack array) -- see the Thread/
-     * thread_copy_state comments above for why this, and the stack/
-     * fail_cache arrays below, are heap-allocated here rather than being
-     * plain C-stack locals like they used to be: this function recurses
-     * into itself for every OP_LOOKAHEAD/OP_LOOKBEHIND, so whatever these
-     * cost used to be paid again on the C stack at every nesting level. */
-    const uint16_t** captures_arena = malloc(sizeof(uint16_t*) * (size_t)cap_pairs * (VM_STACK_CAPACITY + 1));
-    Thread* stack = malloc(sizeof(Thread) * VM_STACK_CAPACITY);
+    /* One arena slice per backtrack-stack slot, plus a separate allocation
+     * for `current` (the thread actively being stepped through
+     * instructions, outside the stack array -- separate so vm_grow_stack's
+     * arena realloc never moves it) -- see the Thread/thread_copy_state
+     * comments above for why this, and the stack/fail_cache arrays below,
+     * are heap-allocated here rather than being plain C-stack locals like
+     * they used to be: this function recurses into itself for every
+     * OP_LOOKAHEAD/OP_LOOKBEHIND, so whatever these cost used to be paid
+     * again on the C stack at every nesting level. */
+    int stack_capacity = VM_STACK_CAPACITY;
+    const uint16_t** captures_arena = malloc(sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)stack_capacity);
+    Thread* stack = malloc(sizeof(Thread) * (size_t)stack_capacity);
     CacheEntry* fail_cache = malloc(sizeof(CacheEntry) * CACHE_SIZE);
-    if (!captures_arena || !stack || !fail_cache) {
+    const uint16_t** current_captures = malloc(sizeof(uint16_t*) * (size_t)cap_pairs);
+    if (!captures_arena || !stack || !fail_cache || !current_captures) {
         fprintf(stderr, "Fatal Error: Out of memory\n");
         exit(EXIT_FAILURE);
     }
     int stack_ptr = 0;
     bool result = false;
 
-    for (int i = 0; i < VM_STACK_CAPACITY; i++) stack[i].captures = captures_arena + (size_t)i * cap_pairs;
+    for (int i = 0; i < stack_capacity; i++) stack[i].captures = captures_arena + (size_t)i * cap_pairs;
     for (int i = 0; i < CACHE_SIZE; i++) fail_cache[i].pc = -1;
 
     Thread current;
-    current.captures = captures_arena + (size_t)VM_STACK_CAPACITY * cap_pairs;
+    current.captures = current_captures;
 
     stack[0].pc = start_pc;
     stack[0].sp = search_start;
@@ -438,6 +479,9 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                 current.pc++;
             }
             else if (inst.op == OP_SPLIT) {
+                /* Every push site checks capacity first; hitting VM_STACK_MAX
+                 * abandons the whole match (see the define above). */
+                if (stack_ptr == stack_capacity && !vm_grow_stack(&stack, &captures_arena, &stack_capacity, cap_pairs)) goto cleanup;
                 thread_copy_state(&stack[stack_ptr], &current, cap_pairs);
                 stack[stack_ptr].pc = inst.arg2;
                 stack_ptr++;
@@ -454,6 +498,7 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                     if (c < min) current.pc++;
                     else if (max != -1 && c == max) current.pc = exit_pc;
                     else {
+                        if (stack_ptr == stack_capacity && !vm_grow_stack(&stack, &captures_arena, &stack_capacity, cap_pairs)) goto cleanup;
                         if (inst.lazy) {
                             thread_copy_state(&stack[stack_ptr], &current, cap_pairs);
                             stack[stack_ptr].pc = current.pc + 1;
@@ -481,6 +526,7 @@ cleanup:
     free(captures_arena);
     free(stack);
     free(fail_cache);
+    free(current_captures);
     return result;
 }
 
