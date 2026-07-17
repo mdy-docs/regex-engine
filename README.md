@@ -1,4 +1,4 @@
-# regex-engine
+# baru-re
 
 A standalone C regex engine (ECMAScript-flavored: named groups, lookbehind,
 Unicode property escapes, `/u`/`/v` mode, etc.), extracted from the jsvm2
@@ -6,7 +6,10 @@ JavaScript engine with a thin WASM shim on top. Zero runtime dependencies
 beyond libc — no GC, no string-interning, no host-engine `Value`/`Object`
 types.
 
-**Try it live:** [the WASM playground demo](https://mdy-docs.github.io/regex-engine/)
+**The name:** *bārû* is the Babylonian term for a diviner — a reader of
+signs and patterns — plus *RE* for regular expression.
+
+**Try it live:** [the WASM playground demo](https://mdy-docs.github.io/baru-re/)
 (source in `web/`, published via `.github/workflows/pages.yml`) runs this
 exact engine, compiled to WebAssembly, entirely in your browser.
 
@@ -82,7 +85,7 @@ docs/
 
 ```sh
 make test       # native smoke test (cc, no Emscripten needed)
-make wasm       # emcc build -> dist/regex-engine.js + dist/regex-engine.wasm
+make wasm       # emcc build -> dist/baru-re.js + dist/baru-re.wasm
 make test-wasm  # builds wasm, then runs node_smoke.mjs against the real artifact
 make demo       # builds wasm, copies artifacts into web/ for local testing
 ```
@@ -99,7 +102,7 @@ Fetches from unicode.org on first run, caching each source file under
 are offline/instant. No dependencies beyond the Python 3 standard library.
 
 `make wasm` needs `emcc` on `PATH` (Emscripten SDK). The build is
-`MODULARIZE=1`, exporting a factory function `createRegexEngineModule`
+`MODULARIZE=1`, exporting a factory function `createBaruReModule`
 importable from either a browser or Node (`ENVIRONMENT=web,node`).
 
 ## API (`src/regex_wasm.c` / `include/regex_wasm.h`)
@@ -146,8 +149,8 @@ Notes:
 ### Minimal JS usage sketch (see `test/node_smoke.mjs` for a full working example)
 
 ```js
-import createRegexEngineModule from "./dist/regex-engine.js";
-const Module = await createRegexEngineModule();
+import createBaruReModule from "./dist/baru-re.js";
+const Module = await createBaruReModule();
 const regex_compile = Module.cwrap("regex_compile", "number", ["number", "number", "number"]);
 // ...cwrap the rest per regex_wasm.h...
 
@@ -178,7 +181,7 @@ To run it locally:
 make demo                       # builds wasm, copies artifacts into web/
 python3 -m http.server -d web   # then open http://localhost:8000/
 ```
-(`regex-engine.js`/`.wasm` fetched by the page over `file://` won't work in
+(`baru-re.js`/`.wasm` fetched by the page over `file://` won't work in
 most browsers — serve it over `http://`.)
 
 It's deployed automatically to GitHub Pages by

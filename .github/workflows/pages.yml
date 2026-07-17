@@ -2,7 +2,7 @@ name: Deploy playground to GitHub Pages
 
 # Builds src/regexp.c + src/regex_wasm.c to WASM (same `make wasm` used
 # locally) and publishes web/ + the freshly-built artifacts as the GitHub
-# Pages site. Nothing under web/regex-engine.{js,wasm} is committed to git
+# Pages site. Nothing under web/baru-re.{js,wasm} is committed to git
 # (see .gitignore) -- this workflow is what produces them for the deployed
 # site, same as `make demo` does for local testing.
 #
@@ -48,7 +48,7 @@ jobs:
         run: |
           mkdir -p _site
           cp web/index.html web/style.css web/app.js _site/
-          cp dist/regex-engine.js dist/regex-engine.wasm _site/
+          cp dist/baru-re.js dist/baru-re.wasm _site/
 
       - uses: actions/upload-pages-artifact@v3
         with:

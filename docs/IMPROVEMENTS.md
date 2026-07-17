@@ -196,7 +196,7 @@ the same depth as a native build (confirmed: 5 levels of `(?=` nesting
 now compiles and matches fine; ~20 still overflows — this raises the
 threshold, it does not remove it). `web/app.js` additionally catches that
 `RuntimeError` and transparently re-instantiates a fresh module (confirmed
-safe: a brand-new `createRegexEngineModule()` instance works normally
+safe: a brand-new `createBaruReModule()` instance works normally
 immediately after a caught trap in a different instance) so the demo
 degrades to an error message instead of a dead page. **This is a build-
 level and host-level stopgap, not a fix** — the source-level fixes below

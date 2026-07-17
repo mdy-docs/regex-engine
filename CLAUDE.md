@@ -64,7 +64,7 @@ web/                   browser regex-playground demo, deployed to GitHub Pages
 ```sh
 make test       # native smoke test, cc only, fast — run this after any src/re_*.c change
 make test-asan  # same suite under ASan+UBSan — run this too if you touched the VM or any buffer handling
-make wasm       # emcc build -> dist/regex-engine.js + .wasm (needs emcc on PATH)
+make wasm       # emcc build -> dist/baru-re.js + .wasm (needs emcc on PATH)
 make test-wasm  # builds wasm, runs test/node_smoke.mjs against the real artifact
 make demo       # builds wasm, copies artifacts into web/, so the demo runs locally
 ```

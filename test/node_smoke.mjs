@@ -1,10 +1,10 @@
-// End-to-end sanity check of the actual compiled dist/regex-engine.wasm
+// End-to-end sanity check of the actual compiled dist/baru-re.wasm
 // through its real JS glue (not the native shim test) -- run with:
 //   node test/node_smoke.mjs
 // after `make wasm`.
-import createRegexEngineModule from "../dist/regex-engine.js";
+import createBaruReModule from "../dist/baru-re.js";
 
-const Module = await createRegexEngineModule();
+const Module = await createBaruReModule();
 
 const regex_flag_bit = Module.cwrap("regex_flag_bit", "number", ["number"]);
 const regex_compile = Module.cwrap("regex_compile", "number", ["number", "number", "number"]);

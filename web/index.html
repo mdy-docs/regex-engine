@@ -3,18 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>regex-engine — WASM playground</title>
+<title>baru-re — WASM playground</title>
 <meta name="description" content="Live playground for a standalone ECMAScript-flavored regex engine, compiled to WebAssembly.">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header>
-  <h1>regex-engine <span class="sub">WASM playground</span></h1>
+  <h1>baru-re <span class="sub">WASM playground</span></h1>
   <p class="tagline">
     A standalone C regex engine (ECMAScript-flavored: named groups, lookaround,
     <code>\p{&#8230;}</code> Unicode properties, <code>/u</code>/<code>/v</code> mode)
     running <strong>as compiled WebAssembly, in your browser</strong> — no server involved.
-    <a href="https://github.com/mdy-docs/regex-engine" id="repo-link">Source on GitHub</a>
+    <a href="https://github.com/mdy-docs/baru-re" id="repo-link">Source on GitHub</a>
   </p>
 </header>
 
@@ -69,7 +69,7 @@
   <p>
     <strong>Known limitations:</strong> this engine has a few confirmed correctness
     issues — see
-    <a href="https://github.com/mdy-docs/regex-engine/blob/main/docs/IMPROVEMENTS.md">docs/IMPROVEMENTS.md</a>
+    <a href="https://github.com/mdy-docs/baru-re/blob/main/docs/IMPROVEMENTS.md">docs/IMPROVEMENTS.md</a>
     for the full list with reproductions. The crash this page used to warn about here
     (deeply nested lookaround exhausting the stack) is fixed; the remaining known issues
     are wrong-answer bugs, not confirmed crashes. This page still catches a WASM-level
@@ -78,7 +78,7 @@
   </p>
 </footer>
 
-<script src="./regex-engine.js"></script>
+<script src="./baru-re.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

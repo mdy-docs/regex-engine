@@ -3,7 +3,7 @@ CFLAGS ?= -Wall -Wextra -O2 -g -Iinclude
 EMCC ?= emcc
 
 WASM_OUT_DIR = dist
-WASM_TARGET = $(WASM_OUT_DIR)/regex-engine.js
+WASM_TARGET = $(WASM_OUT_DIR)/baru-re.js
 ENGINE_SRCS = src/re_lexer.c src/re_parser.c src/re_compiler.c src/re_vm.c
 WASM_SRCS = $(ENGINE_SRCS) src/regex_wasm.c
 
@@ -33,7 +33,7 @@ test/smoke-asan: $(ENGINE_SRCS) src/regex_wasm.c test/smoke.c
 test-asan: test/smoke-asan
 	./test/smoke-asan
 
-# End-to-end check of the actual compiled dist/regex-engine.wasm through its
+# End-to-end check of the actual compiled dist/baru-re.wasm through its
 # real JS glue (requires `make wasm` first, and Node).
 test-wasm: wasm
 	node test/node_smoke.mjs
@@ -60,7 +60,7 @@ wasm:
 	$(EMCC) -O2 -Iinclude $(WASM_SRCS) -o $(WASM_TARGET) \
 		-s WASM=1 \
 		-s MODULARIZE=1 \
-		-s EXPORT_NAME=createRegexEngineModule \
+		-s EXPORT_NAME=createBaruReModule \
 		-s ENVIRONMENT=web,node \
 		-s ALLOW_MEMORY_GROWTH=1 \
 		-s STACK_OVERFLOW_CHECK=2 \
@@ -68,7 +68,7 @@ wasm:
 		-s EXPORTED_FUNCTIONS='["_malloc","_free","_regex_compile","_regex_exec","_regex_free","_regex_last_error","_regex_group_count","_regex_group_name","_regex_captures_ptr","_regex_flag_bit"]' \
 		-s EXPORTED_RUNTIME_METHODS='["cwrap","ccall","UTF8ToString","HEAPU16","HEAP16","HEAPU8","HEAP32"]' \
 		--no-entry
-	@echo "WASM build generated: $(WASM_TARGET) and $(WASM_OUT_DIR)/regex-engine.wasm"
+	@echo "WASM build generated: $(WASM_TARGET) and $(WASM_OUT_DIR)/baru-re.wasm"
 
 # Builds the wasm artifacts and copies them next to web/'s HTML/CSS/JS so the
 # playground demo (web/index.html) can be opened via a local static server,
@@ -76,9 +76,9 @@ wasm:
 # workflow does the equivalent for the published GitHub Pages deployment --
 # neither commits the built .js/.wasm into git (see .gitignore).
 demo: wasm
-	cp $(WASM_OUT_DIR)/regex-engine.js $(WASM_OUT_DIR)/regex-engine.wasm web/
+	cp $(WASM_OUT_DIR)/baru-re.js $(WASM_OUT_DIR)/baru-re.wasm web/
 	@echo "Demo artifacts copied into web/. Serve it with e.g.:"
 	@echo "  python3 -m http.server -d web"
 
 clean:
-	rm -rf test/smoke test/smoke.dSYM test/smoke-asan test/smoke-asan.dSYM $(WASM_OUT_DIR) web/regex-engine.js web/regex-engine.wasm
+	rm -rf test/smoke test/smoke.dSYM test/smoke-asan test/smoke-asan.dSYM $(WASM_OUT_DIR) web/baru-re.js web/baru-re.wasm

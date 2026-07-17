@@ -1,5 +1,5 @@
-// Regex playground UI on top of the compiled WASM engine (regex-engine.js /
-// regex-engine.wasm, built by `make wasm` from src/regexp.c + regex_wasm.c).
+// Regex playground UI on top of the compiled WASM engine (baru-re.js /
+// baru-re.wasm, built by `make wasm` from src/re_*.c + regex_wasm.c).
 // This file only marshals data across the WASM boundary and renders results
 // -- all matching happens inside the compiled C engine.
 "use strict";
@@ -73,7 +73,7 @@ let Module, cfn;
 let liveBuffers = []; // ptrs malloc'd for the current run, freed before the next one
 
 async function loadModule() {
-  Module = await createRegexEngineModule();
+  Module = await createBaruReModule();
   cfn = {
     flag_bit: Module.cwrap("regex_flag_bit", "number", ["number"]),
     compile: Module.cwrap("regex_compile", "number", ["number", "number", "number"]),
