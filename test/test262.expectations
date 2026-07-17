@@ -26,9 +26,9 @@ test/built-ins/RegExp/match-indices/indices-property.js
 test/built-ins/RegExp/named-groups/groups-object.js
 
 # NOTE: `node test/test262_runner.mjs --generated` additionally runs the
-# machine-generated exhaustive sweeps under */generated/, which surface two
-# further known gaps not enumerated line-by-line here: /v-mode set
-# operations ([a&&b] intersection, [a--b] difference -- an unimplemented
-# ES2024 feature) and RGI_Emoji multi-codepoint sequences beyond the
-# 128-per-class cap (documented in docs/IMPROVEMENTS.md "Fixed since this
-# analysis"). CI runs the default (non-generated) scope.
+# machine-generated exhaustive sweeps under */generated/, which surface one
+# further known gap not enumerated line-by-line here: RGI_Emoji
+# multi-codepoint sequences beyond the 128-per-class cap (the six
+# unicodeSets/generated/rgi-emoji-*.js files; documented in
+# docs/IMPROVEMENTS.md "Residual limitation" and docs/CONFORMANCE_GAPS.md
+# #3). CI runs the default (non-generated) scope.

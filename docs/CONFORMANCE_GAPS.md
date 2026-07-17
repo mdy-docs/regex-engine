@@ -19,25 +19,6 @@ Verify every fix the way the rest of this repo does: diff against Node
 
 ---
 
-## 2. [feature] `/v`-mode set operations
-
-**Fails:** `unicodeSets/generated/*` intersection (`[a&&b]`), difference
-(`[a--b]`), and nested-class tests (only under `make test262 --generated`;
-~20 files).
-
-**What's wrong:** `/v` (`unicodeSets`) adds `&&` / `--` operators and nested
-character classes inside `[...]`. The lexer parses single classes and
-`\q{…}` string alternatives but has no set-algebra layer, so `[[0-9]&&\w]`
-etc. don't compile to the intersected set.
-
-**Approach:** a real feature, not a patch — parse `[...]` under `/v` into a
-class *expression tree* (union/intersection/difference of nested
-classes/escapes/strings), then evaluate it to a single `CharClass` (+ string
-set) at compile time. The `CharClass` range representation already supports
-the needed set ops (they're just sorted-range merges/intersections). The
-string-alternative side (`&&`/`--` involving `\q{}` or property-of-strings)
-is the fiddly part. Sizable; scope it on its own.
-
 ## 3. [real/feature] Full multi-codepoint sequence coverage (RGI_Emoji cap)
 
 **Fails:** `unicodeSets/generated/rgi-emoji-*.js`, and any real use of the

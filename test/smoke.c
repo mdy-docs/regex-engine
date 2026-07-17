@@ -1136,6 +1136,106 @@ int main(void) {
         free(pP); regex_free(hP_iu); regex_free(hP_iv);
     }
 
+    /* /v-mode set operations over both codepoint and string components
+     * (docs/CONFORMANCE_GAPS.md gap #2, since fixed): && and -- must act
+     * on \q{...} string sets and properties-of-strings, single-codepoint
+     * \q alternatives live in the codepoint set, operators can't be mixed
+     * with union or ranges, and /v's reserved punctuators are enforced.
+     * Semantics diffed against Node (full-codepoint sweeps) and the
+     * test262 unicodeSets/generated suite. */
+    {
+        int v = regex_flag_bit('v');
+        uint16_t keycap9[] = { '9', 0xFE0F, 0x20E3 };
+        uint16_t zero[] = { '0' };
+        uint16_t nine[] = { '9' };
+
+        /* test262's own example: [[0-9]&&\q{0|2|4|9(keycap)}]. */
+        uint16_t* p1 = to_utf16("[[0-9]&&\\q{0|2|4|9\\uFE0F\\u20E3}]");
+        uintptr_t h1 = regex_compile(p1, 0, v);
+        check(h1 != 0, "[[0-9]&&\\q{...}]/v compiles");
+        check(regex_exec(h1, zero, 1, 0), "intersection keeps '0'");
+        check(!regex_exec(h1, nine, 1, 0), "intersection drops '9' (not in \\q set)");
+        check(!regex_exec(h1, keycap9, 3, 0), "intersection drops the keycap string (RHS has no strings)");
+        free(p1); regex_free(h1);
+
+        /* String survives difference when the RHS can't contain it. */
+        uint16_t* p2 = to_utf16("[\\q{0|2|4|9\\uFE0F\\u20E3}--\\d]");
+        uintptr_t h2 = regex_compile(p2, 0, v);
+        const int32_t* caps2 = regex_captures_ptr(h2);
+        check(regex_exec(h2, keycap9, 3, 0) && caps2[0] == 0 && caps2[1] == 3,
+              "[\\q{...}--\\d]/v keeps the keycap string, spans all 3 units");
+        check(!regex_exec(h2, zero, 1, 0), "[\\q{...}--\\d]/v drops '0'");
+        free(p2); regex_free(h2);
+
+        /* Single-codepoint \q alternatives are codepoints, not strings:
+         * they participate in intersection with plain classes. */
+        uint16_t a_txt[] = { 'a' };
+        uint16_t* p3 = to_utf16("[\\q{a}&&[ab]]");
+        uintptr_t h3 = regex_compile(p3, 0, v);
+        check(regex_exec(h3, a_txt, 1, 0), "[\\q{a}&&[ab]]/v matches 'a' (singleton is a codepoint)");
+        free(p3); regex_free(h3);
+
+        /* Longest string alternative wins, whatever the source order. */
+        uint16_t abc[] = { 'a', 'b', 'c' };
+        uint16_t* p4 = to_utf16("[\\q{ab|abc}]");
+        uintptr_t h4 = regex_compile(p4, 0, v);
+        const int32_t* caps4 = regex_captures_ptr(h4);
+        check(regex_exec(h4, abc, 3, 0) && caps4[1] == 3, "[\\q{ab|abc}]/v prefers the longer 'abc'");
+        free(p4); regex_free(h4);
+
+        /* \q{} is one empty-string alternative: matches empty. */
+        uint16_t* p5 = to_utf16("[\\q{}]");
+        uintptr_t h5 = regex_compile(p5, 0, v);
+        uint16_t dummy[] = { 'x' };
+        const int32_t* caps5 = regex_captures_ptr(h5);
+        check(regex_exec(h5, dummy, 1, 0) && caps5[0] == 0 && caps5[1] == 0, "[\\q{}]/v matches the empty string");
+        free(p5); regex_free(h5);
+
+        /* Chained subtraction, and negation of a set-op result. */
+        uint16_t b_txt[] = { 'b' };
+        uint16_t c_txt[] = { 'c' };
+        uint16_t* p6 = to_utf16("[[a-c]--a--b]");
+        uintptr_t h6 = regex_compile(p6, 0, v);
+        check(regex_exec(h6, c_txt, 1, 0) && !regex_exec(h6, a_txt, 1, 0) && !regex_exec(h6, b_txt, 1, 0),
+              "[[a-c]--a--b]/v leaves only 'c'");
+        free(p6); regex_free(h6);
+        uint16_t* p7 = to_utf16("[^[a-z]--[b]]");
+        uintptr_t h7 = regex_compile(p7, 0, v);
+        check(regex_exec(h7, b_txt, 1, 0) && !regex_exec(h7, a_txt, 1, 0),
+              "[^[a-z]--[b]]/v matches 'b' but not 'a'");
+        free(p7); regex_free(h7);
+
+        /* /v grammar strictness (all confirmed SyntaxErrors in Node). */
+        const char* bad_v[] = {
+            "[ab&&c]", "[a-z&&b]", "[a&&b--c]", "[a---b]", "[a-]", "[-a]",
+            "[a-b-c]", "[|]", "[(]", "[{]", "[a!!b]", "[&&a]", "[^\\q{ab}]",
+        };
+        for (size_t i = 0; i < sizeof(bad_v)/sizeof(bad_v[0]); i++) {
+            uint16_t* p = to_utf16(bad_v[i]);
+            uintptr_t h = regex_compile(p, 0, v);
+            char what[80];
+            snprintf(what, sizeof(what), "%s/v is a SyntaxError", bad_v[i]);
+            check(h == 0, what);
+            if (h) regex_free(h);
+            free(p);
+        }
+
+        /* The /v operator carve-outs must not leak into /u or legacy:
+         * [a-&] and [a--] are out-of-order-range SyntaxErrors there. */
+        const char* bad_u[] = { "[a-&]", "[a--]" };
+        for (size_t i = 0; i < sizeof(bad_u)/sizeof(bad_u[0]); i++) {
+            uint16_t* p = to_utf16(bad_u[i]);
+            uintptr_t hu = regex_compile(p, 0, regex_flag_bit('u'));
+            uintptr_t hl = regex_compile(p, 0, 0);
+            char what[96];
+            snprintf(what, sizeof(what), "%s is an out-of-order range error under /u and legacy", bad_u[i]);
+            check(hu == 0 && hl == 0, what);
+            if (hu) regex_free(hu);
+            if (hl) regex_free(hl);
+            free(p);
+        }
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;

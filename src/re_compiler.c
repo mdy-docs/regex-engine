@@ -56,11 +56,26 @@ static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
     CharClass* cls = &prog->classes[class_id];
     int jmp_pcs[128];
     int jmp_count = 0;
+    /* Longest strings first (stable): the spec's v-mode CharacterClass
+     * matcher tries a class's string alternatives in descending length
+     * order, so \q{ab|abc} against "abc" must consume all three units.
+     * The VM's OP_SPLIT chain tries alternatives in emission order, so
+     * emission order IS preference order. */
+    int order[128];
+    for (int i = 0; i < cls->string_count; i++) order[i] = i;
+    for (int i = 1; i < cls->string_count; i++) {
+        int v = order[i], j = i;
+        while (j > 0 && cls->strings[order[j - 1]].length < cls->strings[v].length) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = v;
+    }
     for (int i = 0; i < cls->string_count; i++) {
         bool has_more = (i < cls->string_count - 1) || (cls->range_count > 0);
         int split = has_more ? emit(prog, OP_SPLIT, 0, 0, 0, 0, false) : -1;
         if (split != -1) prog->code[split].arg1 = prog->code_count;
-        StringSequence* seq = &cls->strings[i];
+        StringSequence* seq = &cls->strings[order[i]];
         if (rtl) {
             for (int k = seq->length - 1; k >= 0; k--) emit(prog, OP_CHAR, seq->cps[k], prog->ignore_case, 0, 0, false);
         } else {

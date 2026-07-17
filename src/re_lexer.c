@@ -13,6 +13,8 @@
  */
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ucd.h"
@@ -567,9 +569,43 @@ static void invert_class(CharClass* cls) {
     *cls = res;
 }
 
-static void intersect_classes(CharClass* a, CharClass* b) {
-    if (a->negated) invert_class(a);
-    if (b->negated) invert_class(b);
+/* ---- /v (unicodeSets) class set algebra ---------------------------------
+ * A /v class value is a pair (codepoint ranges, string set), and the set
+ * operations act on the two components independently, per the spec's
+ * CharSet ops. Single-codepoint \q{} alternatives are normalized into the
+ * RANGE component at parse time (parse_q_strings) -- the spec puts them in
+ * the CharSet's codepoint component, and set ops must see them there:
+ * [\q{a}&&[ab]] matches 'a' (confirmed vs Node) -- so "string" below
+ * always means a sequence of 2+ code points, or the empty string. */
+
+static bool string_seq_equal(const StringSequence* a, const StringSequence* b) {
+    if (a->length != b->length) return false;
+    for (int i = 0; i < a->length; i++)
+        if (a->cps[i] != b->cps[i]) return false;
+    return true;
+}
+
+static bool class_has_string(const CharClass* cls, const StringSequence* s) {
+    for (int i = 0; i < cls->string_count; i++)
+        if (string_seq_equal(&cls->strings[i], s)) return true;
+    return false;
+}
+
+static void class_add_string(Lexer* lexer, CharClass* cls, const StringSequence* s) {
+    if (class_has_string(cls, s)) return;
+    if (cls->string_count >= 128) {
+        if (!lexer->prog->error) lexer->prog->error = "InternalError: Too many strings in character class";
+        return;
+    }
+    cls->strings[cls->string_count++] = *s;
+}
+
+static void class_union_v(Lexer* lexer, CharClass* dst, const CharClass* src) {
+    for (int i = 0; i < src->range_count; i++) add_range(dst, src->ranges[i].start, src->ranges[i].end);
+    for (int i = 0; i < src->string_count; i++) class_add_string(lexer, dst, &src->strings[i]);
+}
+
+static void class_intersect_v(CharClass* a, const CharClass* b) {
     CharClass res = {0};
     for (int i = 0; i < a->range_count; i++) {
         for (int j = 0; j < b->range_count; j++) {
@@ -578,48 +614,105 @@ static void intersect_classes(CharClass* a, CharClass* b) {
             if (start <= end) add_range(&res, start, end);
         }
     }
-    res.negated = false;
+    for (int i = 0; i < a->string_count; i++)
+        if (class_has_string(b, &a->strings[i])) res.strings[res.string_count++] = a->strings[i];
     *a = res;
 }
 
+static void class_subtract_v(CharClass* a, const CharClass* b) {
+    CharClass binv = {0};
+    for (int i = 0; i < b->range_count; i++) add_range(&binv, b->ranges[i].start, b->ranges[i].end);
+    invert_class(&binv);
+    CharClass res = {0};
+    for (int i = 0; i < a->range_count; i++) {
+        for (int j = 0; j < binv.range_count; j++) {
+            uint32_t start = a->ranges[i].start > binv.ranges[j].start ? a->ranges[i].start : binv.ranges[j].start;
+            uint32_t end = a->ranges[i].end < binv.ranges[j].end ? a->ranges[i].end : binv.ranges[j].end;
+            if (start <= end) add_range(&res, start, end);
+        }
+    }
+    for (int i = 0; i < a->string_count; i++)
+        if (!class_has_string(b, &a->strings[i])) res.strings[res.string_count++] = a->strings[i];
+    *a = res;
+}
+
+/* Parses the {Name} / {Key=Value} body of a \p or \P escape (lexer
+ * positioned at the '{') and builds the finished class into out, with the
+ * standalone-escape /i fold semantics baked in. Shared by the top-level
+ * token path (next_token) and /v class operands, which have identical
+ * semantics; the /u in-class path does NOT use this -- there the
+ * end-of-parse_char_class fold supplies the (different) closure ordering.
+ *
+ * The fold/complement ORDER for \P differs by mode, confirmed vs Node with
+ * full-codepoint sweeps: /iu canonicalizes input against the
+ * already-complemented set (\P{Lu}/iu = closure(complement), matches 'A'
+ * via folded member 'a'), while /iv applies MaybeSimpleCaseFolding before
+ * CharacterComplement (\P{Lu}/iv = complement(closure), does not). Under
+ * /iv, string components (properties of strings) are folded elementwise --
+ * matching folds both sides again, which is idempotent. */
+static bool parse_property_escape_class(Lexer* lexer, CharClass* out, bool negate) {
+    if (lexer->src[lexer->pos] != '{') {
+        lexer->prog->error = "SyntaxError: Invalid property escape";
+        return false;
+    }
+    lexer->pos++;
+    char prop[MAX_PROP_NAME] = {0};
+    int prop_len = 0;
+    char* val = prop;
+    while (lexer->src[lexer->pos] != '}' && lexer->src[lexer->pos] != '\0' && prop_len < MAX_PROP_NAME - 1) {
+        char c = (char)lexer->src[lexer->pos++];
+        prop[prop_len++] = c;
+        if (c == '=') val = prop + prop_len;
+    }
+    if (lexer->src[lexer->pos] == '}') lexer->pos++;
+    else {
+        lexer->prog->error = "SyntaxError: Unterminated Unicode property escape";
+        return false;
+    }
+
+    /* \p{Key=Value}: NUL-terminate the key in place (val already points
+     * past the '='). */
+    const char* pkey = NULL;
+    if (val != prop) { prop[val - prop - 1] = '\0'; pkey = prop; }
+
+    if (negate && lexer->prog->unicode_sets && lexer->prog->ignore_case) {
+        if (!fill_unicode_property(out, pkey, val, false, true)) {
+            lexer->prog->error = "SyntaxError: Invalid property name";
+            return false;
+        }
+        if (out->string_count > 0) {
+            lexer->prog->error = "SyntaxError: Invalid property name";
+            return false;
+        }
+        apply_case_folding(out, true);
+        invert_class(out);
+        return true;
+    }
+    if (!fill_unicode_property(out, pkey, val, negate, lexer->prog->unicode_sets)) {
+        lexer->prog->error = "SyntaxError: Invalid property name";
+        return false;
+    }
+    if (lexer->prog->ignore_case) {
+        apply_case_folding(out, true);
+        for (int i = 0; i < out->string_count; i++)
+            for (int k = 0; k < out->strings[i].length; k++)
+                out->strings[i].cps[k] = unicode_casefold(out->strings[i].cps[k]);
+    }
+    return true;
+}
+
+/* /u and legacy modes only -- /v (unicodeSets) class syntax is a different
+ * grammar with set operations and string sets, parsed by parse_char_class_v
+ * below. The half-supported && / -- / nested-class special cases that used
+ * to live inline here moved there wholesale. */
 static void parse_char_class(Lexer* lexer, CharClass* cls) {
     bool negate = false;
     if (lexer->src[lexer->pos] == '^') { negate = true; lexer->pos++; }
-    
+
     CharClass current_union = {0};
-    int set_op = 0; // 0=none, 1=&&, 2=--
-    
+
     while (lexer->src[lexer->pos] != ']' && lexer->src[lexer->pos] != '\0') {
-        if (lexer->prog->unicode_sets && lexer->src[lexer->pos] == '&' && lexer->src[lexer->pos+1] == '&') {
-            if (lexer->prog->ignore_case) apply_case_folding(&current_union, lexer->prog->unicode);
-            if (set_op == 1) intersect_classes(cls, &current_union);
-            else if (set_op == 2) { invert_class(&current_union); intersect_classes(cls, &current_union); }
-            else *cls = current_union;
-            
-            memset(&current_union, 0, sizeof(CharClass));
-            set_op = 1;
-            lexer->pos += 2;
-            continue;
-        }
-        if (lexer->prog->unicode_sets && lexer->src[lexer->pos] == '-' && lexer->src[lexer->pos+1] == '-') {
-            if (lexer->prog->ignore_case) apply_case_folding(&current_union, lexer->prog->unicode);
-            if (set_op == 1) intersect_classes(cls, &current_union);
-            else if (set_op == 2) { invert_class(&current_union); intersect_classes(cls, &current_union); }
-            else *cls = current_union;
-            
-            memset(&current_union, 0, sizeof(CharClass));
-            set_op = 2;
-            lexer->pos += 2;
-            continue;
-        }
-        
-        if (lexer->prog->unicode_sets && lexer->src[lexer->pos] == '[') {
-            lexer->pos++;
-            CharClass nested = {0};
-            parse_char_class(lexer, &nested);
-            if (nested.negated) invert_class(&nested);
-            for (int i = 0; i < nested.range_count; i++) add_range(&current_union, nested.ranges[i].start, nested.ranges[i].end);
-        } else {
+        {
             uint32_t start_char = decode_utf16_lexer(lexer);
             bool is_special = false;
             
@@ -631,66 +724,6 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                     if (!parse_hex(lexer, 2, &start_char)) {
                         lexer->prog->error = "SyntaxError: Invalid hexadecimal escape sequence";
                     }
-                } else if (lexer->prog->unicode_sets && esc == 'q') {
-                    if (negate) {
-                        lexer->prog->error = "SyntaxError: Character class with strings cannot be negated";
-                        return;
-                    }
-                    if (lexer->src[lexer->pos] != '{') {
-                        lexer->prog->error = "SyntaxError: \\q escape must be followed by {";
-                        return;
-                    }
-                    lexer->pos++; // consume '{'
-                    is_special = true;
-
-                    while (lexer->src[lexer->pos] != '}' && lexer->src[lexer->pos] != '\0') {
-                        if (lexer->prog->error) return;
-                        StringSequence seq = {0};
-                        while (lexer->src[lexer->pos] != '|' && lexer->src[lexer->pos] != '}' && lexer->src[lexer->pos] != '\0') {
-                            uint32_t cp = decode_utf16_lexer(lexer);
-                            if (cp == '\\') {
-                                uint32_t esc_cp = decode_utf16_lexer(lexer);
-                                if (esc_cp == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return; }
-                                switch (esc_cp) {
-                                    case 'n': cp = '\n'; break; case 't': cp = '\t'; break;
-                                    case 'r': cp = '\r'; break; case 'b': cp = '\b'; break;
-                                    case 'f': cp = '\f'; break; case 'v': cp = '\v'; break;
-                                    case 'c': {
-                                        uint32_t ctrl = lexer->src[lexer->pos];
-                                        if ((ctrl >= 'a' && ctrl <= 'z') || (ctrl >= 'A' && ctrl <= 'Z')) {
-                                            cp = ctrl % 32; lexer->pos++;
-                                        } else { lexer->prog->error = "SyntaxError: Invalid control escape in \\q{}"; return; }
-                                        break;
-                                    }
-                                    case 'x':
-                                        if (!parse_hex(lexer, 2, &cp)) { lexer->prog->error = "SyntaxError: Invalid hexadecimal escape sequence in \\q{}"; return; }
-                                        break;
-                                    case 'u':
-                                        if (lexer->prog->unicode && lexer->src[lexer->pos] == '{') {
-                                            if (!parse_braced_hex(lexer, &cp)) return;
-                                        } else {
-                                            if (!parse_hex(lexer, 4, &cp)) {
-                                                if (lexer->prog->unicode) { lexer->prog->error = "SyntaxError: Invalid Unicode escape sequence in \\q{}"; return; }
-                                                else cp = 'u';
-                                            }
-                                        }
-                                        break;
-                                    default: cp = esc_cp; break; // IdentityEscape
-                                }
-                            }
-                            if (seq.length >= 16) { lexer->prog->error = "InternalError: String in character class too long"; return; }
-                            seq.cps[seq.length++] = cp;
-                        }
-                        if (current_union.string_count >= 128) { lexer->prog->error = "InternalError: Too many strings in character class"; return; }
-                        current_union.strings[current_union.string_count++] = seq;
-                        if (lexer->src[lexer->pos] == '|') lexer->pos++;
-                    }
-
-                    if (lexer->src[lexer->pos] != '}') {
-                        lexer->prog->error = "SyntaxError: Unterminated \\q{} escape";
-                        return;
-                    }
-                    lexer->pos++; // consume '}'
                 }
                 else if (esc == 'p' || esc == 'P') {
                     if (lexer->prog->unicode) {
@@ -771,21 +804,21 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
             /* In unicode mode, a class escape (\d \w \s \p{...}) as a range
              * START is an early SyntaxError (IsCharacterClass -> error, per
              * NonemptyClassRanges static semantics). The `-]` trailing-dash
-             * shape is the only exception in /u. The `&&`/`--` exceptions
-             * are /v operators (unicode_sets) only -- applying them in plain
-             * /u wrongly let [\p{Hex}--], [\w-&], [\w--] compile (confirmed
-             * vs Node; docs/CONFORMANCE_GAPS.md #4). is_special is set by \p
+             * shape is the only exception in /u. is_special is set by \p
              * too, so this covers property escapes, not just \d\w\s. */
             if (is_special && lexer->prog->unicode &&
-                lexer->src[lexer->pos] == '-' && lexer->src[lexer->pos+1] != ']' &&
-                (!lexer->prog->unicode_sets ||
-                 (lexer->src[lexer->pos+1] != '&' && lexer->src[lexer->pos+1] != '-'))) {
+                lexer->src[lexer->pos] == '-' && lexer->src[lexer->pos+1] != ']') {
                 lexer->prog->error = "SyntaxError: Invalid character class range";
                 return;
             }
 
             if (!is_special) {
-                if (lexer->src[lexer->pos] == '-' && lexer->src[lexer->pos+1] != ']' && lexer->src[lexer->pos+1] != '&' && lexer->src[lexer->pos+1] != '-') {
+                /* No '&'/'-' lookahead exceptions here: those were /v
+                 * operator carve-outs that wrongly leaked into /u and
+                 * legacy parsing, making [a-&] and [a--] compile as
+                 * literals where every real engine reports the
+                 * out-of-order range a-'&' / a-'-' (confirmed vs Node). */
+                if (lexer->src[lexer->pos] == '-' && lexer->src[lexer->pos+1] != ']') {
                     lexer->pos++;
                     uint32_t end_char = decode_utf16_lexer(lexer);
                     if (end_char == '\\') {
@@ -862,11 +895,9 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
     }
     
     if (lexer->prog->ignore_case) apply_case_folding(&current_union, lexer->prog->unicode);
-    
-    if (set_op == 1) intersect_classes(cls, &current_union);
-    else if (set_op == 2) { invert_class(&current_union); intersect_classes(cls, &current_union); }
-    else *cls = current_union;
-    
+
+    *cls = current_union;
+
     if (negate && cls->string_count > 0) {
         lexer->prog->error = "SyntaxError: Character class with strings cannot be negated";
         return;
@@ -878,6 +909,326 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
     } else {
         lexer->prog->error = "SyntaxError: Unterminated character class";
     }
+}
+
+/* ---- /v (unicodeSets) ClassSetExpression parser -------------------------
+ * ClassContents under /v: ClassUnion | ClassIntersection | ClassSubtraction
+ * -- the operator forms take single ClassSetOperands only and cannot be
+ * mixed or combined with ranges ([ab&&c], [a-z&&b], [a&&b--c], [a---b] are
+ * all SyntaxErrors, confirmed vs Node). Unescaped ( ) [ ] { } / - \ | are
+ * reserved outside their syntactic roles, as are doubled punctuators
+ * (!! ## $$ %% ** ++ ,, .. :: ;; << == >> ?? @@ ^^ `` ~~, plus && beyond
+ * the operator).
+ *
+ * Under /iv every operand is fold-CLOSED (and complement-ordered, see
+ * parse_property_escape_class) as it is built; plain set algebra on the
+ * closed sets is then equivalent to the spec's fold-image algebra plus
+ * input canonicalization, because closure(A) op closure(B) =
+ * fold-preimage(fold(A) op fold(B)) for union/intersection/difference. */
+
+static void parse_char_class_v(Lexer* lexer, CharClass* cls);
+
+/* \q{...} string disjunction (/v only). Single-codepoint alternatives are
+ * normalized into the codepoint ranges (see the set-algebra comment
+ * above); multi-codepoint and empty alternatives join the string set --
+ * \q{} is one empty-string alternative, so [\q{}] matches the empty
+ * string (confirmed vs Node). Under /iv both components are folded at
+ * parse time. */
+static void parse_q_strings(Lexer* lexer, CharClass* out) {
+    if (lexer->src[lexer->pos] != '{') {
+        lexer->prog->error = "SyntaxError: \\q escape must be followed by {";
+        return;
+    }
+    lexer->pos++; /* consume '{' */
+    for (;;) {
+        StringSequence seq = {0};
+        while (lexer->src[lexer->pos] != '|' && lexer->src[lexer->pos] != '}' && lexer->src[lexer->pos] != '\0') {
+            uint32_t cp = decode_utf16_lexer(lexer);
+            if (cp == '\\') {
+                uint32_t esc_cp = decode_utf16_lexer(lexer);
+                if (esc_cp == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return; }
+                switch (esc_cp) {
+                    case 'n': cp = '\n'; break; case 't': cp = '\t'; break;
+                    case 'r': cp = '\r'; break; case 'b': cp = '\b'; break;
+                    case 'f': cp = '\f'; break; case 'v': cp = '\v'; break;
+                    case 'c': {
+                        uint32_t ctrl = lexer->src[lexer->pos];
+                        if ((ctrl >= 'a' && ctrl <= 'z') || (ctrl >= 'A' && ctrl <= 'Z')) {
+                            cp = ctrl % 32; lexer->pos++;
+                        } else { lexer->prog->error = "SyntaxError: Invalid control escape in \\q{}"; return; }
+                        break;
+                    }
+                    case 'x':
+                        if (!parse_hex(lexer, 2, &cp)) { lexer->prog->error = "SyntaxError: Invalid hexadecimal escape sequence in \\q{}"; return; }
+                        break;
+                    case 'u':
+                        if (lexer->src[lexer->pos] == '{') {
+                            if (!parse_braced_hex(lexer, &cp)) return;
+                        } else {
+                            if (!parse_hex(lexer, 4, &cp)) { lexer->prog->error = "SyntaxError: Invalid Unicode escape sequence in \\q{}"; return; }
+                        }
+                        break;
+                    default: cp = esc_cp; break; /* IdentityEscape */
+                }
+            }
+            if (seq.length >= 16) { lexer->prog->error = "InternalError: String in character class too long"; return; }
+            seq.cps[seq.length++] = cp;
+        }
+        if (lexer->prog->ignore_case)
+            for (int k = 0; k < seq.length; k++) seq.cps[k] = unicode_casefold(seq.cps[k]);
+        if (seq.length == 1) add_range(out, seq.cps[0], seq.cps[0]);
+        else class_add_string(lexer, out, &seq);
+        if (lexer->prog->error) return;
+        if (lexer->src[lexer->pos] == '|') { lexer->pos++; continue; }
+        break;
+    }
+    if (lexer->src[lexer->pos] != '}') {
+        lexer->prog->error = "SyntaxError: Unterminated \\q{} escape";
+        return;
+    }
+    lexer->pos++; /* consume '}' */
+    if (lexer->prog->ignore_case) apply_case_folding(out, true);
+}
+
+static bool is_class_set_syntax_char(uint32_t c) {
+    return c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' ||
+           c == '/' || c == '-' || c == '\\' || c == '|';
+}
+
+static bool is_class_set_double_punct(uint32_t c) {
+    switch (c) {
+        case '&': case '!': case '#': case '$': case '%': case '*': case '+':
+        case ',': case '.': case ':': case ';': case '<': case '=': case '>':
+        case '?': case '@': case '^': case '`': case '~':
+            return true;
+        default: return false;
+    }
+}
+
+/* One ClassSetCharacter, literal or escaped. Returns the code point, or -1
+ * with prog->error set. */
+static int64_t parse_class_set_char(Lexer* lexer) {
+    uint32_t c = lexer->src[lexer->pos];
+    if (c == '\0') { lexer->prog->error = "SyntaxError: Unterminated character class"; return -1; }
+    if (c == '\\') {
+        lexer->pos++;
+        uint32_t esc = decode_utf16_lexer(lexer);
+        if (esc == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return -1; }
+        switch (esc) {
+            case 'n': return '\n';
+            case 't': return '\t';
+            case 'r': return '\r';
+            case 'f': return '\f';
+            case 'v': return '\v';
+            case 'b': return '\b';
+            case '0': return 0;
+            case 'c': {
+                uint32_t ctrl = lexer->src[lexer->pos];
+                if ((ctrl >= 'a' && ctrl <= 'z') || (ctrl >= 'A' && ctrl <= 'Z')) {
+                    lexer->pos++;
+                    return ctrl % 32;
+                }
+                lexer->prog->error = "SyntaxError: Invalid control escape";
+                return -1;
+            }
+            case 'x': {
+                uint32_t v;
+                if (!parse_hex(lexer, 2, &v)) { lexer->prog->error = "SyntaxError: Invalid hexadecimal escape sequence"; return -1; }
+                return (int64_t)v;
+            }
+            case 'u': {
+                uint32_t v;
+                if (lexer->src[lexer->pos] == '{') {
+                    if (!parse_braced_hex(lexer, &v)) return -1;
+                    return (int64_t)v;
+                }
+                if (!parse_hex(lexer, 4, &v)) { lexer->prog->error = "SyntaxError: Invalid Unicode escape sequence"; return -1; }
+                if (v >= 0xD800 && v <= 0xDBFF && lexer->src[lexer->pos] == '\\' && lexer->src[lexer->pos+1] == 'u') {
+                    int saved_pos = lexer->pos;
+                    lexer->pos += 2;
+                    uint32_t trail;
+                    if (parse_hex(lexer, 4, &trail) && trail >= 0xDC00 && trail <= 0xDFFF) {
+                        v = ((v - 0xD800) << 10) + (trail - 0xDC00) + 0x10000;
+                    } else {
+                        lexer->pos = saved_pos;
+                    }
+                }
+                return (int64_t)v;
+            }
+            default:
+                /* /v IdentityEscape: SyntaxCharacter, '/', or a
+                 * ClassSetReservedPunctuator. */
+                if (esc < 128 && (strchr("^$\\.*+?()[]{}|/", (char)esc) || strchr("&-!#%,:;<=>@`~", (char)esc)))
+                    return (int64_t)esc;
+                lexer->prog->error = "SyntaxError: Invalid identity escape";
+                return -1;
+        }
+    }
+    if (is_class_set_syntax_char(c)) {
+        lexer->prog->error = "SyntaxError: Invalid character in character class";
+        return -1;
+    }
+    if (is_class_set_double_punct(c) && lexer->src[lexer->pos + 1] == c) {
+        lexer->prog->error = "SyntaxError: Reserved double punctuator in character class";
+        return -1;
+    }
+    return (int64_t)decode_utf16_lexer(lexer);
+}
+
+/* One ClassSetOperand. Returns true if a class-shaped operand (nested
+ * class, class escape, \p/\P, \q) was built into out (provided zeroed by
+ * the caller); false if a bare ClassSetCharacter was parsed into *ch
+ * instead, so the caller can decide whether it starts a range. On error
+ * (prog->error set) the return value is meaningless. */
+static bool parse_class_set_operand(Lexer* lexer, CharClass* out, uint32_t* ch) {
+    uint16_t c = lexer->src[lexer->pos];
+    if (c == '[') {
+        lexer->pos++;
+        parse_char_class_v(lexer, out);
+        return true;
+    }
+    if (c == '\\') {
+        uint16_t n = lexer->src[lexer->pos + 1];
+        if (n != 0 && n < 128 && strchr("dDwWsS", (char)n)) {
+            lexer->pos += 2;
+            fill_builtin_class(out, (char)n, true, lexer->prog->ignore_case);
+            return true;
+        }
+        if (n == 'q') {
+            lexer->pos += 2;
+            parse_q_strings(lexer, out);
+            return true;
+        }
+        if (n == 'p' || n == 'P') {
+            lexer->pos += 2;
+            parse_property_escape_class(lexer, out, n == 'P');
+            return true;
+        }
+    }
+    int64_t cp = parse_class_set_char(lexer);
+    if (cp < 0) return true; /* error set */
+    *ch = (uint32_t)cp;
+    return false;
+}
+
+/* One ClassUnion element into tmp (provided zeroed): a class operand, a
+ * ClassSetRange, or a single ClassSetCharacter. *single_operand reports
+ * whether the element is grammatically a ClassSetOperand -- ranges are
+ * not, and so cannot precede && or --. */
+static void parse_class_v_element(Lexer* lexer, CharClass* tmp, bool* single_operand) {
+    uint32_t ch = 0;
+    *single_operand = true;
+    if (parse_class_set_operand(lexer, tmp, &ch)) return; /* class operand, or error */
+    if (lexer->src[lexer->pos] == '-' && lexer->src[lexer->pos + 1] != '-') {
+        /* ClassSetRange. The end must be a ClassSetCharacter: a ']' right
+         * after the '-' ([a-]) is a SyntaxError in /v, unlike /u's
+         * trailing-dash allowance -- parse_class_set_char rejects it. */
+        lexer->pos++;
+        int64_t end = parse_class_set_char(lexer);
+        if (end < 0) return;
+        if ((int64_t)ch > end) {
+            lexer->prog->error = "SyntaxError: Range out of order in character class";
+            return;
+        }
+        add_range(tmp, ch, (uint32_t)end);
+        *single_operand = false;
+    } else {
+        add_range(tmp, ch, ch);
+    }
+    if (lexer->prog->ignore_case) apply_case_folding(tmp, true);
+}
+
+/* ClassContents under /v, lexer positioned just past the '['. Recursion
+ * (nested classes) is depth-capped via lexer->parse_depth like the parser
+ * proper; the per-frame operand scratch is heap-allocated because a
+ * CharClass is ~25KB and MAX_AST_DEPTH frames of stack locals would risk
+ * overflowing the C stack this engine elsewhere carefully protects. */
+static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
+    lexer->parse_depth++;
+    if (lexer->parse_depth > MAX_AST_DEPTH) {
+        if (!lexer->prog->error) lexer->prog->error = "InternalError: pattern too deeply nested or too long to compile safely";
+        lexer->parse_depth--;
+        return;
+    }
+    bool negate = false;
+    if (lexer->src[lexer->pos] == '^') { negate = true; lexer->pos++; }
+
+    CharClass* tmp = malloc(sizeof(CharClass));
+    if (!tmp) {
+        fprintf(stderr, "Fatal Error: Out of memory\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if (lexer->src[lexer->pos] != ']' && lexer->src[lexer->pos] != '\0') {
+        bool single = false;
+        memset(tmp, 0, sizeof(CharClass));
+        parse_class_v_element(lexer, tmp, &single);
+        if (!lexer->prog->error) {
+            class_union_v(lexer, cls, tmp);
+            /* Only peek at pos+1 when pos isn't already the terminator: a
+             * truncated pattern ("[a") would otherwise read one unit past
+             * the buffer (fuzzer-found, ASan heap-buffer-overflow). */
+            uint16_t o0 = lexer->src[lexer->pos];
+            uint16_t o1 = o0 ? lexer->src[lexer->pos + 1] : 0;
+            if (single && ((o0 == '&' && o1 == '&') || (o0 == '-' && o1 == '-'))) {
+                /* ClassIntersection / ClassSubtraction: same operator
+                 * chained over single operands, nothing else. */
+                while (!lexer->prog->error && lexer->src[lexer->pos] == o0 && lexer->src[lexer->pos + 1] == o0) {
+                    lexer->pos += 2;
+                    memset(tmp, 0, sizeof(CharClass));
+                    uint32_t ch = 0;
+                    if (!parse_class_set_operand(lexer, tmp, &ch)) {
+                        add_range(tmp, ch, ch);
+                        if (lexer->prog->ignore_case) apply_case_folding(tmp, true);
+                    }
+                    if (lexer->prog->error) break;
+                    if (o0 == '&') class_intersect_v(cls, tmp);
+                    else class_subtract_v(cls, tmp);
+                }
+                if (!lexer->prog->error && lexer->src[lexer->pos] != ']') {
+                    /* Mixed operators, a trailing range, or further atoms. */
+                    lexer->prog->error = "SyntaxError: Invalid set operation in character class";
+                }
+            } else {
+                /* ClassUnion: further elements until ']'; an operator here
+                 * (after a range or after 2+ elements) is a SyntaxError. */
+                while (!lexer->prog->error && lexer->src[lexer->pos] != ']' && lexer->src[lexer->pos] != '\0') {
+                    uint16_t c0 = lexer->src[lexer->pos], c1 = lexer->src[lexer->pos + 1];
+                    if ((c0 == '&' && c1 == '&') || (c0 == '-' && c1 == '-')) {
+                        lexer->prog->error = "SyntaxError: Invalid set operation in character class";
+                        break;
+                    }
+                    memset(tmp, 0, sizeof(CharClass));
+                    parse_class_v_element(lexer, tmp, &single);
+                    if (lexer->prog->error) break;
+                    class_union_v(lexer, cls, tmp);
+                }
+            }
+        }
+    }
+    free(tmp);
+    if (lexer->prog->error) { lexer->parse_depth--; return; }
+
+    if (lexer->src[lexer->pos] == ']') {
+        lexer->pos++;
+    } else {
+        lexer->prog->error = "SyntaxError: Unterminated character class";
+        lexer->parse_depth--;
+        return;
+    }
+
+    if (negate) {
+        if (cls->string_count > 0) {
+            lexer->prog->error = "SyntaxError: Character class with strings cannot be negated";
+            lexer->parse_depth--;
+            return;
+        }
+        /* Resolved concretely (operands are already folded and closed, and
+         * the complement of a fold-closed set is fold-closed), so the
+         * negated flag stays unset. */
+        invert_class(cls);
+    }
+    lexer->parse_depth--;
 }
 
 /* Non-static: called from every parse_* function in re_parser.c and from
@@ -1043,54 +1394,9 @@ void next_token(Lexer* lexer) {
             }
             else if (esc == 'p' || esc == 'P') {
                 if (lexer->prog->unicode) {
-                    if (lexer->src[lexer->pos] == '{') {
-                        lexer->pos++;
-                        char prop[MAX_PROP_NAME] = {0};
-                        int prop_len = 0;
-                        char* val = prop;
-                        while (lexer->src[lexer->pos] != '}' && lexer->src[lexer->pos] != '\0' && prop_len < MAX_PROP_NAME - 1) {
-                            char prop_ch = (char)lexer->src[lexer->pos++];
-                            prop[prop_len++] = prop_ch;
-                            if (prop_ch == '=') val = prop + prop_len;
-                        }
-                        if (lexer->src[lexer->pos] == '}') lexer->pos++;
-                        else lexer->prog->error = "SyntaxError: Unterminated Unicode property escape";
-
-                        const char* pkey = NULL;
-                        if (val != prop) { prop[val - prop - 1] = '\0'; pkey = prop; }
-                        int cid = alloc_class(lexer->prog);
-                        /* prog->unicode is guaranteed here (\p is only a
-                         * property escape under /u), so effective
-                         * ignoreCase alone gates the fold. The fold/
-                         * complement ORDER differs by mode, full-sweep
-                         * confirmed vs Node: /iu canonicalizes against the
-                         * already-complemented set (\P = fold(complement)),
-                         * while /iv applies MaybeSimpleCaseFolding before
-                         * CharacterComplement (\P = complement(fold)) --
-                         * e.g. \P{Lu}/iu matches 'A' via folded member 'a',
-                         * \P{Lu}/iv does not. */
-                        if (esc == 'P' && lexer->prog->unicode_sets && lexer->prog->ignore_case) {
-                            if (!fill_unicode_property(&lexer->prog->classes[cid], pkey, val, false, true)) {
-                                lexer->prog->error = "SyntaxError: Invalid property name";
-                                return;
-                            }
-                            if (lexer->prog->classes[cid].string_count > 0) {
-                                lexer->prog->error = "SyntaxError: Invalid property name";
-                                return;
-                            }
-                            apply_case_folding(&lexer->prog->classes[cid], true);
-                            invert_class(&lexer->prog->classes[cid]);
-                        } else {
-                            if (!fill_unicode_property(&lexer->prog->classes[cid], pkey, val, esc == 'P', lexer->prog->unicode_sets)) {
-                                lexer->prog->error = "SyntaxError: Invalid property name";
-                                return;
-                            }
-                            if (lexer->prog->ignore_case) apply_case_folding(&lexer->prog->classes[cid], true);
-                        }
-                        lexer->current = (Token){TOK_CLASS, 0, cid};
-                    } else {
-                        lexer->prog->error = "SyntaxError: Invalid property escape";
-                    }
+                    int cid = alloc_class(lexer->prog);
+                    if (!parse_property_escape_class(lexer, &lexer->prog->classes[cid], esc == 'P')) return;
+                    lexer->current = (Token){TOK_CLASS, 0, cid};
                 } else {
                     lexer->current = (Token){TOK_LITERAL, esc, 0, 0, 0, ""};
                 }
@@ -1139,7 +1445,8 @@ void next_token(Lexer* lexer) {
         }
         case '[': {
             int cid = alloc_class(lexer->prog);
-            parse_char_class(lexer, &lexer->prog->classes[cid]);
+            if (lexer->prog->unicode_sets) parse_char_class_v(lexer, &lexer->prog->classes[cid]);
+            else parse_char_class(lexer, &lexer->prog->classes[cid]);
             lexer->current = (Token){TOK_CLASS, 0, cid};
             break;
         }
