@@ -37,7 +37,7 @@ predictably, along the mapping `docs/ARCHITECTURE.md`'s intro describes.
 | 1.4 | `\b`/`\B` read one code unit past `text_end` unconditionally | P1 — OOB read | ✅ ASan — **FIXED** |
 | 1.5 | `decode_utf16` reads past buffer end for a trailing lone lead surrogate | P1 — OOB read | ✅ ASan — **FIXED** |
 | 1.6 | Backreference bounds only validated under `/u` — `\999` OOB-reads in Annex B mode | P1 — OOB read | ✅ ASan — **FIXED** |
-| 1.7 | Non-unicode `.`/`\D`/`\W`/`\S` wrongly capped at codepoint 255 instead of 0xFFFF | P1 — wrong results | ✅ diffed vs Node |
+| 1.7 | Non-unicode `.`/`\D`/`\W`/`\S` wrongly capped at codepoint 255 instead of 0xFFFF | P1 — wrong results | ✅ diffed vs Node — **FIXED** |
 | 1.8 | `OP_CLEAR_CAPTURES` defined + VM-implemented but never emitted — stale captures leak across alternation | P2 — wrong results | ✅ diffed vs Node |
 | 1.9 | Assorted silent-truncation spots | P3 — minor | inspection |
 
@@ -589,7 +589,7 @@ with `SyntaxError: Invalid backreference` instead of OOB-reading
 `"aa"`) still compile and match. Permanent regression coverage in
 `test/smoke.c`.
 
-### 1.7 [P1] Non-unicode-mode builtin classes wrongly capped at codepoint 255
+### 1.7 [P1] Non-unicode-mode builtin classes wrongly capped at codepoint 255 — **FIXED**
 
 ```c
 } else if (type == 'D') {
@@ -625,6 +625,32 @@ separately diffed above — `fill_builtin_class`'s `'D'` branch has the
 exact same `: 255` pattern at line 328 and is presumably equally wrong for
 the same reason, just not independently confirmed against Node in the
 table above.
+
+**Fixed**, with one significant addition beyond the mechanical `255` →
+`0xFFFF` swap. The changed sites, all in `re_lexer.c`: `\D`'s and `\W`'s
+complement upper bound in `fill_builtin_class`; `\s`'s `> 255` entry
+cutoff (removed entirely rather than raised — the spec's WhiteSpace/
+LineTerminator list is mode-independent, so there is nothing to cut);
+`\S`'s post-inversion clamp (now `0xFFFF` without `/u`, `0x10FFFF` with);
+and `.`'s `max_cp`. The addition: **lifting the cap on `.` exposed a
+second, previously-masked bug in the same branch** — non-unicode `.` never
+excluded the LineTerminators U+2028/U+2029 (only the `/u` branch did),
+which was unobservable while both were above the 255 cap but wrong the
+moment the cap rose (Node: `/./.test(' ')` is `false`, no flags).
+The two branches are now collapsed into one that always carves out
+2028–2029, differing only in `max_cp`. Deliberately *not* changed, per
+this finding's own "don't pattern-match blindly" warning: the
+`0x10FFFF` literals in escape-range validation (genuine max-codepoint
+checks) and in `invert_class` (whose above-0xFFFF overshoot is
+unreachable without `/u`, since undecoded code units can't exceed
+0xFFFF). **Verified** against Node (no flags on either side) across 25
+probe cases under ASan+UBSan, zero mismatches: all three of the original
+repro rows above, `\D`/`\S` (flagged above as not independently
+confirmed — both were in fact equally wrong, now equally fixed), the
+2027/2028/2029/202A boundary around `.`'s LineTerminator exclusion,
+dotAll, the in-class `[\s]`/`[\D]`/`[^\S]` path (a different
+`fill_builtin_class` call site than the standalone escapes), and `/u`
+behavior unchanged. Permanent regression coverage in `test/smoke.c`.
 
 ### 1.8 [P2] `OP_CLEAR_CAPTURES` is dead code — stale captures leak across alternation
 
@@ -855,10 +881,13 @@ If tackling this list, roughly in order of (safety impact) / (effort):
    `&& prog->unicode` gate is dropped; out-of-range numeric backrefs are
    now a `SyntaxError` in every mode (a documented Annex B deviation —
    see 1.6's write-up). All three P1 OOB reads are now closed.
-6. **1.7** (the `255` → `0xFFFF` cap fix) — mechanical, but grep carefully
-   for every occurrence and verify each one against real JS behavior
-   rather than pattern-matching blindly, since not every `255`/`0x10FFFF`
-   pair in the file is necessarily wrong.
+6. ~~**1.7** (the `255` → `0xFFFF` cap fix)~~ — **done**, and the
+   verify-each-occurrence caution paid off twice: lifting `.`'s cap
+   exposed a masked missing-LineTerminator-exclusion bug in the same
+   branch (fixed together — see 1.7's write-up), and two `0x10FFFF`
+   families (escape-range validation, `invert_class`) were confirmed
+   correct and left alone. All four P1 findings (1.4–1.7) are now closed;
+   everything remaining in §1 is P2/P3.
 7. Wire up CI (§3) around whatever subset of `make test` / an ASan build
    exists at each step above, so each fix in this list gets a permanent
    regression guard as it lands rather than all testing infrastructure

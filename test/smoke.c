@@ -568,6 +568,76 @@ int main(void) {
         regex_free(hgood);
     }
 
+    /* Non-unicode-mode builtin classes span the full UTF-16 code-unit space
+     * (docs/IMPROVEMENTS.md #1.7). `.`/`\D`/`\W`/`\S` were wrongly capped at
+     * codepoint 255 (and \s dropped its >255 entries) -- ECMAScript has
+     * never Latin-1-scoped these; /u only gates surrogate-pair decoding.
+     * Every expectation below was diffed against Node with no flags. */
+    {
+        uint16_t* pattern = to_utf16("x.y");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t text[] = { 'x', 0x20AC, 'y' }; /* "x€y" */
+        check(regex_exec(h, text, 3, 0), "non-/u /x.y/ matches 'x\\u20ACy' (dot was capped at 255)");
+        free(pattern);
+        regex_free(h);
+    }
+    {
+        /* The 255 cap was also masking a second bug in the same branch:
+         * non-/u `.` never excluded the LineTerminators U+2028/U+2029
+         * (both unreachable under the cap). Node: /./.test(' ') is
+         * false, /./s.test(' ') is true. */
+        uint16_t* pattern = to_utf16(".");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t ls[] = { 0x2028 };
+        check(!regex_exec(h, ls, 1, 0), "non-/u /./ still excludes LINE SEPARATOR U+2028 above the old cap");
+        uint16_t ok[] = { 0x202A };
+        check(regex_exec(h, ok, 1, 0), "non-/u /./ matches U+202A (exclusion is exactly 2028-2029)");
+        free(pattern);
+        regex_free(h);
+
+        uint16_t* pattern_s = to_utf16(".");
+        uintptr_t hs = regex_compile(pattern_s, 0, regex_flag_bit('s'));
+        check(regex_exec(hs, ls, 1, 0), "/./s (dotAll) matches U+2028");
+        free(pattern_s);
+        regex_free(hs);
+    }
+    {
+        uint16_t* pd = to_utf16("\\D");
+        uintptr_t hd = regex_compile(pd, 0, 0);
+        uint16_t amacron[] = { 0x0100 };
+        check(regex_exec(hd, amacron, 1, 0), "non-/u /\\D/ matches U+0100");
+        free(pd); regex_free(hd);
+
+        uint16_t* pw = to_utf16("\\W");
+        uintptr_t hw = regex_compile(pw, 0, 0);
+        check(regex_exec(hw, amacron, 1, 0), "non-/u /\\W/ matches U+0100");
+        free(pw); regex_free(hw);
+    }
+    {
+        uint16_t* ps = to_utf16("\\s");
+        uintptr_t hs = regex_compile(ps, 0, 0);
+        uint16_t bom[] = { 0xFEFF };
+        check(regex_exec(hs, bom, 1, 0), "non-/u /\\s/ matches BOM U+FEFF (\\s list is mode-independent)");
+        free(ps); regex_free(hs);
+
+        uint16_t* pS = to_utf16("\\S");
+        uintptr_t hS = regex_compile(pS, 0, 0);
+        uint16_t euro[] = { 0x20AC };
+        check(regex_exec(hS, euro, 1, 0), "non-/u /\\S/ matches EURO U+20AC");
+        check(!regex_exec(hS, bom, 1, 0), "non-/u /\\S/ does not match BOM (complement of the full \\s list)");
+        free(pS); regex_free(hS);
+    }
+    {
+        /* Inside a character class the same fill_builtin_class path is
+         * reached via a different call site -- guard it separately. */
+        uint16_t* pattern = to_utf16("[\\s]");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t ls[] = { 0x2028 };
+        check(regex_exec(h, ls, 1, 0), "non-/u /[\\s]/ matches U+2028 (in-class builtin path)");
+        free(pattern);
+        regex_free(h);
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;

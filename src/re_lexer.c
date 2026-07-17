@@ -306,12 +306,19 @@ static bool add_range(CharClass* cls, uint32_t start, uint32_t end) {
     return true;
 }
 
+/* The non-unicode upper bound for complement classes is 0xFFFF, not 255:
+ * ECMAScript's \D/\W/\S have never been Latin-1-scoped in any mode -- what
+ * /u gates is surrogate-pair *decoding*, so without it the match space is
+ * the full UTF-16 code-unit range 0-0xFFFF (docs/ARCHITECTURE.md's lexer
+ * invariant; docs/IMPROVEMENTS.md #1.7, diffed against Node). The \s list
+ * itself is mode-independent per spec (WhiteSpace/LineTerminator don't
+ * change under /u), so it gets no cutoff at all. */
 static void fill_builtin_class(CharClass* cls, char type, bool unicode) {
     if (type == 'd') {
         add_range(cls, '0', '9');
     } else if (type == 'D') {
         add_range(cls, 0, '0' - 1);
-        add_range(cls, '9' + 1, unicode ? 0x10FFFF : 255);
+        add_range(cls, '9' + 1, unicode ? 0x10FFFF : 0xFFFF);
     } else if (type == 'w') {
         add_range(cls, '0', '9');
         add_range(cls, 'A', 'Z');
@@ -322,7 +329,7 @@ static void fill_builtin_class(CharClass* cls, char type, bool unicode) {
         add_range(cls, '9' + 1, 'A' - 1);
         add_range(cls, 'Z' + 1, '_' - 1);
         add_range(cls, '_' + 1, 'a' - 1);
-        add_range(cls, 'z' + 1, unicode ? 0x10FFFF : 255);
+        add_range(cls, 'z' + 1, unicode ? 0x10FFFF : 0xFFFF);
     } else if (type == 's') {
         uint32_t spaces[] = {
             0x0009, 0x000D, 0x0020, 0x0020, 0x00A0, 0x00A0, 0x1680, 0x1680,
@@ -330,16 +337,16 @@ static void fill_builtin_class(CharClass* cls, char type, bool unicode) {
             0x3000, 0x3000, 0xFEFF, 0xFEFF
         };
         for (size_t i = 0; i < sizeof(spaces)/sizeof(spaces[0]); i += 2) {
-            if (!unicode && spaces[i] > 255) break;
             add_range(cls, spaces[i], spaces[i+1]);
         }
     } else if (type == 'S') {
         CharClass temp = {0};
         fill_builtin_class(&temp, 's', unicode);
         invert_class(&temp);
+        uint32_t max_cp = unicode ? 0x10FFFF : 0xFFFF;
         for (int i = 0; i < temp.range_count; i++) {
-            if (!unicode && temp.ranges[i].start > 255) break;
-            uint32_t end = (!unicode && temp.ranges[i].end > 255) ? 255 : temp.ranges[i].end;
+            if (temp.ranges[i].start > max_cp) break;
+            uint32_t end = (temp.ranges[i].end > max_cp) ? max_cp : temp.ranges[i].end;
             add_range(cls, temp.ranges[i].start, end);
         }
     }
@@ -923,16 +930,17 @@ void next_token(Lexer* lexer) {
             break;
         case '.': {
             int cid = alloc_class(lexer->prog);
-            uint32_t max_cp = lexer->prog->unicode ? 0x10FFFF : 255;
+            /* 0xFFFF, not 255, without /u: same full-code-unit-space
+             * invariant as fill_builtin_class above (docs/IMPROVEMENTS.md
+             * #1.7). The U+2028/U+2029 LineTerminator exclusion applies in
+             * both modes -- the old non-unicode branch skipping it was only
+             * ever masked by the 255 cap putting both out of reach. */
+            uint32_t max_cp = lexer->prog->unicode ? 0x10FFFF : 0xFFFF;
             if (!lexer->prog->dot_all) {
                 add_range(&lexer->prog->classes[cid], 0, '\n' - 1);
                 add_range(&lexer->prog->classes[cid], '\n' + 1, '\r' - 1);
-                if (lexer->prog->unicode) {
-                    add_range(&lexer->prog->classes[cid], '\r' + 1, 0x2027);
-                    add_range(&lexer->prog->classes[cid], 0x202A, max_cp);
-                } else {
-                    add_range(&lexer->prog->classes[cid], '\r' + 1, max_cp);
-                }
+                add_range(&lexer->prog->classes[cid], '\r' + 1, 0x2027);
+                add_range(&lexer->prog->classes[cid], 0x202A, max_cp);
             } else {
                 add_range(&lexer->prog->classes[cid], 0, max_cp);
             }
