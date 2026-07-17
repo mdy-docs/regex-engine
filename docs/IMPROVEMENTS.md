@@ -751,21 +751,24 @@ patterns plus one surrogate-pair case. None of the P0/P1 findings above
 would have been caught by either file, and there's no regression test
 guarding against any of them once fixed.
 
-- **No CI.** There's no `.github/workflows/` at all — nothing runs
-  `make test` (or anything else) on push or PR. This is the single
-  cheapest structural improvement available: even a minimal workflow
-  running `make test` on every push catches regressions for free. (The
-  GitHub Pages deploy workflow this task also sets up, see
-  `docs/ARCHITECTURE.md`/README, could double as this if it's split into
-  a `test` job that gates the `deploy` job.)
+- ~~**No CI.**~~ — **resolved.** `.github/workflows/test.yml` runs three
+  jobs on every push and PR to `main`: `make test` (native), `make
+  test-asan` (ASan+UBSan — see next bullet), and `make test-wasm` (the
+  real compiled artifact under Node, via `setup-emsdk`). The GitHub Pages
+  workflow (`pages.yml`) independently gates its deploy on `make test`,
+  so a broken engine can't ship to the demo site even if someone pushes
+  without waiting for the test workflow.
 - **No memory-safety testing.** Every finding in §1 above was found with
   a throwaway ASan probe in ten minutes. ~~Adding a `make test-asan` target
   (same `test/smoke.c`, built with `-fsanitize=address,undefined`)~~ —
   **the target now exists** (added alongside the 1.4/1.5 fixes, whose
   buffer-edge regression tests are only meaningful under a sanitizer: a
-  plain build can pass them by silently reading adjacent memory). Still
-  outstanding: running it in CI, which doesn't exist yet (previous
-  bullet).
+  plain build can pass them by silently reading adjacent memory) **and
+  runs in CI** as `test.yml`'s `asan` job. One wrinkle worth knowing:
+  UBSan findings are only fatal because the target compiles with
+  `-fno-sanitize-recover=undefined` — by default UBSan *prints* its
+  report and exits 0, which would sail through CI unnoticed (ASan's
+  reports abort by default; UBSan's don't).
 - **No fuzzing.** `regex_compile` + `regex_exec` is an unusually clean
   fuzz target — two pure functions, deterministic, small state, already
   isolated behind a stable C API. A libFuzzer harness that feeds random
@@ -888,9 +891,11 @@ If tackling this list, roughly in order of (safety impact) / (effort):
    families (escape-range validation, `invert_class`) were confirmed
    correct and left alone. All four P1 findings (1.4–1.7) are now closed;
    everything remaining in §1 is P2/P3.
-7. Wire up CI (§3) around whatever subset of `make test` / an ASan build
-   exists at each step above, so each fix in this list gets a permanent
-   regression guard as it lands rather than all testing infrastructure
-   being a separate final step.
+7. ~~Wire up CI (§3)~~ — **done**: `test.yml` runs native, ASan+UBSan
+   (with `-fno-sanitize-recover=undefined` so UBSan findings actually
+   fail the job), and WASM smoke jobs on every push/PR; the Pages deploy
+   was already gated on `make test`. Every regression test added by the
+   fixes above now runs automatically, including the sanitizer-only
+   buffer-edge ones.
 8. **1.8** (emit `OP_CLEAR_CAPTURES`) — lower urgency (wrong answer, not
    unsafe), tackle once the memory-safety items are clear.

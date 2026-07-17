@@ -24,8 +24,11 @@ test: test/smoke
 # (docs/IMPROVEMENTS.md #1.4/#1.5) exercise one-past-the-end reads on
 # tightly-sized buffers -- a plain build can pass those by silently reading
 # adjacent memory, so only this target actually proves them fixed.
+# -fno-sanitize-recover: UBSan only *prints* its findings by default and
+# exits 0, which would let undefined behavior sail through CI unnoticed --
+# this makes the first finding fatal, like ASan's already are.
 test/smoke-asan: $(ENGINE_SRCS) src/regex_wasm.c test/smoke.c
-	$(CC) $(CFLAGS) -fsanitize=address,undefined $(ENGINE_SRCS) src/regex_wasm.c test/smoke.c -o test/smoke-asan
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=undefined $(ENGINE_SRCS) src/regex_wasm.c test/smoke.c -o test/smoke-asan
 
 test-asan: test/smoke-asan
 	./test/smoke-asan

@@ -14,6 +14,17 @@ jobs:
       - uses: actions/checkout@v4
       - run: make test
 
+  # The buffer-edge regression tests (docs/IMPROVEMENTS.md #1.4/#1.5) only
+  # prove anything under a sanitizer -- a plain build can pass them by
+  # silently reading adjacent memory -- so this job, not `native`, is what
+  # actually guards the memory-safety fixes against regression.
+  asan:
+    name: ASan+UBSan smoke test (make test-asan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test-asan
+
   wasm:
     name: WASM smoke test (make test-wasm)
     runs-on: ubuntu-latest
