@@ -7,3 +7,5 @@ test/smoke-asan.dSYM/
 .ucd_cache/
 web/baru-re.js
 web/baru-re.wasm
+*.tgz
+node_modules/

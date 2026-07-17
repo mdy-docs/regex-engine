@@ -146,10 +146,38 @@ Notes:
   semantics (a `String.prototype.slice(caps[0], caps[1])` on the original
   JS string reconstructs the match).
 
+### Using from JavaScript via npm
+
+The compiled engine is published as
+[`@mdy-docs/baru-re`](https://www.npmjs.com/package/@mdy-docs/baru-re) —
+the package ships exactly two artifacts, `dist/baru-re.js` (the Emscripten
+glue, UMD-style: CommonJS `require`, ESM `import`, or a browser `<script>`
+global all work) and `dist/baru-re.wasm`, which the glue locates next to
+itself automatically in both Node and bundler/browser setups.
+
+```sh
+npm install @mdy-docs/baru-re
+```
+
+```js
+import createBaruReModule from "@mdy-docs/baru-re";
+const Module = await createBaruReModule();
+// Module.cwrap / Module._malloc etc. as below
+```
+
+If a bundler or server setup needs the `.wasm` asset's path explicitly
+(e.g. to serve it statically), it's exported as a subpath:
+`import.meta.resolve("@mdy-docs/baru-re/baru-re.wasm")` /
+`require.resolve("@mdy-docs/baru-re/baru-re.wasm")`.
+
+The package intentionally exposes the same low-level API documented above —
+see the note at the top of this section about the missing (deliberately)
+JS-friendly wrapper layer.
+
 ### Minimal JS usage sketch (see `test/node_smoke.mjs` for a full working example)
 
 ```js
-import createBaruReModule from "./dist/baru-re.js";
+import createBaruReModule from "@mdy-docs/baru-re"; // or "./dist/baru-re.js" from a checkout
 const Module = await createBaruReModule();
 const regex_compile = Module.cwrap("regex_compile", "number", ["number", "number", "number"]);
 // ...cwrap the rest per regex_wasm.h...
@@ -232,3 +260,7 @@ would apply here too:
 # from the jsvm2 repo root, not this directory
 node test/run_test262.js test/test262/test/built-ins/RegExp
 ```
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).

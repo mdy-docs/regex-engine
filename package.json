@@ -1,0 +1,44 @@
+{
+  "name": "@mdy-docs/baru-re",
+  "version": "0.1.0",
+  "description": "Standalone ECMAScript-flavored regex engine in C, compiled to WebAssembly. bārû (the Babylonian diviner — a reader of signs and patterns) + RE.",
+  "license": "MIT",
+  "author": "Daniel Walton <daniel@belteshazzar.com.au>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mdy-docs/baru-re.git"
+  },
+  "homepage": "https://mdy-docs.github.io/baru-re/",
+  "bugs": "https://github.com/mdy-docs/baru-re/issues",
+  "keywords": [
+    "regex",
+    "regexp",
+    "wasm",
+    "webassembly",
+    "ecmascript",
+    "unicode",
+    "lookbehind",
+    "named-groups",
+    "unicode-properties"
+  ],
+  "main": "dist/baru-re.js",
+  "exports": {
+    ".": "./dist/baru-re.js",
+    "./baru-re.wasm": "./dist/baru-re.wasm",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/baru-re.js",
+    "dist/baru-re.wasm"
+  ],
+  "scripts": {
+    "prepack": "make wasm",
+    "test": "make test && make test-wasm"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
