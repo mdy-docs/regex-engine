@@ -31,9 +31,9 @@ predictably, along the mapping `docs/ARCHITECTURE.md`'s intro describes.
 
 | # | Finding | Severity | Confirmed |
 |---|---|---|---|
-| 1.1 | 3 nested lookarounds crashes the process (stack overflow) | **P0 — crash/DoS** | ✅ ASan + plain build |
-| 1.2 | `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS`/`MAX_COUNTERS` never bounds-checked → heap/stack corruption | **P0 — memory corruption** | ✅ ASan |
-| 1.3 | Flat (non-nested) long patterns also stack-overflow via linear AST recursion | **P0 — crash/DoS** | ✅ ASan |
+| 1.1 | 3 nested lookarounds crashes the process (stack overflow) | **P0 — crash/DoS** | ✅ ASan + plain build — **FIXED** |
+| 1.2 | `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS`/`MAX_COUNTERS` never bounds-checked → heap/stack corruption | **P0 — memory corruption** | ✅ ASan — **FIXED** |
+| 1.3 | Flat (non-nested) long patterns also stack-overflow via linear AST recursion | **P0 — crash/DoS** | ✅ ASan — **FIXED** |
 | 1.4 | `\b`/`\B` read one code unit past `text_end` unconditionally | P1 — OOB read | ✅ ASan |
 | 1.5 | `decode_utf16` reads past buffer end for a trailing lone lead surrogate | P1 — OOB read | ✅ ASan |
 | 1.6 | Backreference bounds only validated under `/u` — `\999` OOB-reads in Annex B mode | P1 — OOB read | ✅ ASan |
@@ -110,7 +110,7 @@ regression coverage added to `test/smoke.c`:
 
 ## 1. Correctness & memory safety
 
-### 1.1 [P0] Nested lookaround crashes the process at depth 3
+### 1.1 [P0] Nested lookaround crashes the process at depth 3 — **FIXED**
 
 ```c
 // (?=(?=(?=x))) -- three nested positive lookaheads, matched against "x"
@@ -183,36 +183,88 @@ level and host-level stopgap, not a fix** — the source-level fixes below
 are still the real solution, and any *other* embedder of this engine
 (native, or WASM without these flags) is still exposed.
 
-**Suggested source-level fix, in order of surgical-ness:**
-1. Shrink `Thread.captures` from a fixed `MAX_GROUPS * 2` (510 pointers) to
-   `(prog->group_count + 1) * 2`, either via a dynamically-sized
-   (heap-allocated once per `vm_execute_internal` call tree, not per
-   `Thread`) buffer, or by capping typical `MAX_GROUPS` much lower and
-   raising it only for patterns that need it. Most patterns use a handful
-   of groups; paying for 510 pointers per `Thread` (and there are 512
-   `Thread`s in `stack[]`) is the dominant cost.
-2. Move `stack[512]` and `fail_cache[CACHE_SIZE]` off the C stack (heap-
-   allocate, or make them `static`/thread-local scratch buffers sized once
-   and reused — note `static` alone isn't safe for the *recursive* call
-   case without an explicit per-depth pool, since a lookaround's recursive
-   call would clobber the outer call's in-progress buffer).
-3. Enforce a maximum lookaround nesting depth at compile time (track depth
-   in the parser, emit a clear `prog->error` past some sane limit like 50)
-   as a backstop even after (1)/(2) — recursion depth should fail closed
-   with a catchable error, not crash the process, regardless of how much
-   the frame shrinks or how big a stack the host configures.
+**Fixed** by exactly the two source-level changes suggested above (1 and
+2 — see `re_vm.c`):
 
-### 1.2 [P0] `MAX_*` bounds are never checked — heap/stack corruption
+1. **`Thread.captures` is now a pointer, not an embedded `MAX_GROUPS * 2`
+   array**, sized per-call to `cap_pairs = (prog->group_count + 1) * 2` —
+   the pattern's *actual* group count, not the worst case. It points into
+   a shared arena `vm_execute_internal` allocates once per call (one slice
+   per backtrack-stack slot, plus one more for `current`, the thread
+   actively being stepped through instructions outside the stack array).
+   Since a plain struct assignment now only copies a *pointer* (aliasing
+   two threads' capture state instead of duplicating it), every push/pop
+   that used to rely on `Thread` value semantics — `OP_SPLIT`,
+   `OP_CHECK_COUNTER`'s two backtrack pushes, and popping the next thread
+   off the stack — now goes through a small `thread_copy_state()` helper
+   that copies the *data* `.captures` points to, into the destination
+   thread's own already-assigned slice, explicitly.
+2. **The backtrack stack (`Thread[512]`) and fail-cache
+   (`CacheEntry[CACHE_SIZE]`) are heap-allocated**, not C-stack locals —
+   `malloc`'d at the top of `vm_execute_internal` and `free`'d on every
+   exit path (a single `goto cleanup` target, since there are now two
+   return points: `OP_MATCH` succeeding, and the loop running out of
+   threads). Lookaround's recursive call into this same function now costs
+   heap, not C-stack, per nesting level.
+
+(3) — a hard nesting-depth cap as a backstop — was **not** added on top:
+with (1) and (2) in place, this function's own C-stack frame no longer
+scales with `MAX_GROUPS` or the backtrack-stack/cache sizes at all (just a
+handful of small locals), so nesting depth is no longer the scarce
+resource a backstop would need to protect. The three `OP_LOOKAHEAD`/
+`OP_NEG_LOOKAHEAD`/`OP_LOOKBEHIND`/`OP_NEG_LOOKBEHIND` blocks' own
+`temp_captures` scratch buffer is sized to `cap_pairs` too (a small,
+per-instruction-dispatch C-stack VLA — at most 510 pointers, nowhere near
+large enough to need heap allocation the way the once-per-call arena did).
+Separately, `docs/IMPROVEMENTS.md #1.3`'s `MAX_AST_DEPTH` already caps how
+deeply a *pattern's source syntax* can nest at parse time (200, for a
+different reason — bounding the parser's and the AST-walkers' own
+recursion), which incidentally also caps lookaround nesting specifically,
+but that's not what makes *this* fix safe; this fix stands on its own
+regardless of that cap's value.
+
+**Verified** (ASan + UBSan, zero warnings under `-Wall -Wextra`, plus
+macOS `leaks --atExit`: **0 leaks for 0 total leaked bytes** across every
+scenario below — LeakSanitizer itself isn't supported on macOS, so `leaks`
+stood in for it): the original repro (`(?=(?=(?=x)))`, 3 levels) now
+compiles and matches correctly instead of crashing; nesting pushed to 199
+levels (the edge of `MAX_AST_DEPTH`) compiles and matches correctly with
+no crash; capture groups *inside* a lookahead round-trip correctly through
+the recursive call's `temp_captures` (confirmed both in isolation and
+combined with 50 levels of nesting) — right-sizing `Thread.captures`
+didn't corrupt capture data; 2000 repeated compile/exec/free cycles with
+nested lookahead completed cleanly. Also reconfirmed against the actual
+compiled WASM artifact directly (not just native): the `web/`
+demo's own "known crash" preset (40 levels of `(?=`, previously the
+concrete trigger `web/app.js`'s crash-recovery UI was built to catch) now
+simply compiles and matches, no `RuntimeError`, no reload. Permanent
+regression coverage for all of the above in `test/smoke.c`.
+
+**What this changes about the mitigations already in place.** The
+WASM-build stopgaps described above (`-s STACK_OVERFLOW_CHECK=2`,
+`-s STACK_SIZE=8388608` in the `Makefile`, and `web/app.js`'s catch-and-
+reload) are no longer load-bearing *for this specific finding* — the
+pattern that used to need them to fail safely under WASM now just works.
+They're being left in place regardless: `STACK_OVERFLOW_CHECK` in
+particular is generically valuable defense-in-depth against *any* future
+stack issue (this fix doesn't make the engine immune to stack overflow in
+general, just this specific, previously-worst offender), and removing
+already-working safety nets isn't worth the marginal build-size/perf cost
+of keeping them. `web/`'s "known crash" example pattern and footer copy
+should be updated separately to stop describing something that no longer
+reproduces — tracked as a follow-up, not done as part of this fix.
+
+### 1.2 [P0] `MAX_*` bounds are never checked — heap/stack corruption — **FIXED**
 
 `include/regexp.h` defines `MAX_OPCODES=16384`, `MAX_CLASSES=64`,
 `MAX_GROUPS=255`, `MAX_COUNTERS=16`, all as fixed array sizes inside
 `Program` (heap-allocated) or `Thread` (stack-allocated, see 1.1). Every
-increment of the corresponding counter is unchecked:
+increment of the corresponding counter was unchecked:
 
-- `emit()` (`re_compiler.c:24`): `prog->code[idx] = ...; idx = prog->code_count++;` — no check against `MAX_OPCODES`.
-- Character-class allocation (`re_lexer.c:905, 926, 998, 1055`): `int cid = lexer->prog->class_count++;` then `memset(&lexer->prog->classes[cid], ...)` — no check against `MAX_CLASSES`.
-- Group numbering (`re_parser.c:77`): `node->id = ++lexer->prog->group_count;` — no check against `MAX_GROUPS`.
-- Counter allocation (`re_compiler.c:153`): `int counter_id = prog->counter_count++;` — no check against `MAX_COUNTERS`.
+- `emit()` (`re_compiler.c`): `prog->code[idx] = ...; idx = prog->code_count++;` — no check against `MAX_OPCODES`.
+- Character-class allocation (`re_lexer.c`, 4 call sites): `int cid = lexer->prog->class_count++;` then `memset(&lexer->prog->classes[cid], ...)` — no check against `MAX_CLASSES`.
+- Group numbering (`re_parser.c`): `node->id = ++lexer->prog->group_count;` — no check against `MAX_GROUPS`.
+- Counter allocation (`re_compiler.c`): `int counter_id = prog->counter_count++;` — no check against `MAX_COUNTERS`.
 
 **Confirmed repro (character classes, heap corruption via `memset` overrun):**
 ```c
@@ -237,36 +289,75 @@ input string needed.
     #0 vm_execute_internal regexp.c:1758   (OP_INIT_COUNTER: current.counters[inst.arg1] = 0)
 ```
 
-`MAX_GROUPS` (256+ capture groups) and `MAX_OPCODES` (very long/complex
-patterns) are structurally the same class of bug — unchecked writes into
-fixed arrays sized by a compile-time constant, driven by pattern content —
-confirmed by code inspection even where a specific probe hit a different
-crash first (see 1.3, which triggers before `MAX_OPCODES` can be reached
-via a *flat* pattern).
+**Fixed** by bounds-checking all four allocation sites, each the same
+shape: check the counter against its `MAX_*` bound *before* using it as an
+array index; if the pattern has already hit the limit, set `prog->error`
+(if not already set — the first failure wins) and return a clamped, always-
+in-bounds index (the last valid slot) instead of writing OOB. This keeps
+every subsequent `emit()`/`add_range()`/etc. call safe even after the limit
+is hit, since a `Program` with `prog->error` set is discarded by
+`regex_compile()` without ever being executed (`src/regex_wasm.c`) — the
+resulting reused-slot bytecode is nonsensical but never read.
 
-**Fix:** in each of the four increment sites, check against the `MAX_*`
-bound and set `prog->error = "InternalError: pattern exceeds internal
-limit"` (or a more specific message per resource) instead of writing OOB.
-This is a small, mechanical, high-value fix — a handful of `if` checks
-total. Consider whether the `MAX_*` constants themselves should be raised
-now that they're actually enforced (right now they're aspirational, not
-real limits).
+- `re_compiler.c`'s `emit()` and the `AST_QUANTIFIER` counter allocation:
+  `code_count >= MAX_OPCODES` / `counter_count >= MAX_COUNTERS` before
+  allocating — no reserved-slot subtlety, straightforward.
+- `re_lexer.c`'s four `class_count++` sites consolidated into one new
+  `alloc_class()` helper with the `class_count >= MAX_CLASSES` check,
+  replacing the repeated allocate-then-`memset` pattern at each call site.
+- `re_parser.c`'s group numbering needed one extra subtlety: capture group
+  id 0 is reserved for "whole match" everywhere else in the engine
+  (`group_names[0]` is never a real named group;
+  `captures[0]`/`captures[1]` are the whole-match span, not any capture
+  group's), so it already occupies one of `MAX_GROUPS`'s 255 array slots
+  even though real capture groups are only ever assigned ids 1 and up. The
+  correct ceiling is therefore `group_count < MAX_GROUPS - 1` (254 usable
+  capture groups), not `< MAX_GROUPS` — the naive version would have let
+  `node->id` reach 255, one past the end of both `group_names[MAX_GROUPS]`
+  and (doubled) `captures[MAX_GROUPS*2]`.
 
-### 1.3 [P0] Long flat patterns stack-overflow via linear AST recursion
+**Verified** (all under ASan+UBSan, zero warnings under `-Wall -Wextra`):
+exact-boundary precision for all four resources — 64 classes/16 counters
+compile successfully, 65/17 fail cleanly with a message naming the
+resource; 255 capture groups (one past the real 254 ceiling) fails cleanly;
+a single `\p{RGI_Emoji_ZWJ_Sequence}` character class repeated 20 times
+(each class expanding to hundreds of opcodes via `compile_class_with_strings`,
+clearing `MAX_OPCODES` without needing anywhere near the AST depth 1.3
+would need) fails cleanly. None of these crash; all set a specific,
+resource-naming `prog->error` instead. Permanent regression coverage for
+all four in `test/smoke.c`.
 
-Separately from 1.1/1.2, `parse_concat` (`re_parser.c:108`) and `parse_alt`
-(`re_parser.c:130`) build a **linear chain** of `AST_CONCAT`/`AST_ALT` nodes
-for a flat sequence — not a balanced tree. A pattern with N sequential
-atoms (e.g. `N` literal characters with no grouping at all) produces an
-AST that's N nodes deep. Every one of `free_ast`, `validate_group_names`,
-`validate_backrefs`, `validate_named_backrefs`, and `compile_node`
-recurses through `node->left`/`node->right` with no iterative fallback and
-no depth limit.
+**An interaction worth knowing about, discovered while verifying this
+fix — not introduced by it:** the *legitimate*, non-erroring maximum of
+exactly 254 capture groups (`(a)(a)(a)...` × 254, no bounds violation)
+independently crashes via 1.3's still-open stack-overflow bug in
+`validate_group_names` — confirmed via ASan (~247 recursion frames before
+overflow, right at that group count). This fix's own error path is
+unaffected *only* because `next_token` short-circuits to `TOK_EOF` the
+moment `prog->error` is set (this fix triggers *during* parsing, before
+`validate_group_names` ever runs — see `compile_into`'s `if (!prog->error)`
+guard ahead of that call), so 255+ groups reliably fail cleanly without
+ever reaching the dangerous code path. A pattern that stays *within* the
+now-enforced limit has no such shortcut. In other words: this fix
+correctly closes the OOB-write hole this finding was about, but raising
+`MAX_GROUPS` itself, or otherwise trying to make full use of the newly-
+enforced 254-group ceiling, still runs straight into 1.3 — that's a
+separate fix, tracked there, not part of this one.
+
+### 1.3 [P0] Long flat patterns stack-overflow via linear AST recursion — **FIXED**
+
+`parse_concat` and `parse_alt` build a **linear chain** of `AST_CONCAT`/
+`AST_ALT` nodes for a flat sequence — not a balanced tree. A pattern with N
+sequential atoms (e.g. `N` literal characters with no grouping at all)
+produces an AST that's N nodes deep. Every one of `free_ast`,
+`validate_group_names`, `validate_backrefs`, `validate_named_backrefs`, and
+`compile_node` recurses through `node->left`/`node->right` with no
+iterative fallback and no depth limit.
 
 **Confirmed repro:** a pattern of 20,000 plain literal characters (e.g.
-`"aaaa...a"` × 20000, no metacharacters, no nesting) segfaults with a stack
-overflow inside `validate_group_names`, called from `compile_into` before
-any bytecode is even emitted:
+`"aaaa...a"` × 20000, no metacharacters, no nesting) segfaulted with a
+stack overflow inside `validate_group_names`, called from `compile_into`
+before any bytecode was even emitted:
 ```
 ==ERROR: AddressSanitizer: stack-overflow
     #0 validate_group_names regexp.c:1228
@@ -274,18 +365,79 @@ any bytecode is even emitted:
     #2 validate_group_names regexp.c:1248
     ... (repeats)
 ```
-20,000 nested *groups* (`((((...a...))))`) hits the same crash for the
-same structural reason (real nesting this time, not just a flat chain) —
-both are "the AST is deep enough that per-node recursion exhausts the C
-stack," just via different pattern shapes.
+20,000 nested *groups* (`((((...a...))))`) hit the same crash for the same
+structural reason (real nesting this time, not just a flat chain), and a
+20,000-way alternation (`a|a|a|...|a`) hit it a third way — `parse_alt`
+recurses on its own right-hand side for every `|`, so that one crashed
+*during parsing itself*, before the resulting tree was ever handed to any
+of the walkers above. All three are "recursion depth proportional to
+pattern shape, with no cap," just reached via different grammar
+constructs.
 
-**Fix:** either (a) rewrite the four recursive walkers as iterative loops
-with an explicit stack (doable — `AST_CONCAT` recursion is effectively
-"walk a linked list," which is the easy case to de-recursify first), or
-(b) enforce a maximum pattern length / AST depth at parse time and fail
-with `prog->error` before recursion depth becomes a problem. (b) is
-strictly necessary regardless of (a) as a backstop for genuinely
-adversarial nested-group patterns, similar to 1.1's recommendation.
+**Fixed** by capping AST height at `MAX_AST_DEPTH` (`include/regexp.h`),
+checked at parse time via two complementary mechanisms in `re_parser.c`,
+matching the two different ways excessive depth could arise:
+
+- **`ASTNode.depth`**, maintained incrementally as `finish_node()` combines
+  a node's already-known children depths (`1 + max(left, right)`) at every
+  point the parser attaches children — the four sites identified above
+  (`parse_quantifier`, `parse_concat`'s loop, `parse_alt`'s combine, and
+  `parse_primary`'s group/lookaround wrap). This is what bounds a flat
+  literal chain or nested-group tree: neither causes deep *parser*
+  recursion on its own (`parse_concat`'s loop is iterative; group nesting's
+  recursion is comparatively shallow C-stack-wise), but both build a tree
+  deep enough to endanger the *later* walkers once parsing finishes.
+- **`Lexer.parse_depth`**, a live counter checked at the top of `parse_alt`
+  itself, *before* recursing further — necessary because `ASTNode.depth`
+  is only known *after* a subtree is fully built, which is too late to stop
+  the recursion that built it. Both nested groups (`parse_primary` calls
+  `parse_alt` for the group body) and chained alternation (`parse_alt`
+  calls itself for each `|`) recurse through `parse_alt`, so checking there
+  catches both, including the alternation-chain case where the *parser's
+  own* stack was previously what overflowed.
+
+Once either check trips, `prog->error` is set (first failure wins, same
+"clamp and let the caller's existing short-circuit unwind things" pattern
+used for the four `MAX_*` bounds in 1.2) and parsing winds down quickly:
+`next_token()` starts returning `TOK_EOF` immediately once `prog->error` is
+set, so the still-in-flight recursive `parse_concat`/`parse_alt` calls
+return with minimal further work rather than continuing to build. This is
+also why `validate_group_names` and friends are safe even though a
+"doomed" AST may still contain a node or two past the limit: `compile_into`
+gates every one of those four walkers behind `if (!prog->error)`, so once
+this check fires, none of them run at all. (`free_ast` is the one
+exception — it isn't gated, since the AST needs freeing regardless of
+error state — but it has by far the smallest per-frame stack cost of the
+five, so a tree just past `MAX_AST_DEPTH` is nowhere near dangerous for it
+specifically.)
+
+**Verified** (ASan + UBSan, zero warnings under `-Wall -Wextra`): all three
+of the original repro shapes (20,000 flat literals, 20,000 nested groups,
+20,000-way alternation) now fail cleanly with a resource-limit error
+instead of crashing. Critically, the case this fix actually targets —
+**a *legitimate*, within-`MAX_GROUPS` pattern (254 capture groups, no
+bounds violation, would have compiled successfully before this fix) that
+still crashed via `validate_group_names`' own recursion once it ran on the
+resulting AST** — is confirmed to no longer crash either: the depth guard
+now rejects it before `validate_group_names` ever runs, converting a
+segfault into a clean, catchable `InternalError`. A moderately nested and
+quantified pattern well clear of the limit still compiles and matches
+correctly, confirming the guard doesn't disturb ordinary usage. Permanent
+regression coverage for all of the above in `test/smoke.c`.
+
+**What this fix does *not* cover — 1.1 remains separate and open.**
+Finding 1.1 (3 nested lookarounds crashing the process) is a *different*
+recursion path: `vm_execute_internal`'s own recursive call for
+`OP_LOOKAHEAD`/`OP_LOOKBEHIND` at **match time**, not anything in the
+parser. `MAX_AST_DEPTH=200` bounds how deeply a *pattern's syntax* can
+nest at parse time, but does nothing to stop a pattern that compiles fine
+(e.g. 10 nested lookaheads, comfortably under 200) from crashing the VM
+later when matched, since that recursion's ~2.2MB-per-call stack frame
+only tolerates roughly 3–4 levels regardless of what the parser allowed
+through. Fixing that would need either shrinking `Thread`/the VM's own
+stack frame or a separate, much tighter (single-digit) lookaround-nesting
+cap at parse time — deliberately not bundled into this fix, which was
+scoped to the `validate_group_names`-and-siblings bug specifically.
 
 ### 1.4 [P1] `\b`/`\B` read one past `text_end` unconditionally
 
@@ -623,24 +775,29 @@ guarding against any of them once fixed.
 
 If tackling this list, roughly in order of (safety impact) / (effort):
 
-1. **1.2** (bounds-check the four `MAX_*` counters) — small, mechanical,
-   closes real heap/stack corruption.
-2. **1.4** and **1.5** (the two unconditional OOB reads) — one-line-ish
+1. ~~**1.2** (bounds-check the four `MAX_*` counters)~~ — **done.**
+2. ~~**1.3** (depth-limit the parser/AST walkers)~~ — **done**, via
+   `MAX_AST_DEPTH` + `ASTNode.depth`/`Lexer.parse_depth` in `re_parser.c`.
+   This also happened to close the specific 254-capture-group crash noted
+   under 1.2 (a legitimate, within-`MAX_GROUPS` pattern that used to reach
+   `validate_group_names` and crash there) — that was always a 1.3 issue
+   wearing a 1.2-shaped trigger, and is now fixed alongside it.
+3. ~~**1.1** (shrink `Thread`/the VM stack frame)~~ — **done**: captures is
+   now sized to `(prog->group_count + 1) * 2` instead of `MAX_GROUPS * 2`,
+   and the backtrack stack + fail-cache are heap-allocated instead of
+   C-stack locals — see 1.1's write-up for what that took (`Thread`
+   captures becoming a pointer meant every push/pop needed an explicit
+   copy instead of relying on struct-assignment). All four original P0
+   crash/memory-corruption findings (1.1, 1.2, 1.3, and the 1.2-shaped
+   1.3 interaction above) are now fixed.
+4. **1.4** and **1.5** (the two unconditional OOB reads) — one-line-ish
    guards each.
-3. **1.6** (unconditional backref bounds validation) — drop one `&&
+5. **1.6** (unconditional backref bounds validation) — drop one `&&
    prog->unicode` condition.
-4. **1.7** (the `255` → `0xFFFF` cap fix) — mechanical, but grep carefully
+6. **1.7** (the `255` → `0xFFFF` cap fix) — mechanical, but grep carefully
    for every occurrence and verify each one against real JS behavior
    rather than pattern-matching blindly, since not every `255`/`0x10FFFF`
    pair in the file is necessarily wrong.
-5. **1.1** (shrink `Thread`/the VM stack frame, add a depth limit) — the
-   highest-impact fix and also the most invasive; budget real time for it,
-   and add the depth-limit backstop even if the frame-shrinking part is
-   deferred, since the backstop alone converts a crash into a catchable
-   error immediately.
-6. **1.3** (de-recursify or depth-limit the AST walkers) — same shape as
-   (5)'s backstop; a length/depth cap at parse time is the fast partial
-   fix, de-recursifying the walkers is the complete one.
 7. Wire up CI (§3) around whatever subset of `make test` / an ASan build
    exists at each step above, so each fix in this list gets a permanent
    regression guard as it lands rather than all testing infrastructure

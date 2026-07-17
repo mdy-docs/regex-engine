@@ -21,7 +21,20 @@
 
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 
+/* Bounds-checked against MAX_OPCODES (see docs/IMPROVEMENTS.md #1.2, a
+ * confirmed heap-buffer-overflow: an unchecked pattern compiling to more
+ * than MAX_OPCODES instructions wrote past prog->code[]). Once the limit is
+ * hit, prog->error is set and every subsequent call clamps to the last
+ * valid slot instead of indexing out of bounds; callers keep patching that
+ * slot's fields (`prog->code[returned_idx].argN = ...`) after the fact,
+ * which produces nonsensical-but-safe bytecode that's never actually run,
+ * since a Program with prog->error set is discarded by regex_compile()
+ * without ever reaching vm_execute_internal() (see src/regex_wasm.c). */
 static int emit(Program* prog, RegexOpCode op, int arg1, int arg2, int arg3, int arg4, bool lazy) {
+    if (prog->code_count >= MAX_OPCODES) {
+        if (!prog->error) prog->error = "InternalError: pattern exceeds maximum compiled instruction count";
+        return MAX_OPCODES - 1;
+    }
     int idx = prog->code_count++;
     prog->code[idx] = (Instruction){op, arg1, arg2, arg3, arg4, lazy};
     return idx;
@@ -150,7 +163,22 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
             prog->code[jmp].arg1 = prog->code_count; break;
         }
         case AST_QUANTIFIER: {
-            int counter_id = prog->counter_count++;
+            /* Bounds-checked against MAX_COUNTERS (see docs/IMPROVEMENTS.md
+             * #1.2, a confirmed stack-buffer-overflow: a pattern with more
+             * than MAX_COUNTERS bounded quantifiers wrote past the VM's
+             * per-thread counters[MAX_COUNTERS]/counter_sp[MAX_COUNTERS]
+             * arrays). No reserved-zero convention here (unlike group ids),
+             * so counter_count >= MAX_COUNTERS is the exact overflow point;
+             * clamping to the last valid slot keeps this safe the same way
+             * emit()'s clamp does, for the same reason (prog->error set =>
+             * this Program is discarded, never executed). */
+            int counter_id;
+            if (prog->counter_count < MAX_COUNTERS) {
+                counter_id = prog->counter_count++;
+            } else {
+                if (!prog->error) prog->error = "InternalError: pattern exceeds maximum quantifier count";
+                counter_id = MAX_COUNTERS - 1;
+            }
             emit(prog, OP_INIT_COUNTER, counter_id, 0, 0, 0, false);
             int split_pc = prog->code_count;
             int check_idx = emit(prog, OP_CHECK_COUNTER, counter_id, node->min, node->max, 0, node->lazy);

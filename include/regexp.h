@@ -10,6 +10,21 @@
 #define MAX_COUNTERS 16
 #define CACHE_SIZE 8192
 
+/* Unlike the four MAX_* above (which size fixed arrays and are checked at
+ * their respective allocation sites -- see docs/IMPROVEMENTS.md #1.2), this
+ * bounds AST *height*, not a data structure's capacity: the parser
+ * (re_parser.c) computes each node's subtree height as it's built and
+ * rejects a pattern before its AST would grow deep enough to overflow the
+ * C stack in one of the several functions that recurse through it with no
+ * depth limit of their own (free_ast, validate_group_names,
+ * validate_backrefs, validate_named_backrefs, compile_node -- see
+ * docs/IMPROVEMENTS.md #1.3). validate_group_names is the most fragile of
+ * those (two ~8KB NameSet locals per stack frame) and was observed via
+ * ASan to crash around recursion depth ~247 on an 8MB stack; this leaves a
+ * comfortable safety margin below that while still accommodating any
+ * pattern a human would plausibly write by hand. */
+#define MAX_AST_DEPTH 200
+
 #define REGEX_FLAG_IGNORECASE 1
 #define REGEX_FLAG_GLOBAL 2
 #define REGEX_FLAG_MULTILINE 4

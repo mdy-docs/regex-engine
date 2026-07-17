@@ -60,19 +60,21 @@
 
 <footer>
   <p>
-    This page loads the exact <code>src/regexp.c</code> / <code>src/regex_wasm.c</code>
+    This page loads the exact <code>src/re_lexer.c</code> / <code>re_parser.c</code> /
+    <code>re_compiler.c</code> / <code>re_vm.c</code> / <code>regex_wasm.c</code>
     compiled by <code>make wasm</code> in this repo — nothing here is reimplemented in JS.
     The compiled <code>Program</code> struct and its backtracking VM run entirely inside
     the WASM sandbox; this page only marshals UTF-16 buffers in and capture offsets out.
   </p>
   <p>
-    <strong>Known limitations:</strong> this engine has a few confirmed correctness and
-    memory-safety issues (deeply nested lookaround can crash the matcher; a couple of
-    other edge cases) — see
+    <strong>Known limitations:</strong> this engine has a few confirmed correctness
+    issues — see
     <a href="https://github.com/mdy-docs/regex-engine/blob/main/docs/IMPROVEMENTS.md">docs/IMPROVEMENTS.md</a>
-    for the full list with reproductions. If a pattern below reports an engine crash, that's
-    one of those, not a bug in this page — the WASM instance is automatically reloaded so you
-    can keep experimenting.
+    for the full list with reproductions. The crash this page used to warn about here
+    (deeply nested lookaround exhausting the stack) is fixed; the remaining known issues
+    are wrong-answer bugs, not confirmed crashes. This page still catches a WASM-level
+    crash and reloads the engine automatically if it ever encounters one, as
+    defense-in-depth rather than a known, reproducible path.
   </p>
 </footer>
 

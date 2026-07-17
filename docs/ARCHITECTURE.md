@@ -145,10 +145,18 @@ parse_primary      ::= literal | class | ^ | $ | \b | \B | backref
 chains** of `AST_CONCAT`/`AST_ALT` nodes for a flat sequence, not balanced
 trees — a pattern with N flat concatenated atoms produces an AST N nodes
 deep. `free_ast`, `validate_group_names`, `validate_backrefs`, and
-`compile_node` all recurse through that chain, so **all four have O(pattern
-length) recursion depth with no iterative fallback** — see
-`docs/IMPROVEMENTS.md` P0 findings; this is a real stack-overflow DoS on
-long patterns, confirmed via ASan, not a style concern.
+`compile_node` all recurse through that chain with no iterative fallback,
+which used to mean O(pattern length) recursion depth and a real
+stack-overflow DoS on long patterns (confirmed via ASan) — see
+`docs/IMPROVEMENTS.md` #1.3, now fixed: `parse_concat`/`parse_alt`/
+`parse_quantifier`/`parse_primary` track each node's subtree height as
+it's built (`ASTNode.depth`, via `finish_node()` in `re_parser.c`) and
+`parse_alt` additionally checks a live recursion counter
+(`Lexer.parse_depth`) before recursing into itself or a group body, so a
+pattern that would produce a tree taller than `MAX_AST_DEPTH`
+(`include/regexp.h`) is rejected with a clean `prog->error` before any of
+the four walkers above — or the parser's own recursion, for deeply nested
+groups/alternation — ever gets that deep.
 
 Group numbering happens during parsing, not compilation:
 `parse_primary`'s group case (`re_parser.c:77`) does
@@ -234,7 +242,7 @@ knowing before you touch this:
 | `OP_WORD_BOUNDARY`/`OP_NON_WORD_BOUNDARY` | `\b`/`\B` |
 | `OP_CLEAR_CAPTURES` | **defined, VM-implemented, never emitted by the compiler** — see `docs/IMPROVEMENTS.md`; this is the missing piece behind the "stale captures from earlier alternation branch survive a later iteration" bug |
 
-## VM (`vm_execute_internal`, `re_vm.c:85`)
+## VM (`vm_execute_internal`, `re_vm.c:128`)
 
 A backtracking interpreter with an explicit thread stack (not the C call
 stack) plus a memoizing fail-cache:
@@ -242,23 +250,43 @@ stack) plus a memoizing fail-cache:
 ```c
 typedef struct {
     int pc; const uint16_t* sp;
-    const uint16_t* captures[MAX_GROUPS * 2];
+    const uint16_t** captures;
     int counters[MAX_COUNTERS];
     const uint16_t* counter_sp[MAX_COUNTERS];
 } Thread;
 ```
 
-- `Thread stack[512]` (`re_vm.c:86`) is the backtrack stack — every
-  `OP_SPLIT` and every "give up on this quantifier iteration" push a full
-  `Thread` (which is itself several KB, dominated by
-  `captures[MAX_GROUPS*2]` = 510 pointers). **This is a fixed-size array
-  with no overflow check** — see `docs/IMPROVEMENTS.md`.
-- `fail_cache[CACHE_SIZE]` (`CACHE_SIZE` = 8192, `include/regexp.h:11`) is
-  the ReDoS mitigation: before running a popped thread, `hash_state`
-  (`re_vm.c:79`) hashes `(pc, sp, counters[])` and checks whether that exact
-  state was
-  already tried and failed on *this* `vm_execute_internal` invocation; if
-  so, the thread is dropped without re-running. This is what keeps classic
+- `captures` is a pointer, not an embedded array — it used to be a fixed
+  `MAX_GROUPS * 2` (510-pointer) array, which made every `Thread` several
+  KB and this function's own stack frame balloon to ~2.2MB regardless of
+  how many groups the compiled pattern actually has, a real crash risk
+  once lookaround's recursion (below) is in the picture — see
+  `docs/IMPROVEMENTS.md` #1.1 for the history. `vm_execute_internal` now
+  allocates one arena per call (`re_vm.c:139`), sized to `cap_pairs =
+  (prog->group_count + 1) * 2` — the pattern's *actual* group count — with
+  one slice per backtrack-stack thread plus one more for `current`, and
+  points every `Thread.captures` into its own slice. The backtrack stack
+  itself (`Thread* stack`, `VM_STACK_CAPACITY` = 512 slots, `re_vm.c:140`)
+  and the fail-cache below are heap-allocated alongside it, not C-stack
+  locals, for the same reason: this function recurses into itself for
+  every `OP_LOOKAHEAD`/`OP_LOOKBEHIND`, so whatever lived on the C stack
+  here used to be paid again at every nesting level. **One consequence
+  worth knowing before editing this function:** since a plain struct
+  assignment now only copies `captures`' *pointer* (aliasing two threads'
+  capture state instead of duplicating it), every place that used to push
+  or pop a `Thread` by relying on that assignment's value semantics —
+  `OP_SPLIT`, `OP_CHECK_COUNTER`'s two backtrack pushes, and popping the
+  next thread off the stack — now goes through a small `thread_copy_state()`
+  helper that copies the *data* `.captures` points to explicitly, into the
+  destination thread's own already-assigned slice. Still a fixed-size
+  array with no *overflow* check on `VM_STACK_CAPACITY` itself, though —
+  see `docs/IMPROVEMENTS.md`.
+- `fail_cache` (`CacheEntry`, also heap-allocated per call now,
+  `CACHE_SIZE` = 8192, `include/regexp.h:11`) is the ReDoS mitigation:
+  before running a popped thread, `hash_state` (`re_vm.c:105`) hashes
+  `(pc, sp, counters[])` and checks whether that exact state was already
+  tried and failed on *this* `vm_execute_internal` invocation; if so, the
+  thread is dropped without re-running. This is what keeps classic
   catastrophic-backtracking patterns like `(a+)+$` fast in practice (see
   `docs/IMPROVEMENTS.md`'s "positive finding" — this genuinely works for
   the common cases). It's allocated fresh per call, including per
@@ -267,7 +295,7 @@ typedef struct {
   contains a quantifier gets a fresh, uncorrelated cache for the inner
   call each time the outer one is retried.
 - Each opcode handler is a big `if`/`else if` chain (not a jump table /
-  `switch`) inside the innermost `while (true)` loop (`re_vm.c:104`
+  `switch`) inside the innermost `while (true)` loop (`re_vm.c:172`
   onward) — this is the hot loop; see `docs/IMPROVEMENTS.md`'s performance
   section for the `switch` vs `if`-chain tradeoff here.
 - `OP_CHAR`/`OP_CLASS`/backreference matching each have a `step > 0` branch

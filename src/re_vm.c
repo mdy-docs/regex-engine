@@ -3,8 +3,12 @@
  * which recurses via a genuine nested call to vm_execute_internal) and a
  * memoizing fail-cache that's the main defense against classic
  * catastrophic-backtracking patterns. See docs/ARCHITECTURE.md's "VM"
- * section for the full picture, and docs/IMPROVEMENTS.md #1.1 for why that
- * lookaround recursion is also this engine's most serious known crash risk.
+ * section for the full picture, and docs/IMPROVEMENTS.md #1.1 for the
+ * history here: that lookaround recursion used to be this engine's most
+ * serious known crash risk (a fixed ~2.2MB C-stack frame per call,
+ * regardless of the pattern's actual group count, crashed the process at
+ * only 3 levels of nesting) until the backtrack stack, fail-cache, and
+ * per-thread captures were moved to a right-sized heap arena instead.
  *
  * decode_utf16/is_word_char/annexb_canonicalize live here (not in
  * re_lexer.c, despite jsvm2's original file having them textually
@@ -20,6 +24,8 @@
  */
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ucd.h"
@@ -72,33 +78,95 @@ static uint32_t annexb_canonicalize(uint32_t ch) {
 }
 
 typedef struct { int pc; const uint16_t* sp; } CacheEntry;
+
+/* captures used to be a fixed MAX_GROUPS*2 (510-pointer) array embedded
+ * directly in this struct -- and this struct was itself embedded 512 times
+ * over in vm_execute_internal's backtrack stack, making that function's
+ * own C stack frame ~2.2MB regardless of how many capture groups the
+ * compiled pattern actually has. Confirmed via ASan (docs/IMPROVEMENTS.md
+ * #1.1): this crashed the process after only ~3 levels of lookaround
+ * recursion, since every level of nesting is a fresh, non-tail call to
+ * this same function, each paying that same ~2.2MB again. Fixed by making
+ * captures a pointer into a shared arena that vm_execute_internal
+ * allocates once per call (see there), sized to the *pattern's actual*
+ * group_count instead of the worst-case MAX_GROUPS -- both eliminating the
+ * stack cost (the arena lives on the heap) and shrinking the typical-case
+ * footprint by roughly two orders of magnitude (a handful of groups vs.
+ * 254). The tradeoff: every place that used to rely on plain struct
+ * assignment to duplicate a Thread's captures (pushing a backtrack point,
+ * popping one back off) now needs an explicit copy instead -- see
+ * thread_copy_state(), and its call sites below -- since assignment now
+ * only copies the *pointer*, aliasing two threads' capture state instead
+ * of giving each its own snapshot. */
 typedef struct {
-    int pc; const uint16_t* sp; const uint16_t* captures[MAX_GROUPS * 2]; int counters[MAX_COUNTERS]; const uint16_t* counter_sp[MAX_COUNTERS];
+    int pc; const uint16_t* sp; const uint16_t** captures; int counters[MAX_COUNTERS]; const uint16_t* counter_sp[MAX_COUNTERS];
 } Thread;
 
 static inline unsigned int hash_state(const Thread* t, int counter_count) {
     unsigned int h = (unsigned int)((t->pc * 31) + (size_t)t->sp);
-    for (int i = 0; i < counter_count; i++) h ^= (t->counters[i] * 73); 
+    for (int i = 0; i < counter_count; i++) h ^= (t->counters[i] * 73);
     return h % CACHE_SIZE;
 }
 
+/* Copies src's pc/sp/counters/counter_sp, and the *data* src->captures
+ * points to, into dst -- but never dst->captures itself (that pointer is
+ * assigned once, into dst's own permanent slice of the shared arena, and
+ * must stay put). This is what plain struct assignment (`*dst = *src;`)
+ * used to do for free back when captures was an embedded array; now that
+ * it's a pointer, assignment would just copy the pointer value and leave
+ * dst aliasing src's capture state instead of owning an independent copy. */
+static inline void thread_copy_state(Thread* dst, const Thread* src, int cap_pairs) {
+    dst->pc = src->pc;
+    dst->sp = src->sp;
+    memcpy((void*)dst->captures, src->captures, sizeof(const uint16_t*) * (size_t)cap_pairs);
+    memcpy(dst->counters, src->counters, sizeof(dst->counters));
+    memcpy(dst->counter_sp, src->counter_sp, sizeof(dst->counter_sp));
+}
+
+#define VM_STACK_CAPACITY 512
+
 bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures) {
-    Thread stack[512];
+    int cap_pairs = (prog->group_count + 1) * 2;
+
+    /* One arena for every backtrack-stack thread's captures, plus one more
+     * slice for `current` (the thread actively being stepped through
+     * instructions, outside the stack array) -- see the Thread/
+     * thread_copy_state comments above for why this, and the stack/
+     * fail_cache arrays below, are heap-allocated here rather than being
+     * plain C-stack locals like they used to be: this function recurses
+     * into itself for every OP_LOOKAHEAD/OP_LOOKBEHIND, so whatever these
+     * cost used to be paid again on the C stack at every nesting level. */
+    const uint16_t** captures_arena = malloc(sizeof(uint16_t*) * (size_t)cap_pairs * (VM_STACK_CAPACITY + 1));
+    Thread* stack = malloc(sizeof(Thread) * VM_STACK_CAPACITY);
+    CacheEntry* fail_cache = malloc(sizeof(CacheEntry) * CACHE_SIZE);
+    if (!captures_arena || !stack || !fail_cache) {
+        fprintf(stderr, "Fatal Error: Out of memory\n");
+        exit(EXIT_FAILURE);
+    }
     int stack_ptr = 0;
-    
-    CacheEntry fail_cache[CACHE_SIZE];
+    bool result = false;
+
+    for (int i = 0; i < VM_STACK_CAPACITY; i++) stack[i].captures = captures_arena + (size_t)i * cap_pairs;
     for (int i = 0; i < CACHE_SIZE; i++) fail_cache[i].pc = -1;
-    
-    Thread init_thread = {start_pc, search_start, {NULL}, {0}, {NULL}};
-    if (out_captures) memcpy(init_thread.captures, out_captures, sizeof(const uint16_t*) * MAX_GROUPS * 2);
-    stack[stack_ptr++] = init_thread;
-    
+
+    Thread current;
+    current.captures = captures_arena + (size_t)VM_STACK_CAPACITY * cap_pairs;
+
+    stack[0].pc = start_pc;
+    stack[0].sp = search_start;
+    memset((void*)stack[0].captures, 0, sizeof(const uint16_t*) * (size_t)cap_pairs);
+    if (out_captures) memcpy((void*)stack[0].captures, out_captures, sizeof(const uint16_t*) * (size_t)cap_pairs);
+    memset(stack[0].counters, 0, sizeof(stack[0].counters));
+    memset(stack[0].counter_sp, 0, sizeof(stack[0].counter_sp));
+    stack_ptr = 1;
+
     while (stack_ptr > 0) {
-        Thread current = stack[--stack_ptr];
-        
+        stack_ptr--;
+        thread_copy_state(&current, &stack[stack_ptr], cap_pairs);
+
         unsigned int h = hash_state(&current, prog->counter_count);
-        if (fail_cache[h].pc == current.pc && fail_cache[h].sp == current.sp) continue; 
-        
+        if (fail_cache[h].pc == current.pc && fail_cache[h].sp == current.sp) continue;
+
         int path_start_pc = current.pc; const uint16_t* path_start_sp = current.sp; bool path_failed = false;
         
         while (true) {
@@ -307,16 +375,22 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                 }
             }
             else if (inst.op == OP_LOOKAHEAD) {
-                const uint16_t* temp_captures[MAX_GROUPS * 2];
+                /* Sized to this pattern's actual cap_pairs (a small,
+                 * on-C-stack VLA), not MAX_GROUPS*2 -- unlike the arenas
+                 * above, this one's small enough (at most 510 pointers,
+                 * typically far fewer) that there's no need to move it off
+                 * the stack too; it's a single instance per instruction
+                 * dispatch, not one per backtrack-stack slot. */
+                const uint16_t* temp_captures[cap_pairs];
                 memcpy(temp_captures, current.captures, sizeof(temp_captures));
                 bool la_match = vm_execute_internal(prog, inst.arg1, 1, original_text, text_end, current.sp, temp_captures);
                 if (la_match) {
-                    memcpy(current.captures, temp_captures, sizeof(temp_captures));
+                    memcpy((void*)current.captures, temp_captures, sizeof(temp_captures));
                     current.pc++;
                 } else { path_failed = true; break; }
             }
             else if (inst.op == OP_NEG_LOOKAHEAD) {
-                const uint16_t* temp_captures[MAX_GROUPS * 2];
+                const uint16_t* temp_captures[cap_pairs];
                 memcpy(temp_captures, current.captures, sizeof(temp_captures));
                 bool la_match = vm_execute_internal(prog, inst.arg1, 1, original_text, text_end, current.sp, temp_captures);
                 if (!la_match) {
@@ -324,56 +398,78 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
                 } else { path_failed = true; break; }
             }
             else if (inst.op == OP_LOOKBEHIND || inst.op == OP_NEG_LOOKBEHIND) {
-                const uint16_t* temp_captures[MAX_GROUPS * 2];
+                const uint16_t* temp_captures[cap_pairs];
                 memcpy(temp_captures, current.captures, sizeof(temp_captures));
                 bool lb_match = vm_execute_internal(prog, inst.arg1, -1, original_text, text_end, current.sp, temp_captures);
                 if ((inst.op == OP_LOOKBEHIND && lb_match) || (inst.op == OP_NEG_LOOKBEHIND && !lb_match)) {
-                    if (lb_match) memcpy(current.captures, temp_captures, sizeof(temp_captures));
+                    if (lb_match) memcpy((void*)current.captures, temp_captures, sizeof(temp_captures));
                     current.pc++;
                 } else {
                     path_failed = true; break;
                 }
             }
             else if (inst.op == OP_CLEAR_CAPTURES) {
-                for (int i = inst.arg1; i <= inst.arg2 && i < MAX_GROUPS; i++) {
+                /* Bound against this pattern's own group_count, not
+                 * MAX_GROUPS -- captures is now sized to cap_pairs, not
+                 * always the worst-case MAX_GROUPS*2 (see the Thread
+                 * comment above), so the old `i < MAX_GROUPS` bound would
+                 * write past the end of a smaller pattern's arena slice.
+                 * (This opcode is defined and implemented but never
+                 * actually emitted by the compiler today -- see
+                 * docs/IMPROVEMENTS.md #1.8 -- so this bound is currently
+                 * unreachable in practice; fixed anyway rather than left
+                 * as a latent landmine for whenever #1.8 gets addressed.) */
+                for (int i = inst.arg1; i <= inst.arg2 && i <= prog->group_count; i++) {
                     current.captures[i * 2] = NULL;
                     current.captures[i * 2 + 1] = NULL;
                 }
                 current.pc++;
             }
             else if (inst.op == OP_SPLIT) {
-                stack[stack_ptr] = current; stack[stack_ptr++].pc = inst.arg2; current.pc = inst.arg1;            
+                thread_copy_state(&stack[stack_ptr], &current, cap_pairs);
+                stack[stack_ptr].pc = inst.arg2;
+                stack_ptr++;
+                current.pc = inst.arg1;
             }
             else if (inst.op == OP_INIT_COUNTER) { current.counters[inst.arg1] = 0; current.counter_sp[inst.arg1] = NULL; current.pc++; }
             else if (inst.op == OP_INC_COUNTER)  { current.counters[inst.arg1]++; current.pc++; }
             else if (inst.op == OP_CHECK_COUNTER) {
                 int c = current.counters[inst.arg1], min = inst.arg2, max = inst.arg3, exit_pc = inst.arg4;
                 if (c > 0 && current.counter_sp[inst.arg1] == current.sp && c >= min) {
-                    current.pc = exit_pc; 
+                    current.pc = exit_pc;
                 } else {
                     current.counter_sp[inst.arg1] = current.sp;
-                    if (c < min) current.pc++; 
-                    else if (max != -1 && c == max) current.pc = exit_pc; 
+                    if (c < min) current.pc++;
+                    else if (max != -1 && c == max) current.pc = exit_pc;
                     else {
                         if (inst.lazy) {
-                            stack[stack_ptr] = current; stack[stack_ptr++].pc = current.pc + 1; 
-                            current.pc = exit_pc; 
+                            thread_copy_state(&stack[stack_ptr], &current, cap_pairs);
+                            stack[stack_ptr].pc = current.pc + 1;
+                            stack_ptr++;
+                            current.pc = exit_pc;
                         } else {
-                            stack[stack_ptr] = current; stack[stack_ptr++].pc = exit_pc; 
-                            current.pc++; 
+                            thread_copy_state(&stack[stack_ptr], &current, cap_pairs);
+                            stack[stack_ptr].pc = exit_pc;
+                            stack_ptr++;
+                            current.pc++;
                         }
                     }
                 }
             }
-            else if (inst.op == OP_JMP) { current.pc = inst.arg1; } 
+            else if (inst.op == OP_JMP) { current.pc = inst.arg1; }
             else if (inst.op == OP_MATCH) {
-                if (out_captures) memcpy((void*)out_captures, current.captures, sizeof(const uint16_t*) * MAX_GROUPS * 2);
-                return true; 
+                if (out_captures) memcpy((void*)out_captures, current.captures, sizeof(const uint16_t*) * (size_t)cap_pairs);
+                result = true;
+                goto cleanup;
             }
         }
         if (path_failed) { fail_cache[h].pc = path_start_pc; fail_cache[h].sp = path_start_sp; }
     }
-    return false;
+cleanup:
+    free(captures_arena);
+    free(stack);
+    free(fail_cache);
+    return result;
 }
 
 void vm_get_indices(const uint16_t* original_text, const uint16_t** captures, CaptureIndex* out_indices, int group_count) {

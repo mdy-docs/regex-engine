@@ -62,8 +62,8 @@ const PRESETS = [
     subject: "٣٤٥ and ۹۸ are non-ASCII digits, 42 is not",
   },
   {
-    label: "⚠️ Known crash: deep lookaround nesting",
-    pattern: "(?=".repeat(40) + "x" + ")".repeat(40),
+    label: "Deep lookaround nesting (used to crash at depth 3 — fixed)",
+    pattern: "(?=".repeat(60) + "x" + ")".repeat(60),
     flags: "",
     subject: "x",
   },
@@ -260,22 +260,26 @@ async function run() {
     renderHighlighted(subject, matches);
     renderMatchTables(matches, handle, groupCount, subject);
   } catch (err) {
-    // A WASM trap (see docs/IMPROVEMENTS.md #1.1/#1.3 -- deeply nested
-    // lookaround or very long/deeply nested patterns can still overflow
-    // even the enlarged WASM stack this build configures). The module
-    // instance is left in an undefined state per Emscripten's own
-    // guidance after an abort, so we discard it and load a fresh one
-    // rather than keep making calls into it.
+    // A WASM trap. The two confirmed, reliably-reproducible ways to hit
+    // this (deeply nested lookaround exhausting the stack -- #1.1; very
+    // long/deeply-nested patterns overflowing the parser/AST-walker
+    // recursion -- #1.3) are both fixed as of docs/IMPROVEMENTS.md's
+    // current state -- this catch is now defense-in-depth against
+    // whatever's left (an OOB read landing somewhere WASM's linear-memory
+    // bounds checking actually traps on, say) rather than a known,
+    // demonstrable path. The module instance is left in an undefined
+    // state per Emscripten's own guidance after an abort, so we discard
+    // it and load a fresh one rather than keep making calls into it.
     console.error(err);
     setStatus(
-      "Engine crashed evaluating this pattern (a known limitation — see the footer below). Reloading the WASM instance…",
+      "Engine crashed evaluating this pattern (unexpected -- see the footer below). Reloading the WASM instance…",
       "crash"
     );
     els.matches.innerHTML = "";
     liveBuffers = []; // the old module's memory is going away with it
     await loadModule();
     setStatus(
-      "Engine reloaded after a crash. That pattern hit a known internal limit — see docs/IMPROVEMENTS.md linked below.",
+      "Engine reloaded after an unexpected crash — see docs/IMPROVEMENTS.md linked below for known (non-crashing) issues.",
       "crash"
     );
   } finally {

@@ -46,6 +46,16 @@ typedef struct {
     Token current;
     Program* prog;
     bool has_named_groups;
+    /* Live count of nested parse_alt() calls currently on the C stack --
+     * both nested groups (parse_primary -> parse_alt) and chained
+     * alternation (parse_alt -> parse_alt for each '|') recurse through
+     * parse_alt, so checking *there*, before recursing further, is what
+     * actually bounds the parser's own stack usage (unlike ASTNode.depth,
+     * which is only known *after* a subtree is fully built -- too late to
+     * stop the recursion that built it). See MAX_AST_DEPTH in
+     * include/regexp.h. Zero-initialized for free by compile_into's
+     * existing partial Lexer initializer. */
+    int parse_depth;
 } Lexer;
 
 /* Advances the lexer past one token into lexer->current. Called from every
@@ -70,6 +80,13 @@ typedef struct ASTNode {
     char name[32];
     int flags_on; int flags_off;
     struct ASTNode* left; struct ASTNode* right;
+    /* Height of this node's subtree (leaves are 1); maintained incrementally
+     * as the parser attaches children, and checked against MAX_AST_DEPTH
+     * (see re_parser.c) to guard against the stack-overflow class of bug in
+     * docs/IMPROVEMENTS.md #1.3 -- free_ast, validate_group_names,
+     * validate_backrefs, validate_named_backrefs, and compile_node all
+     * recurse through left/right with no depth limit of their own. */
+    int depth;
 } ASTNode;
 
 typedef struct {

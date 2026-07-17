@@ -28,6 +28,31 @@ static ASTNode* create_node(ASTType type) {
         exit(EXIT_FAILURE);
     }
     node->type = type;
+    node->depth = 1; /* a freshly-created node is a leaf until finish_node()
+                       * recomputes this from its children, if any get attached */
+    return node;
+}
+
+static int node_depth(ASTNode* n) { return n ? n->depth : 0; }
+
+/* Call once a node's left/right (or just left, for single-child wrappers
+ * like AST_GROUP/AST_QUANTIFIER) have been attached, so its own depth can
+ * be (re)computed from them. Rejects the pattern (once, via prog->error --
+ * "first failure wins" like every other resource-limit check in this
+ * engine) as soon as MAX_AST_DEPTH is exceeded, rather than letting the
+ * tree keep growing -- see MAX_AST_DEPTH's comment in include/regexp.h for
+ * why this matters and what it protects. Safe to keep calling after the
+ * limit trips: node->depth stays accurate (so a parent combining an
+ * already-too-deep child computes correctly, rather than silently
+ * under-counting), and every parse_* caller's own error-propagation
+ * (ultimately via next_token() short-circuiting to TOK_EOF once
+ * prog->error is set) unwinds parsing shortly after regardless. */
+static ASTNode* finish_node(Lexer* lexer, ASTNode* node) {
+    int d = 1 + (node_depth(node->left) > node_depth(node->right) ? node_depth(node->left) : node_depth(node->right));
+    node->depth = d;
+    if (d > MAX_AST_DEPTH && !lexer->prog->error) {
+        lexer->prog->error = "InternalError: pattern too deeply nested or too long to compile safely";
+    }
     return node;
 }
 
@@ -73,8 +98,25 @@ static ASTNode* parse_primary(Lexer* lexer) {
             node = create_node(is_la ? AST_LOOKAHEAD : (is_neg_la ? AST_NEG_LOOKAHEAD : (is_lb ? AST_LOOKBEHIND : (is_neg_lb ? AST_NEG_LOOKBEHIND : AST_GROUP))));
         }
         node->left = inner;
+        node = finish_node(lexer, node);
         if (!is_la && !is_neg_la && !is_lb && !is_neg_lb && !is_noncap && !is_modifier) {
-            node->id = ++lexer->prog->group_count; 
+            /* Bounds-checked against MAX_GROUPS (see docs/IMPROVEMENTS.md
+             * #1.2, a confirmed heap-buffer-overflow: an unchecked pattern
+             * with more than MAX_GROUPS capture groups wrote past
+             * prog->group_names[] and, at match time, past the VM's
+             * captures[MAX_GROUPS*2] array). The safe ceiling is
+             * MAX_GROUPS-1, not MAX_GROUPS: group id 0 is reserved for
+             * "whole match" everywhere else in the engine, so it already
+             * occupies one of the MAX_GROUPS slots even though no capture
+             * group is ever assigned id 0 -- allowing group_count to reach
+             * MAX_GROUPS itself would let a later id*2+1 index one past the
+             * end of captures[MAX_GROUPS*2]. */
+            if (lexer->prog->group_count < MAX_GROUPS - 1) {
+                node->id = ++lexer->prog->group_count;
+            } else {
+                if (!lexer->prog->error) lexer->prog->error = "InternalError: pattern exceeds maximum capture group count";
+                node->id = 0;
+            }
             if (is_named) strcpy(lexer->prog->group_names[node->id], name);
             if (is_named) strcpy(node->name, name);
         }
@@ -100,7 +142,7 @@ static ASTNode* parse_quantifier(Lexer* lexer) {
         else if (t == TOK_BOUNDS)  { q->min = lexer->current.min; q->max = lexer->current.max; }
         next_token(lexer);
         if (lexer->current.type == TOK_QUESTION) { q->lazy = true; next_token(lexer); }
-        node = q;
+        node = finish_node(lexer, q);
     }
     return node;
 }
@@ -122,20 +164,39 @@ static ASTNode* parse_concat(Lexer* lexer) {
         ASTNode* right = parse_quantifier(lexer);
         ASTNode* concat = create_node(AST_CONCAT);
         concat->left = node; concat->right = right;
-        node = concat;
+        node = finish_node(lexer, concat);
     }
     return node;
 }
 
 ASTNode* parse_alt(Lexer* lexer) {
+    /* Both nested groups (parse_primary calls parse_alt for the group body)
+     * and chained alternation (parse_alt calls itself for each '|') recurse
+     * through here on the C stack -- checked *before* recursing further,
+     * since ASTNode.depth (via finish_node below) is only known *after* a
+     * subtree is fully built, which is too late to stop the recursion that
+     * built it. See MAX_AST_DEPTH's comment in include/regexp.h. */
+    lexer->parse_depth++;
+    if (lexer->parse_depth > MAX_AST_DEPTH) {
+        if (!lexer->prog->error) lexer->prog->error = "InternalError: pattern too deeply nested or too long to compile safely";
+        lexer->parse_depth--;
+        /* A harmless placeholder: the caller (parse_primary, or top-level
+         * compile_into) unwinds quickly once prog->error is set, since
+         * next_token() starts short-circuiting to TOK_EOF immediately --
+         * what's returned here barely matters structurally, it just needs
+         * to be a valid, non-NULL node for callers that dereference it
+         * (e.g. parse_quantifier checking node->type). */
+        return create_node(AST_LITERAL);
+    }
     ASTNode* node = parse_concat(lexer);
     if (lexer->current.type == TOK_OR) {
         next_token(lexer);
         ASTNode* right = parse_alt(lexer);
         ASTNode* alt = create_node(AST_ALT);
         alt->left = node; alt->right = right;
-        node = alt;
+        node = finish_node(lexer, alt);
     }
+    lexer->parse_depth--;
     return node;
 }
 

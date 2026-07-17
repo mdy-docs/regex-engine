@@ -35,6 +35,26 @@ static inline bool is_digit_char(uint32_t c) {
     return c >= '0' && c <= '9';
 }
 
+/* Allocates the next CharClass slot, bounds-checked against MAX_CLASSES
+ * (previously unchecked -- see docs/IMPROVEMENTS.md #1.2, a confirmed heap-
+ * buffer-overflow: a pattern with more than MAX_CLASSES distinct classes
+ * silently wrote past prog->classes[]). Once the limit is hit, prog->error
+ * is set and every subsequent call clamps to the last valid slot instead of
+ * indexing out of bounds -- callers keep writing into that slot via
+ * add_range/fill_builtin_class/etc, which is wasted work but never unsafe,
+ * since a Program with prog->error set is discarded by regex_compile()
+ * without ever being executed (see src/regex_wasm.c), so the resulting
+ * (reused, semantically-nonsensical) slot contents are never read. */
+static int alloc_class(Program* prog) {
+    if (prog->class_count >= MAX_CLASSES) {
+        if (!prog->error) prog->error = "InternalError: pattern exceeds maximum character class count";
+        return MAX_CLASSES - 1;
+    }
+    int cid = prog->class_count++;
+    memset(&prog->classes[cid], 0, sizeof(CharClass)); /* slot is built in place */
+    return cid;
+}
+
 /* Confirmed (by cross-referencing every call site before this split) to be
  * used only within this file -- unlike next_token, this doesn't need to be
  * in re_internal.h. */
@@ -902,8 +922,7 @@ void next_token(Lexer* lexer) {
             }
             break;
         case '.': {
-            int cid = lexer->prog->class_count++;
-            memset(&lexer->prog->classes[cid], 0, sizeof(CharClass)); /* slots are built in place */
+            int cid = alloc_class(lexer->prog);
             uint32_t max_cp = lexer->prog->unicode ? 0x10FFFF : 255;
             if (!lexer->prog->dot_all) {
                 add_range(&lexer->prog->classes[cid], 0, '\n' - 1);
@@ -923,8 +942,7 @@ void next_token(Lexer* lexer) {
         case '\\': {
             uint32_t esc = decode_utf16_lexer(lexer);
             if (esc < 128 && strchr("dDwWsS", (char)esc)) {
-                int cid = lexer->prog->class_count++;
-            memset(&lexer->prog->classes[cid], 0, sizeof(CharClass)); /* slots are built in place */
+                int cid = alloc_class(lexer->prog);
                 fill_builtin_class(&lexer->prog->classes[cid], (char)esc, lexer->prog->unicode);
                 lexer->current = (Token){TOK_CLASS, 0, cid};
             } 
@@ -994,9 +1012,8 @@ void next_token(Lexer* lexer) {
                         }
                         if (lexer->src[lexer->pos] == '}') lexer->pos++;
                         else lexer->prog->error = "SyntaxError: Unterminated Unicode property escape";
-                        
-                        int cid = lexer->prog->class_count++;
-            memset(&lexer->prog->classes[cid], 0, sizeof(CharClass)); /* slots are built in place */
+
+                        int cid = alloc_class(lexer->prog);
                         if (!fill_unicode_property(&lexer->prog->classes[cid], val, esc == 'P')) {
                             lexer->prog->error = "SyntaxError: Invalid property name";
                             return;
@@ -1052,8 +1069,7 @@ void next_token(Lexer* lexer) {
             break;
         }
         case '[': {
-            int cid = lexer->prog->class_count++;
-            memset(&lexer->prog->classes[cid], 0, sizeof(CharClass)); /* slots are built in place */
+            int cid = alloc_class(lexer->prog);
             parse_char_class(lexer, &lexer->prog->classes[cid]);
             lexer->current = (Token){TOK_CLASS, 0, cid};
             break;

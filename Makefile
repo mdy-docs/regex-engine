@@ -25,18 +25,23 @@ test: test/smoke
 test-wasm: wasm
 	node test/node_smoke.mjs
 
-# STACK_OVERFLOW_CHECK=2 -- the native engine has confirmed C-stack-overflow
-# crashes on some inputs (deeply nested lookaround, very long/deeply-nested
-# patterns in general -- parsing recurses per paren group, not just
-# lookaround; see docs/IMPROVEMENTS.md #1.1/#1.3). Without this flag a WASM
-# stack overflow can silently corrupt linear memory instead of trapping;
-# with it, it becomes a catchable RuntimeError a JS host can recover from
-# (see web/app.js). STACK_SIZE is bumped from Emscripten's 64KB default
-# (which made the crash threshold far shallower under WASM than natively --
-# confirmed: 8 nested lookaheads overflowed a 64KB stack during parsing
-# alone, before any matching happened) to 8MB, roughly matching a typical
-# native default thread stack, so the demo tolerates the same depth a
-# native embedder would before hitting this.
+# STACK_OVERFLOW_CHECK=2 -- deeply nested lookaround used to be a confirmed
+# C-stack-overflow crash (docs/IMPROVEMENTS.md #1.1, fixed: the VM's
+# backtrack stack/fail-cache/per-thread captures are heap-allocated and
+# right-sized to the pattern's actual group count now, not fixed ~2.2MB
+# C-stack locals on every recursive call). Parsing itself still recurses
+# per nested paren group and is now hard-capped at MAX_AST_DEPTH=200
+# (docs/IMPROVEMENTS.md #1.3) rather than unbounded, but 200 levels is
+# still enough to want headroom under WASM specifically: Emscripten's
+# default stack is only 64KB (confirmed: 8 nested lookaheads previously
+# overflowed a 64KB stack during parsing alone, well under the 200 cap).
+# STACK_SIZE is bumped to 8MB, matching a typical native default, so this
+# build tolerates the full MAX_AST_DEPTH range same as a native embedder
+# would. Kept as defense-in-depth even though #1.1 (the original, more
+# severe reason for both flags) is fixed: STACK_OVERFLOW_CHECK turns any
+# *future* stack issue into a catchable RuntimeError (see web/app.js)
+# instead of silent linear-memory corruption, which is worth keeping
+# regardless of what specifically motivated adding it.
 wasm:
 	@mkdir -p $(WASM_OUT_DIR)
 	$(EMCC) -O2 -Iinclude $(WASM_SRCS) -o $(WASM_TARGET) \

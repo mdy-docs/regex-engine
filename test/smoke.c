@@ -226,6 +226,259 @@ int main(void) {
         regex_free(h);
     }
 
+    /* MAX_CLASSES/MAX_GROUPS/MAX_COUNTERS/MAX_OPCODES bounds checking.
+     * Regression tests for a confirmed bug: none of these were enforced
+     * (docs/IMPROVEMENTS.md #1.2) -- a pattern exceeding any of them wrote
+     * past the corresponding fixed-size array (heap corruption for classes/
+     * opcodes, stack corruption for groups/counters), confirmed via ASan.
+     * Each "exceeds the limit" case below is chosen to reject *without*
+     * crashing; the exact boundary itself is deliberately not exercised
+     * here for capture groups -- see the comment on that block below. */
+    {
+        /* MAX_CLASSES = 64: exactly at the limit succeeds, one more fails
+         * cleanly instead of overflowing prog->classes[]. */
+        char pat64[64 * 3 + 1] = {0};
+        for (int i = 0; i < 64; i++) strcat(pat64, "[a]");
+        uint16_t* p64 = to_utf16(pat64);
+        uintptr_t h64 = regex_compile(p64, 0, 0);
+        check(h64 != 0, "MAX_CLASSES: exactly 64 character classes compiles");
+        if (h64) regex_free(h64);
+        free(p64);
+
+        char pat65[65 * 3 + 1] = {0};
+        for (int i = 0; i < 65; i++) strcat(pat65, "[a]");
+        uint16_t* p65 = to_utf16(pat65);
+        uintptr_t h65 = regex_compile(p65, 0, 0);
+        check(h65 == 0, "MAX_CLASSES: 65 character classes is a clean compile error, not a crash");
+        check(h65 == 0 && strstr(regex_last_error(), "maximum character class count") != NULL,
+              "MAX_CLASSES: error message identifies the resource limit");
+        if (h65) regex_free(h65);
+        free(p65);
+    }
+    {
+        /* MAX_COUNTERS = 16: exactly at the limit succeeds, one more fails
+         * cleanly instead of overflowing the VM's per-thread counters[]. */
+        char pat16[16 * 8 + 1] = {0};
+        for (int i = 0; i < 16; i++) { char b[8]; snprintf(b, sizeof(b), "%c{1,2}", 'a' + (i % 26)); strcat(pat16, b); }
+        uint16_t* p16 = to_utf16(pat16);
+        uintptr_t h16 = regex_compile(p16, 0, 0);
+        check(h16 != 0, "MAX_COUNTERS: exactly 16 bounded quantifiers compiles");
+        if (h16) regex_free(h16);
+        free(p16);
+
+        char pat17[17 * 8 + 1] = {0};
+        for (int i = 0; i < 17; i++) { char b[8]; snprintf(b, sizeof(b), "%c{1,2}", 'a' + (i % 26)); strcat(pat17, b); }
+        uint16_t* p17 = to_utf16(pat17);
+        uintptr_t h17 = regex_compile(p17, 0, 0);
+        check(h17 == 0, "MAX_COUNTERS: 17 bounded quantifiers is a clean compile error, not a crash");
+        check(h17 == 0 && strstr(regex_last_error(), "maximum quantifier count") != NULL,
+              "MAX_COUNTERS: error message identifies the resource limit");
+        if (h17) regex_free(h17);
+        free(p17);
+    }
+    {
+        /* MAX_GROUPS: 255 groups (one over the real ceiling of 254 -- see
+         * re_parser.c's comment on the off-by-one from group id 0 being
+         * reserved for "whole match") is rejected cleanly, not a crash.
+         * Not asserting *which* safety net catches it: MAX_AST_DEPTH (see
+         * below) is now the tighter, earlier-firing bound for any pattern
+         * shaped like a chain of "(a)"s, since every way of accumulating
+         * that many groups also grows AST depth past MAX_AST_DEPTH first
+         * (255 groups implies at least 255 levels of concat/group nesting,
+         * comfortably past MAX_AST_DEPTH=200) -- the group-count check
+         * beneath it is still correct and necessary in its own right, just
+         * not the one a simple test like this can observe firing first.
+         * Both are exercised directly below. */
+        char* pat = malloc(255 * 4 + 1); pat[0] = 0;
+        for (int i = 0; i < 255; i++) strcat(pat, "(a)");
+        uint16_t* p = to_utf16(pat);
+        uintptr_t h = regex_compile(p, 0, 0);
+        check(h == 0, "MAX_GROUPS: 255 capture groups is a clean compile error, not a crash");
+        if (h) regex_free(h);
+        free(pat); free(p);
+    }
+
+    /* MAX_AST_DEPTH: regression tests for the actual stack-overflow bug
+     * (docs/IMPROVEMENTS.md #1.3) -- free_ast, validate_group_names,
+     * validate_backrefs, validate_named_backrefs, and compile_node all
+     * recurse through the parsed AST with no depth limit, and
+     * parse_concat/parse_alt build linear (unbalanced) chains for flat
+     * sequences, so a sufficiently long or deeply nested pattern produced
+     * an AST deep enough to exhaust the C stack -- confirmed via ASan
+     * (validate_group_names crashes around recursion depth ~247, the most
+     * fragile of the five thanks to two ~8KB NameSet locals per frame).
+     * Every case below previously crashed (verified against this exact
+     * commit's pre-fix behavior); all now fail cleanly instead. */
+    {
+        /* The original, simplest repro: a long flat run of literals with no
+         * groups/alternation at all -- pure parse_concat chain depth. */
+        char* pat = malloc(20001); memset(pat, 'a', 20000); pat[20000] = 0;
+        uint16_t* p = to_utf16(pat);
+        uintptr_t h = regex_compile(p, 0, 0);
+        check(h == 0, "MAX_AST_DEPTH: 20000 flat literal characters is a clean compile error, not a crash");
+        check(h == 0 && strstr(regex_last_error(), "deeply nested or too long") != NULL,
+              "MAX_AST_DEPTH: error message identifies the resource limit");
+        if (h) regex_free(h);
+        free(pat); free(p);
+    }
+    {
+        /* Deeply nested groups: "((((...a...))))" -- tests both the
+         * parser's own recursion (parse_primary -> parse_alt per nesting
+         * level, guarded by Lexer.parse_depth) and the resulting AST's
+         * depth (guarded by ASTNode.depth via finish_node). */
+        int n = 20000;
+        char* pat = malloc(2 * n + 2);
+        for (int i = 0; i < n; i++) pat[i] = '(';
+        pat[n] = 'a';
+        for (int i = 0; i < n; i++) pat[n + 1 + i] = ')';
+        pat[2 * n + 1] = 0;
+        uint16_t* p = to_utf16(pat);
+        uintptr_t h = regex_compile(p, 0, 0);
+        check(h == 0, "MAX_AST_DEPTH: 20000 nested groups is a clean compile error, not a crash");
+        if (h) regex_free(h);
+        free(pat); free(p);
+    }
+    {
+        /* Long alternation chain: "a|a|a|...|a" -- parse_alt recurses on
+         * its own right-hand side for every '|', so this exercises the
+         * parser's own C-stack recursion via Lexer.parse_depth specifically
+         * (parse_concat, used for plain literal runs above, is iterative
+         * and has no such recursion of its own -- this is a genuinely
+         * different code path). */
+        int n = 20000;
+        char* pat = malloc(2 * n + 1);
+        for (int i = 0; i < n; i++) { pat[2*i] = 'a'; pat[2*i+1] = (i < n - 1) ? '|' : 0; }
+        uint16_t* p = to_utf16(pat);
+        uintptr_t h = regex_compile(p, 0, 0);
+        check(h == 0, "MAX_AST_DEPTH: 20000-way alternation is a clean compile error, not a crash");
+        if (h) regex_free(h);
+        free(pat); free(p);
+    }
+    {
+        /* The specific case this fix was written for: a *legitimate*,
+         * within-MAX_GROUPS pattern (254 capture groups -- no bounds
+         * violation, would compile successfully before this fix) that
+         * still crashed via validate_group_names' own recursion once it
+         * ran on the resulting 254-deep AST. Confirmed via ASan, pre-fix,
+         * to crash with no other error condition involved. Now rejected
+         * cleanly by the depth guard before validate_group_names ever
+         * runs (compile_into only calls it inside an `if (!prog->error)`
+         * guard) instead of reaching it at all. */
+        char* pat = malloc(254 * 4 + 1); pat[0] = 0;
+        for (int i = 0; i < 254; i++) strcat(pat, "(a)");
+        uint16_t* p = to_utf16(pat);
+        uintptr_t h = regex_compile(p, 0, 0);
+        check(h == 0, "MAX_AST_DEPTH: 254 groups (legitimate under MAX_GROUPS) no longer crashes validate_group_names");
+        if (h) regex_free(h);
+        free(pat); free(p);
+    }
+    {
+        /* Moderate nesting/length, comfortably clear of MAX_AST_DEPTH --
+         * confirms the guard doesn't disturb ordinary complex-but-sane
+         * patterns. */
+        uint16_t* pattern = to_utf16("(?:(?:(?:(?:(?:a+)+)+)?)*){1,3}(b|c|d){2,5}");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        check(h != 0, "moderately nested/quantified pattern still compiles normally");
+        uint16_t text[] = { 'a','a','a','c','c' };
+        check(regex_exec(h, text, 5, 0), "moderately nested pattern still matches");
+        free(pattern);
+        regex_free(h);
+    }
+    {
+        /* Moderate group count, well clear of both the MAX_GROUPS ceiling
+         * and the separate recursion-depth danger zone -- confirms the
+         * bounds check above doesn't disturb ordinary multi-group patterns. */
+        uint16_t* pattern = to_utf16("(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        check(h != 0 && regex_group_count(h) == 10, "10 capture groups still compiles normally");
+        uint16_t text[] = { 'a','b','c','d','e','f','g','h','i','j' };
+        check(regex_exec(h, text, 10, 0), "10-group pattern still matches");
+        free(pattern);
+        regex_free(h);
+    }
+    {
+        /* MAX_OPCODES = 16384: a single character class containing many
+         * multi-codepoint string alternatives (\p{RGI_Emoji_ZWJ_Sequence},
+         * capped at 128 sequences per class -- see the property-of-strings
+         * fix above) compiles to far more than one instruction per AST
+         * node, so a handful of repetitions clears the limit without the
+         * deep AST recursion a long flat/nested pattern would need (and
+         * without tripping the separate bug that would risk). */
+        char pat[20 * 32 + 1] = {0};
+        for (int i = 0; i < 20; i++) strcat(pat, "\\p{RGI_Emoji_ZWJ_Sequence}");
+        uint16_t* p = to_utf16(pat);
+        uintptr_t h = regex_compile(p, 0, regex_flag_bit('v'));
+        check(h == 0, "MAX_OPCODES: 20x \\p{RGI_Emoji_ZWJ_Sequence} is a clean compile error, not a crash");
+        check(h == 0 && strstr(regex_last_error(), "maximum compiled instruction count") != NULL,
+              "MAX_OPCODES: error message identifies the resource limit");
+        if (h) regex_free(h);
+        free(p);
+    }
+
+    /* Nested lookaround no longer exhausts the C stack (docs/IMPROVEMENTS.md
+     * #1.1). vm_execute_internal used to stack-allocate a ~2.2MB backtrack
+     * stack + fail-cache on *every* call, including every recursive call
+     * OP_LOOKAHEAD/OP_LOOKBEHIND makes into itself -- confirmed via ASan to
+     * crash the process after only 3 levels of lookaround nesting on an
+     * 8MB stack. Fixed by heap-allocating those buffers (so recursion costs
+     * heap, not C-stack, per level) and sizing Thread.captures to the
+     * pattern's actual group_count instead of the worst-case MAX_GROUPS
+     * (which also fixed the ~2.2MB-per-call cost itself, not just its
+     * location -- a typical few-group pattern's buffers are now a couple
+     * hundred KB, not 2MB+). */
+    {
+        /* The original P0 repro (3 levels crashed natively pre-fix). */
+        uint16_t* pattern = to_utf16("(?=(?=(?=x)))");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        check(h != 0, "3 nested lookaheads compiles");
+        uint16_t text[] = { 'x' };
+        check(regex_exec(h, text, 1, 0), "3 nested lookaheads matches (was: crashed the process)");
+        free(pattern);
+        regex_free(h);
+    }
+    {
+        /* Deep nesting well past the old ~3-level crash point, up to the
+         * edge of MAX_AST_DEPTH (199 -- one level short of the parser's own
+         * separate 200 cap, see MAX_AST_DEPTH's regression tests above). */
+        int n = 199;
+        char* pat = malloc((size_t)n * 4 + 2); /* n*"(?=" + 'x' + n*")" + '\0' */
+        char* q = pat;
+        for (int i = 0; i < n; i++) { *q++ = '('; *q++ = '?'; *q++ = '='; }
+        *q++ = 'x';
+        for (int i = 0; i < n; i++) *q++ = ')';
+        *q = 0;
+        uint16_t* p = to_utf16(pat);
+        uintptr_t h = regex_compile(p, 0, 0);
+        check(h != 0, "199 nested lookaheads compiles (was: rejected far earlier by crash-prevention alone)");
+        uint16_t text[] = { 'x' };
+        int m = regex_exec(h, text, 1, 0);
+        check(m, "199 nested lookaheads matches without crashing");
+        if (m) {
+            const int32_t* caps = regex_captures_ptr(h);
+            check(caps[0] == 0 && caps[1] == 0, "match is zero-width, as a pure lookahead chain should be");
+        }
+        free(pat); free(p);
+        regex_free(h);
+    }
+    {
+        /* Capture groups *inside* a nested lookahead, and more afterward --
+         * exercises that right-sizing Thread.captures to group_count
+         * doesn't corrupt capture data as it round-trips through the
+         * recursive call's temp_captures. */
+        uint16_t* pattern = to_utf16("(?=(\\d+)-(\\w+))(\\d+)-(\\w+)");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        check(h != 0 && regex_group_count(h) == 4, "lookahead containing capture groups compiles, group_count is 4");
+        uint16_t text[] = { '4','2','-','a','b','c' };
+        check(regex_exec(h, text, 6, 0), "matches '42-abc'");
+        const int32_t* caps = regex_captures_ptr(h);
+        check(caps[2] == 0 && caps[3] == 2, "group 1 (inside lookahead) = '42'");
+        check(caps[4] == 3 && caps[5] == 6, "group 2 (inside lookahead) = 'abc'");
+        check(caps[6] == 0 && caps[7] == 2, "group 3 (outside) = '42'");
+        check(caps[8] == 3 && caps[9] == 6, "group 4 (outside) = 'abc'");
+        free(pattern);
+        regex_free(h);
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;
