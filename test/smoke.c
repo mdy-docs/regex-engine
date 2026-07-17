@@ -638,6 +638,47 @@ int main(void) {
         regex_free(h);
     }
 
+    /* Nested capture groups are numbered by OPENING paren position, per
+     * ECMA-262. Regression tests for a confirmed bug (present in jsvm2
+     * upstream too): the parser assigned ids after parsing a group's body,
+     * numbering nested groups by *closing* paren instead -- so in ((a)b)
+     * the inner group was 1 and the outer 2, backwards from every real JS
+     * engine, corrupting both reported capture indices and numeric-backref
+     * resolution for any pattern with nested captures. Every expectation
+     * below diffed against Node. */
+    {
+        uint16_t* pattern = to_utf16("((a)b)");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t text[] = { 'a', 'b' };
+        int m = regex_exec(h, text, 2, 0);
+        const int32_t* caps = regex_captures_ptr(h);
+        check(m && caps[2] == 0 && caps[3] == 2, "((a)b): group 1 is the OUTER paren [0,2)");
+        check(m && caps[4] == 0 && caps[5] == 1, "((a)b): group 2 is the inner paren [0,1)");
+        free(pattern);
+        regex_free(h);
+    }
+    {
+        uint16_t* pattern = to_utf16("(a(b(c)))\\3");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t text[] = { 'a', 'b', 'c', 'c' };
+        int m = regex_exec(h, text, 4, 0);
+        const int32_t* caps = regex_captures_ptr(h);
+        check(m && caps[0] == 0 && caps[1] == 4, "(a(b(c)))\\3: \\3 resolves to the innermost group");
+        check(m && caps[6] == 2 && caps[7] == 3, "(a(b(c)))\\3: group 3 is (c) at [2,3)");
+        free(pattern);
+        regex_free(h);
+    }
+    {
+        /* Named nested groups: the index->name table must follow the same
+         * opening-paren order as the ids themselves. */
+        uint16_t* pattern = to_utf16("(?<out>(?<in>a)b)");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        check(h != 0 && strcmp(regex_group_name(h, 1), "out") == 0, "nested named groups: group 1 is 'out'");
+        check(h != 0 && strcmp(regex_group_name(h, 2), "in") == 0, "nested named groups: group 2 is 'in'");
+        free(pattern);
+        regex_free(h);
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;

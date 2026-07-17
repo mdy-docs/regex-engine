@@ -106,6 +106,26 @@ regression coverage added to `test/smoke.c`:
   resolve. Worth knowing if a consuming project leans on one of the five
   large properties named above expecting full coverage.
 
+- **Nested capture groups were numbered backwards.** The parser assigned
+  `node->id = ++group_count` only *after* a group's body had been parsed,
+  so ids followed closing-paren order — in `((a)b)`, the inner `(a)` was
+  group 1 and the outer group 2, the reverse of ECMA-262's opening-paren
+  numbering (Node: `/((a)b)/.exec('ab')` → group 1 `"ab"`, group 2 `"a"`).
+  Wrong for *any* pattern with nested captures, in three observable ways:
+  reported capture indices, numeric-backreference resolution (`\2` bound
+  to the wrong paren), and the group-index→name table for nested named
+  groups. Sibling-only patterns — which happened to be all the test suite
+  exercised — were unaffected, which is how it survived this long; it was
+  exposed by #1.8's verification, whose Node-diffed expectations came out
+  systematically "swapped" for nested-group cases. Fixed by claiming the
+  id at the opening paren, before `parse_alt` descends into the body
+  (`re_parser.c`). Verified against Node: 2- and 4-deep nesting, `\3`
+  resolving to the innermost group, nested named groups' index/name
+  mapping, and sibling numbering unchanged. **This one is
+  upstream-relevant**: jsvm2's parser has the same post-body assignment,
+  so it mis-numbers nested groups the same way (see README "Provenance").
+  Regression coverage in `test/smoke.c`.
+
 ---
 
 ## 1. Correctness & memory safety

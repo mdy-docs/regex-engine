@@ -82,6 +82,37 @@ static ASTNode* parse_primary(Lexer* lexer) {
             flags_off = lexer->current.flags_off;
         }
         
+        /* The capture-group id must be claimed HERE, at the opening paren,
+         * before the body is parsed -- ECMA-262 numbers groups by the
+         * position of '(' in source order, so in `((a)b)` the outer group
+         * is 1 and the inner is 2. Assigning after parse_alt returns (as
+         * this originally did, and jsvm2 upstream still does) numbers
+         * nested groups by *closing* paren instead -- backwards from every
+         * real JS engine, visibly wrong in both reported capture indices
+         * and numeric-backreference resolution the moment groups nest.
+         *
+         * Bounds-checked against MAX_GROUPS (see docs/IMPROVEMENTS.md
+         * #1.2, a confirmed heap-buffer-overflow: an unchecked pattern
+         * with more than MAX_GROUPS capture groups wrote past
+         * prog->group_names[] and, at match time, past the VM's
+         * captures[MAX_GROUPS*2] array). The safe ceiling is
+         * MAX_GROUPS-1, not MAX_GROUPS: group id 0 is reserved for
+         * "whole match" everywhere else in the engine, so it already
+         * occupies one of the MAX_GROUPS slots even though no capture
+         * group is ever assigned id 0 -- allowing group_count to reach
+         * MAX_GROUPS itself would let a later id*2+1 index one past the
+         * end of captures[MAX_GROUPS*2]. */
+        bool is_capture = !is_la && !is_neg_la && !is_lb && !is_neg_lb && !is_noncap && !is_modifier;
+        int gid = 0;
+        if (is_capture) {
+            if (lexer->prog->group_count < MAX_GROUPS - 1) {
+                gid = ++lexer->prog->group_count;
+            } else {
+                if (!lexer->prog->error) lexer->prog->error = "InternalError: pattern exceeds maximum capture group count";
+            }
+            if (is_named) strcpy(lexer->prog->group_names[gid], name);
+        }
+
         next_token(lexer);
         ASTNode* inner = parse_alt(lexer);
         if (lexer->current.type == TOK_RPAREN) {
@@ -89,7 +120,7 @@ static ASTNode* parse_primary(Lexer* lexer) {
         } else {
             lexer->prog->error = "SyntaxError: Unterminated group";
         }
-        
+
         if (is_modifier) {
             node = create_node(AST_MODIFIER_GROUP);
             node->flags_on = flags_on;
@@ -99,25 +130,8 @@ static ASTNode* parse_primary(Lexer* lexer) {
         }
         node->left = inner;
         node = finish_node(lexer, node);
-        if (!is_la && !is_neg_la && !is_lb && !is_neg_lb && !is_noncap && !is_modifier) {
-            /* Bounds-checked against MAX_GROUPS (see docs/IMPROVEMENTS.md
-             * #1.2, a confirmed heap-buffer-overflow: an unchecked pattern
-             * with more than MAX_GROUPS capture groups wrote past
-             * prog->group_names[] and, at match time, past the VM's
-             * captures[MAX_GROUPS*2] array). The safe ceiling is
-             * MAX_GROUPS-1, not MAX_GROUPS: group id 0 is reserved for
-             * "whole match" everywhere else in the engine, so it already
-             * occupies one of the MAX_GROUPS slots even though no capture
-             * group is ever assigned id 0 -- allowing group_count to reach
-             * MAX_GROUPS itself would let a later id*2+1 index one past the
-             * end of captures[MAX_GROUPS*2]. */
-            if (lexer->prog->group_count < MAX_GROUPS - 1) {
-                node->id = ++lexer->prog->group_count;
-            } else {
-                if (!lexer->prog->error) lexer->prog->error = "InternalError: pattern exceeds maximum capture group count";
-                node->id = 0;
-            }
-            if (is_named) strcpy(lexer->prog->group_names[node->id], name);
+        if (is_capture) {
+            node->id = gid;
             if (is_named) strcpy(node->name, name);
         }
     }
