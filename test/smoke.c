@@ -1020,6 +1020,37 @@ int main(void) {
         free(pc);
     }
 
+    /* A class escape used as a character-class range endpoint is an early
+     * SyntaxError under /u (IsCharacterClass -> error). Regression for
+     * docs/CONFORMANCE_GAPS.md #4: the rejection covered \d\w\s but not
+     * \p{...}, and /v-only && / -- exceptions wrongly suppressed it in
+     * plain /u. Non-/u (Annex B legacy) still permits these. Diffed vs
+     * Node. */
+    {
+        const char* bad[] = { "[\\p{L}--]", "[\\p{L}-a]", "[a-\\p{L}]", "[\\w-a]", "[\\w-&]", "[a-\\d]" };
+        for (size_t i = 0; i < sizeof(bad)/sizeof(bad[0]); i++) {
+            uint16_t* p = to_utf16(bad[i]);
+            uintptr_t h = regex_compile(p, 0, regex_flag_bit('u'));
+            char what[80];
+            snprintf(what, sizeof(what), "%s/u is a range SyntaxError", bad[i]);
+            check(h == 0, what);
+            if (h) regex_free(h);
+            free(p);
+        }
+        /* Valid shapes must still compile: trailing dash, plain classes. */
+        uint16_t* ok1 = to_utf16("[\\w-]");
+        uintptr_t h1 = regex_compile(ok1, 0, regex_flag_bit('u'));
+        check(h1 != 0, "[\\w-]/u (trailing dash) still compiles");
+        if (h1) regex_free(h1);
+        free(ok1);
+        /* Annex B: non-/u legacy allows a class escape as a range endpoint. */
+        uint16_t* legacy = to_utf16("[\\w-a]");
+        uintptr_t hl = regex_compile(legacy, 0, 0);
+        check(hl != 0, "[\\w-a] without /u still compiles (Annex B legacy)");
+        if (hl) regex_free(hl);
+        free(legacy);
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;

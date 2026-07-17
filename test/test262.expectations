@@ -41,12 +41,6 @@ test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-b.js
 test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-p.js
 test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-w.js
 
-## Real gap: a \p{...} property escape used as a character-class RANGE
-# endpoint (e.g. [\p{Hex}--] under /u) must be an early SyntaxError. This
-# engine's range-endpoint rejection covers \d\w\s but not \p{...}. Narrow
-# parser fix, deferred to avoid disturbing the passing class-range tests.
-test/built-ins/RegExp/property-escapes/character-class-range-start.js
-
 # NOTE: `node test/test262_runner.mjs --generated` additionally runs the
 # machine-generated exhaustive sweeps under */generated/, which surface two
 # further known gaps not enumerated line-by-line here: /v-mode set

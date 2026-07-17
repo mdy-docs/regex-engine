@@ -756,10 +756,18 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                 }
             }
             
-            /* In unicode mode, a class escape (\d, \w, etc.) cannot be a range endpoint */
+            /* In unicode mode, a class escape (\d \w \s \p{...}) as a range
+             * START is an early SyntaxError (IsCharacterClass -> error, per
+             * NonemptyClassRanges static semantics). The `-]` trailing-dash
+             * shape is the only exception in /u. The `&&`/`--` exceptions
+             * are /v operators (unicode_sets) only -- applying them in plain
+             * /u wrongly let [\p{Hex}--], [\w-&], [\w--] compile (confirmed
+             * vs Node; docs/CONFORMANCE_GAPS.md #4). is_special is set by \p
+             * too, so this covers property escapes, not just \d\w\s. */
             if (is_special && lexer->prog->unicode &&
                 lexer->src[lexer->pos] == '-' && lexer->src[lexer->pos+1] != ']' &&
-                lexer->src[lexer->pos+1] != '&' && lexer->src[lexer->pos+1] != '-') {
+                (!lexer->prog->unicode_sets ||
+                 (lexer->src[lexer->pos+1] != '&' && lexer->src[lexer->pos+1] != '-'))) {
                 lexer->prog->error = "SyntaxError: Invalid character class range";
                 return;
             }
@@ -771,8 +779,12 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                     if (end_char == '\\') {
                         uint32_t esc = decode_utf16_lexer(lexer);
                         if (esc == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return; }
-                        /* Class escapes (\d \w \s etc.) cannot be range endpoints in unicode mode */
-                        if (lexer->prog->unicode && esc < 128 && strchr("dDwWsS", (char)esc)) {
+                        /* Same rule for a class escape as the range END atom
+                         * ([a-\d], [a-\p{Hex}]): SyntaxError in unicode mode.
+                         * \p/\P (property escapes) must be rejected here too,
+                         * not just \d\w\s (docs/CONFORMANCE_GAPS.md #4). */
+                        if (lexer->prog->unicode && esc < 128 &&
+                            (strchr("dDwWsS", (char)esc) || esc == 'p' || esc == 'P')) {
                             lexer->prog->error = "SyntaxError: Invalid character class range";
                             return;
                         }

@@ -86,21 +86,7 @@ constants) point directly at the `ucd.h` `UCDStringSequence[]` arrays
 instead of copying. The latter is cleanest but changes the `CharClass`
 ownership model. Weigh against the ~2MB `Program` footprint goal.
 
-## 4. [real] `\p{…}` as a character-class range endpoint
-
-**Fails:** `property-escapes/character-class-range-start.js`.
-
-**What's wrong:** `[\p{Hex}--]` under `/u` must be an early `SyntaxError` (a
-property escape can't be a range endpoint), but this engine accepts it. The
-range-endpoint rejection in `parse_char_class` (`re_lexer.c`) covers
-`\d`/`\w`/`\s` but not `\p{…}`, and the `!= '-'` guard on the check lets this
-specific shape through.
-
-**Approach:** extend the `is_special`-as-range-endpoint check to fire for
-`\p{…}` too. Narrow, but re-diff the passing class-range tests carefully —
-the guard conditions there are subtle and easy to over-broaden.
-
-## 5. [scope] Match-result object descriptors
+## 4. [scope] Match-result object descriptors
 
 **Fails:** `match-indices/indices-property.js`,
 `match-indices/indices-groups-object.js`, `named-groups/groups-object.js`.
