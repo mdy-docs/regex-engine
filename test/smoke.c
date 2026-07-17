@@ -943,6 +943,83 @@ int main(void) {
         free(text);
     }
 
+    /* Inline modifier groups (?flags:...) / (?-flags:...) actually change
+     * matching within the group. Regression tests for a confirmed bug found
+     * by test262: modifier flags were parsed but never took effect during
+     * lexing, so (?s:.) didn't match newline, (?i:a) didn't fold case, etc.
+     * -- the group body's `.`/classes are built at lex time reading
+     * prog->dot_all/ignore_case, which the parser now toggles around the
+     * body's parse. Each expectation diffed against Node. */
+    {
+        uint16_t* p = to_utf16("(?s:a.)");
+        uintptr_t h = regex_compile(p, 0, 0);
+        uint16_t text[] = { 'a', '\n' };
+        check(h != 0 && regex_exec(h, text, 2, 0), "(?s:a.) matches 'a\\n' (dotAll inside modifier group)");
+        free(p); regex_free(h);
+    }
+    {
+        uint16_t* p = to_utf16("(?i:a)b");
+        uintptr_t h = regex_compile(p, 0, 0);
+        uint16_t yes[] = { 'A', 'b' };
+        uint16_t no[] = { 'A', 'B' };
+        check(h != 0 && regex_exec(h, yes, 2, 0), "(?i:a)b matches 'Ab' (ignoreCase only inside group)");
+        check(h != 0 && !regex_exec(h, no, 2, 0), "(?i:a)b does not match 'AB' (b outside group stays case-sensitive)");
+        free(p); regex_free(h);
+    }
+    {
+        /* (?-s:.) turns dotAll back off inside the group even under /s. */
+        uint16_t* p = to_utf16("(?-s:.)");
+        uintptr_t h = regex_compile(p, 0, regex_flag_bit('s'));
+        uint16_t nl[] = { '\n' };
+        check(h != 0 && !regex_exec(h, nl, 1, 0), "(?-s:.) under /s does not match newline");
+        free(p); regex_free(h);
+    }
+    {
+        /* Same-flag repeats and cross-side conflicts are early errors. */
+        uint16_t* p1 = to_utf16("(?ss:a)");
+        uintptr_t h1 = regex_compile(p1, 0, 0);
+        check(h1 == 0, "(?ss:a) (repeated flag) is a compile error");
+        if (h1) regex_free(h1);
+        free(p1);
+        uint16_t* p2 = to_utf16("(?i-i:a)");
+        uintptr_t h2 = regex_compile(p2, 0, 0);
+        check(h2 == 0, "(?i-i:a) (flag on both sides) is a compile error");
+        if (h2) regex_free(h2);
+        free(p2);
+    }
+    {
+        /* Duplicate group names across alternation: \k<x> must resolve at
+         * match time to whichever same-named group actually participated,
+         * not bind to the first one at compile time. test262-found:
+         * /(?:(?<x>a)|(?<x>b))\k<x>/ on "bb" -- \k<x> must match the "b"
+         * captured by the second group. */
+        uint16_t* p = to_utf16("(?:(?<x>a)|(?<x>b))\\k<x>");
+        uintptr_t h = regex_compile(p, 0, 0);
+        uint16_t bb[] = { 'b', 'b' };
+        int m = regex_exec(h, bb, 2, 0);
+        const int32_t* caps = regex_captures_ptr(h);
+        check(m && caps[0] == 0 && caps[1] == 2, "dup-name \\k<x> matches 'bb' (backref resolves the participating group)");
+        check(m && caps[2] == -1 && caps[3] == -1, "dup-name: first x group unset on 'bb'");
+        check(m && caps[4] == 0 && caps[5] == 1, "dup-name: second x group is 'b'");
+        free(p); regex_free(h);
+    }
+    {
+        /* A pattern ending in a lone backslash is a clean error, not a read
+         * past the terminator. Regression for a fuzzer-found heap overflow:
+         * decode_utf16_lexer consumed the NUL terminator, walking the lexer
+         * position past the buffer so later peeks read foreign memory. */
+        uint16_t* p = to_utf16("abc\\");
+        uintptr_t h = regex_compile(p, 0, 0);
+        check(h == 0, "pattern ending in lone backslash is a clean compile error (was: heap overflow)");
+        if (h) regex_free(h);
+        free(p);
+        uint16_t* pc = to_utf16("[a\\");
+        uintptr_t hc = regex_compile(pc, 0, 0);
+        check(hc == 0, "class ending in lone backslash is a clean compile error");
+        if (hc) regex_free(hc);
+        free(pc);
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;

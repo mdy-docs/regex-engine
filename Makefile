@@ -7,7 +7,7 @@ WASM_TARGET = $(WASM_OUT_DIR)/baru-re.js
 ENGINE_SRCS = src/re_lexer.c src/re_parser.c src/re_compiler.c src/re_vm.c
 WASM_SRCS = $(ENGINE_SRCS) src/regex_wasm.c
 
-.PHONY: all clean test test-asan test-wasm wasm demo
+.PHONY: all clean test test-asan test-wasm test262 fuzz wasm demo
 
 all: test/smoke
 
@@ -32,6 +32,21 @@ test/smoke-asan: $(ENGINE_SRCS) src/regex_wasm.c test/smoke.c
 
 test-asan: test/smoke-asan
 	./test/smoke-asan
+
+# Fuzz harness over the shim API (see test/fuzz.c), built in standalone
+# mode (deterministic PRNG driver) because Apple clang ships no libFuzzer
+# runtime; with a full LLVM clang, build the real libFuzzer variant by
+# swapping -DFUZZ_STANDALONE for -fsanitize=fuzzer. Run: ./test/fuzz
+# [iterations] [seed].
+fuzz: $(ENGINE_SRCS) src/regex_wasm.c test/fuzz.c
+	$(CC) $(CFLAGS) -DFUZZ_STANDALONE -fsanitize=address,undefined -fno-sanitize-recover=undefined $(ENGINE_SRCS) src/regex_wasm.c test/fuzz.c -o test/fuzz
+
+# Fetches the pinned tc39/test262 subset (harness + RegExp trees) and runs
+# the conformance suite against the freshly-built WASM artifact, judged
+# against test/test262.expectations. See test/test262_runner.mjs.
+test262: wasm
+	sh scripts/get_test262.sh
+	node test/test262_runner.mjs
 
 # End-to-end check of the actual compiled dist/baru-re.wasm through its
 # real JS glue (requires `make wasm` first, and Node).

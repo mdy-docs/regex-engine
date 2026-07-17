@@ -9,3 +9,6 @@ web/baru-re.js
 web/baru-re.wasm
 *.tgz
 node_modules/
+test262/
+test/fuzz
+test/fuzz.dSYM/

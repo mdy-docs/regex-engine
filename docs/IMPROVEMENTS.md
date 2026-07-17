@@ -905,13 +905,26 @@ status list above is the current truth):
 
 ## 3. Testing
 
-Current coverage is exactly two files: `test/smoke.c` (15 assertions,
-native) and `test/node_smoke.mjs` (13 assertions, against the real
-compiled `.wasm`). Both are useful as fast, zero-dependency sanity checks
-and both currently pass — but they only exercise happy-path ASCII
-patterns plus one surrogate-pair case. None of the P0/P1 findings above
-would have been caught by either file, and there's no regression test
-guarding against any of them once fixed.
+**Substantially built out since this analysis** — every bullet below is now
+addressed. The original text is kept beneath each ✅ note as the record of
+what was missing.
+
+At the time of writing, coverage was exactly two files: `test/smoke.c` (15
+assertions, native) and `test/node_smoke.mjs` (13 against the real compiled
+`.wasm`), both happy-path ASCII. Today:
+
+- **`test/smoke.c` is the primary regression suite** — every §1 finding,
+  the §2 backtrack-stack overflow, and the bugs the conformance/fuzz work
+  surfaced (modifier groups, duplicate-name backrefs, trailing-backslash
+  overread) each have permanent coverage, run natively and under
+  ASan+UBSan.
+- **tc39/test262 conformance** runs against the real compiled engine
+  (`make test262`, `test/test262_runner.mjs`) — see the dedicated bullet
+  below.
+- **A fuzz harness** (`make fuzz`, `test/fuzz.c`) drives the shim API — see
+  below.
+- **CI runs all of it**: `test.yml` has `native`, `asan`, `wasm`, and
+  `test262` jobs on every push/PR.
 
 - ~~**No CI.**~~ — **resolved.** `.github/workflows/test.yml` runs three
   jobs on every push and PR to `main`: `make test` (native), `make
@@ -931,29 +944,55 @@ guarding against any of them once fixed.
   `-fno-sanitize-recover=undefined` — by default UBSan *prints* its
   report and exits 0, which would sail through CI unnoticed (ASan's
   reports abort by default; UBSan's don't).
-- **No fuzzing.** `regex_compile` + `regex_exec` is an unusually clean
-  fuzz target — two pure functions, deterministic, small state, already
-  isolated behind a stable C API. A libFuzzer harness that feeds random
-  bytes as (pattern, flags, text) and asserts "never crashes, never
-  ASan-trips" would likely surface more of the class of bug found in §1
-  beyond what manual probing found. This is a natural next step given how
-  productive manual probing already was.
-- **No spec-conformance coverage.** `README.md` already points at jsvm2's
-  `test262` RegExp subset as the "real" test suite for this engine's
-  matching semantics, but explicitly as an *external, disconnected*
-  resource — you have to go clone/find jsvm2 and run its test runner by
-  hand, and there's no guarantee anyone does that before merging a change
-  here. Given this repo is the one meant to be embedded standalone,
-  vendoring a curated subset of test262's RegExp built-ins directly into
-  `test/` (even a modest few hundred cases covering lookaround, Unicode
-  properties, named groups, and quantifier edge cases) would make
-  spec-compliance regressions visible in *this* repo's own CI rather than
-  requiring a manual cross-check against a sibling project.
-- **No negative/error-path tests.** All 28 combined assertions today
-  check for a match or a specific capture span; only one checks a compile
-  error path (`test/smoke.c`'s unbalanced-paren case). None check the
-  `MAX_*` limits, backreference bounds, or malformed Unicode escapes — the
-  exact surface area where §1's bugs live.
+- ~~**No fuzzing.**~~ — **resolved.** `test/fuzz.c` (`make fuzz`) drives
+  `regex_compile` + the `regex_exec` scan loop with bytes interpreted as
+  (flags, pattern, text) — raw code units on purpose, so lone surrogates,
+  NULs, and garbage (the §1.4/§1.5 input class) all occur. The invariant
+  is purely "never crashes, never trips ASan/UBSan"; correctness is the
+  smoke/test262 suites' job. It builds in a standalone deterministic-PRNG
+  mode by default (Apple clang ships no libFuzzer runtime; swap
+  `-DFUZZ_STANDALONE` for `-fsanitize=fuzzer` with a full LLVM clang) and
+  is reproducible by seed. **It immediately earned its keep**: the first
+  run found a heap-buffer-overflow — a pattern ending in a lone `\` made
+  `decode_utf16_lexer` consume the NUL terminator and walk the lexer
+  position past the buffer, so later `src[pos+1]` peeks read foreign heap
+  memory. Fixed (the decoder no longer advances past the terminator; a
+  trailing `\` is now a clean "\\ at end of pattern" error), with
+  regression coverage in `test/smoke.c`; 500k iterations clean afterward.
+- ~~**No spec-conformance coverage.**~~ — **resolved.** `make test262`
+  runs a pinned tc39/test262 checkout's RegExp suite against *this*
+  engine's compiled `.wasm` (`test/test262_runner.mjs`; fetched by
+  `scripts/get_test262.sh`, pinned by SHA). The trick is that test262
+  sources use regex *literals* (which would compile to the host engine): a
+  tokenizer rewrites every literal to a `new RegExp(...)` call, and a
+  sandboxed `RegExp` class plus patched `String.prototype.match`/`replace`/
+  `split`/`matchAll` route all matching through the WASM engine. Results
+  are judged against `test/test262.expectations` (a known-failures list;
+  the run fails on any *unexpected* fail **or** unexpected pass, so the
+  list can only shrink). The default scope skips the `generated/`
+  exhaustive codepoint sweeps for speed (~80s in CI; `--generated` runs
+  them locally). Current status: **286 pass, 11 known failures**, all
+  triaged in the expectations file — 3 are match-result-object descriptor
+  plumbing (out of a standalone matcher's scope), the rest real,
+  documented gaps (Unicode case folding of built-in class escapes under
+  `/iu`; the `Unknown`/`Zzzz` script value; `\p{...}` as a class-range
+  endpoint; and, under `--generated`, `/v` set operations and the
+  RGI_Emoji 128-sequence cap). **Standing this up found and fixed two real
+  engine bugs**: inline modifier groups (`(?i:...)`, `(?s:...)`) were
+  parsed but never took effect, because a group body's `.`/classes are
+  built at *lex* time from `prog->dot_all`/`ignore_case` — the parser now
+  toggles those around the body's parse, and match-time flag decisions are
+  baked per-instruction so a `(?i:...)` body's opcodes capture the toggled
+  value; and duplicate group names across alternation (ES2025) resolved
+  `\k<name>` to the first same-named group at compile time instead of the
+  participating one at match time (now emits `OP_NAMED_BACKREF`, which the
+  VM already resolved correctly). Both have `test/smoke.c` regressions.
+- ~~**No negative/error-path tests.**~~ — **resolved** as a side effect of
+  the §1 fixes and the conformance work: `test/smoke.c` now checks the
+  `MAX_*` limits, out-of-range backrefs, malformed/unknown property
+  escapes, over-long group names, trailing backslashes, and invalid
+  modifier groups as compile errors; test262 contributes hundreds more
+  negative (`phase: parse` SyntaxError) cases.
 
 ## 4. Structure & code quality
 

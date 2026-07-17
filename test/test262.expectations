@@ -1,0 +1,60 @@
+# Known test262 failures for the default (non-generated) conformance run,
+# consumed by test/test262_runner.mjs. Each line is a test path (relative to
+# the test262 checkout root); text after the path is an ignored comment.
+#
+# The runner exits nonzero on any UNEXPECTED failure OR any UNEXPECTED pass,
+# so this list can only shrink silently: fix a gap and its test starts
+# passing, which fails the run until the line is removed here. Every entry
+# below is a real, understood gap or an out-of-scope concern -- not a
+# rubber stamp.
+#
+# Pinned test262 commit: see TEST262_SHA in scripts/get_test262.sh. Bumping
+# it may add/remove tests; re-triage this file when you do.
+
+## Out of scope: match-RESULT-OBJECT plumbing, not engine behavior.
+# These assert the property descriptors (writable/enumerable/configurable)
+# and prototype of the Array that String.prototype.match / RegExp.exec
+# return. This engine's job ends at producing capture spans; assembling
+# them into a spec-shaped RegExp result object is the host's RegExp
+# implementation, which a standalone matcher doesn't own. The runner's shim
+# builds a plausible result array but does not replicate every descriptor.
+test/built-ins/RegExp/match-indices/indices-groups-object.js
+test/built-ins/RegExp/match-indices/indices-property.js
+test/built-ins/RegExp/named-groups/groups-object.js
+
+## Real gap: Unicode case-insensitive matching of BUILT-IN class escapes
+# and word boundaries. Under /iu, \w \W \p \P \b \B must fold via simple
+# case folding (e.g. U+017F LONG S folds to 's', so /\w/iu matches it, and
+# /\W/iu must not). This engine already folds *explicit* [...] classes
+# (apply_case_folding), but not the built-in escapes. It's all-or-nothing:
+# folding \w without \W would let one char match both, so the fix also
+# needs \W/\D/\S represented as a negated positive set (they're currently
+# pre-complemented) and is_word_char made fold-aware. Self-contained
+# correctness project, tracked separately.
+test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-b.js
+test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-p.js
+test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-w.js
+test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-b.js
+test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-p.js
+test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-w.js
+
+## Real gap: the "Unknown" (Zzzz) script value. \p{sc=Unknown} / \p{sc=Zzzz}
+# name the script of codepoints with no assigned script; Node accepts them,
+# this engine rejects (Scripts.txt doesn't list unassigned codepoints, so
+# the generator emits no Zzzz entry). Recognizing it means computing the
+# complement of all assigned scripts in scripts/generate_ucd.py.
+test/built-ins/RegExp/property-escapes/special-property-value-Script_Extensions-Unknown.js
+
+## Real gap: a \p{...} property escape used as a character-class RANGE
+# endpoint (e.g. [\p{Hex}--] under /u) must be an early SyntaxError. This
+# engine's range-endpoint rejection covers \d\w\s but not \p{...}. Narrow
+# parser fix, deferred to avoid disturbing the passing class-range tests.
+test/built-ins/RegExp/property-escapes/character-class-range-start.js
+
+# NOTE: `node test/test262_runner.mjs --generated` additionally runs the
+# machine-generated exhaustive sweeps under */generated/, which surface two
+# further known gaps not enumerated line-by-line here: /v-mode set
+# operations ([a&&b] intersection, [a--b] difference -- an unimplemented
+# ES2024 feature) and RGI_Emoji multi-codepoint sequences beyond the
+# 128-per-class cap (documented in docs/IMPROVEMENTS.md "Fixed since this
+# analysis"). CI runs the default (non-generated) scope.

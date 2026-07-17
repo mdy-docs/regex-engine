@@ -113,8 +113,36 @@ static ASTNode* parse_primary(Lexer* lexer) {
             if (is_named) strcpy(lexer->prog->group_names[gid], name);
         }
 
+        /* Modifier groups must take effect while the body is LEXED, not just
+         * while it's compiled: `.` and character classes are built into
+         * CharClass tables by next_token itself, reading prog->dot_all /
+         * prog->ignore_case at that moment -- so (?s:.) and (?i:[a-z]) only
+         * work if the flags are toggled around the body's parse (during
+         * which its tokens are produced), then restored. compile_node's
+         * AST_MODIFIER_GROUP does the same dance for what's decided at
+         * compile time; match-time decisions ride along inside the emitted
+         * instructions (see re_compiler.c). */
+        bool saved_i = lexer->prog->ignore_case;
+        bool saved_m = lexer->prog->multiline;
+        bool saved_s = lexer->prog->dot_all;
+        if (is_modifier) {
+            if (flags_on & REGEX_FLAG_IGNORECASE) lexer->prog->ignore_case = true;
+            if (flags_on & REGEX_FLAG_MULTILINE) lexer->prog->multiline = true;
+            if (flags_on & REGEX_FLAG_DOTALL) lexer->prog->dot_all = true;
+            if (flags_off & REGEX_FLAG_IGNORECASE) lexer->prog->ignore_case = false;
+            if (flags_off & REGEX_FLAG_MULTILINE) lexer->prog->multiline = false;
+            if (flags_off & REGEX_FLAG_DOTALL) lexer->prog->dot_all = false;
+        }
+
         next_token(lexer);
         ASTNode* inner = parse_alt(lexer);
+        /* Restore BEFORE consuming past the ')': the next_token below lexes
+         * the first token AFTER the group, which must see the outer flags. */
+        if (is_modifier) {
+            lexer->prog->ignore_case = saved_i;
+            lexer->prog->multiline = saved_m;
+            lexer->prog->dot_all = saved_s;
+        }
         if (lexer->current.type == TOK_RPAREN) {
             next_token(lexer);
         } else {

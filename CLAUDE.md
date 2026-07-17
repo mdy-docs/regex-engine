@@ -66,19 +66,23 @@ make test       # native smoke test, cc only, fast — run this after any src/re
 make test-asan  # same suite under ASan+UBSan — run this too if you touched the VM or any buffer handling
 make wasm       # emcc build -> dist/baru-re.js + .wasm (needs emcc on PATH)
 make test-wasm  # builds wasm, runs test/node_smoke.mjs against the real artifact
+make test262    # builds wasm, runs tc39/test262 RegExp conformance vs test/test262.expectations
+make fuzz       # builds the fuzz harness (test/fuzz.c); run ./test/fuzz [iters] [seed]
 make demo       # builds wasm, copies artifacts into web/, so the demo runs locally
 ```
 
 `emcc` comes from the Emscripten SDK (`emsdk`); if it's not on `PATH`,
-`make wasm`/`make test-wasm`/`make demo` will fail with a clear "command not
-found" — `make test` alone needs nothing but a C compiler.
+`make wasm`/`make test-wasm`/`make test262`/`make demo` will fail with a
+clear "command not found" — `make test` alone needs nothing but a C compiler.
 
 **Always run `make test` after editing any `src/re_*.c`/`.h` or `include/regexp.h`.**
-It's a handful of cases, not a real correctness suite (see
-`docs/IMPROVEMENTS.md` §Testing) — passing it is necessary, not sufficient.
-If you're touching matching semantics (not just the shim), sanity-check
-against a real JS engine (`node -e "console.log(/pattern/flags.exec('text'))"`)
-for the cases you changed.
+It's a broad regression suite now (every `docs/IMPROVEMENTS.md` §1 finding
+plus the conformance/fuzz-found bugs), but still not exhaustive — if you're
+touching matching semantics (not just the shim), also run `make test262`,
+and sanity-check new cases against a real JS engine
+(`node -e "console.log(/pattern/flags.exec('text'))"`). `make test262`
+is the real spec-conformance gate; its known gaps are enumerated with
+reasons in `test/test262.expectations`.
 
 ## Load-bearing constraints — do not violate these silently
 

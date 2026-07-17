@@ -43,3 +43,20 @@ jobs:
         with:
           node-version: 20
       - run: make test-wasm
+
+  # tc39/test262 RegExp conformance against the compiled WASM engine, judged
+  # against test/test262.expectations. Runs the default (non-generated)
+  # scope -- see test/test262_runner.mjs. Same emsdk-before-node ordering as
+  # the wasm job, for the same reason.
+  test262:
+    name: test262 conformance (make test262)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: make test262

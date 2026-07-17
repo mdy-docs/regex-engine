@@ -22,7 +22,19 @@
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 
 static inline uint32_t decode_utf16_lexer(Lexer* lexer) {
-    uint32_t cp = lexer->src[lexer->pos++];
+    uint32_t cp = lexer->src[lexer->pos];
+    /* Never advance past the NUL terminator: decoding "at end" returns 0
+     * without moving, so lexer->pos can never exceed the terminator's
+     * index and every src[pos+1]-style peek in this file stays in bounds.
+     * The old unconditional pos++ consumed the terminator itself -- a
+     * pattern ending in a lone '\' (whose escape decode eats the NUL) then
+     * walked pos past the buffer, and later peeks read foreign heap
+     * memory (found by the fuzz harness: heap-buffer-overflow in
+     * parse_char_class). Callers that decode an *escape* body treat the
+     * resulting 0 as "\\ at end of pattern" -- a NUL can't otherwise occur
+     * mid-pattern, since a NUL is by contract the terminator. */
+    if (cp == 0) return 0;
+    lexer->pos++;
     if (lexer->prog->unicode && cp >= 0xD800 && cp <= 0xDBFF) {
         if (lexer->src[lexer->pos] >= 0xDC00 && lexer->src[lexer->pos] <= 0xDFFF) {
             cp = ((cp - 0xD800) << 10) + (lexer->src[lexer->pos++] - 0xDC00) + 0x10000;
@@ -601,6 +613,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
             
             if (start_char == '\\') {
                 uint32_t esc = decode_utf16_lexer(lexer);
+                if (esc == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return; }
                 if (esc < 128 && strchr("dDwWsS", (char)esc)) { fill_builtin_class(&current_union, (char)esc, lexer->prog->unicode); is_special = true; }
                 else if (esc == 'x') {
                     if (!parse_hex(lexer, 2, &start_char)) {
@@ -625,6 +638,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                             uint32_t cp = decode_utf16_lexer(lexer);
                             if (cp == '\\') {
                                 uint32_t esc_cp = decode_utf16_lexer(lexer);
+                                if (esc_cp == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return; }
                                 switch (esc_cp) {
                                     case 'n': cp = '\n'; break; case 't': cp = '\t'; break;
                                     case 'r': cp = '\r'; break; case 'b': cp = '\b'; break;
@@ -756,6 +770,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                     uint32_t end_char = decode_utf16_lexer(lexer);
                     if (end_char == '\\') {
                         uint32_t esc = decode_utf16_lexer(lexer);
+                        if (esc == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return; }
                         /* Class escapes (\d \w \s etc.) cannot be range endpoints in unicode mode */
                         if (lexer->prog->unicode && esc < 128 && strchr("dDwWsS", (char)esc)) {
                             lexer->prog->error = "SyntaxError: Invalid character class range";
@@ -901,13 +916,12 @@ void next_token(Lexer* lexer) {
                     else break;
                     
                     has_flags = true;
-                    if (negative) {
-                        if (flags_on & flag) { lexer->prog->error = "SyntaxError: Invalid group"; return; }
-                        flags_off |= flag;
-                    } else {
-                        if (flags_off & flag) { lexer->prog->error = "SyntaxError: Invalid group"; return; }
-                        flags_on |= flag;
-                    }
+                    /* Both cross-side conflicts ((?i-i:)) and same-side
+                     * repeats ((?ii:)) are early errors per the
+                     * RegularExpressionFlags grammar -- confirmed vs Node. */
+                    if ((flags_on | flags_off) & flag) { lexer->prog->error = "SyntaxError: Invalid group"; return; }
+                    if (negative) flags_off |= flag;
+                    else flags_on |= flag;
                     p++;
                 }
                 
@@ -945,6 +959,7 @@ void next_token(Lexer* lexer) {
         }
         case '\\': {
             uint32_t esc = decode_utf16_lexer(lexer);
+            if (esc == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return; }
             if (esc < 128 && strchr("dDwWsS", (char)esc)) {
                 int cid = alloc_class(lexer->prog);
                 fill_builtin_class(&lexer->prog->classes[cid], (char)esc, lexer->prog->unicode);

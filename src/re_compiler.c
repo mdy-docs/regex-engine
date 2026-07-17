@@ -62,9 +62,9 @@ static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
         if (split != -1) prog->code[split].arg1 = prog->code_count;
         StringSequence* seq = &cls->strings[i];
         if (rtl) {
-            for (int k = seq->length - 1; k >= 0; k--) emit(prog, OP_CHAR, seq->cps[k], 0, 0, 0, false);
+            for (int k = seq->length - 1; k >= 0; k--) emit(prog, OP_CHAR, seq->cps[k], prog->ignore_case, 0, 0, false);
         } else {
-            for (int k = 0; k < seq->length; k++) emit(prog, OP_CHAR, seq->cps[k], 0, 0, 0, false);
+            for (int k = 0; k < seq->length; k++) emit(prog, OP_CHAR, seq->cps[k], prog->ignore_case, 0, 0, false);
         }
         if (has_more) {
             jmp_pcs[jmp_count++] = emit(prog, OP_JMP, 0, 0, 0, 0, false);
@@ -94,13 +94,29 @@ static void group_id_range(ASTNode* node, int* lo, int* hi) {
 
 static void compile_node(ASTNode* node, Program* prog, bool rtl) {
     if (!node) return;
+    /* Match-time flag decisions are baked into each instruction as it's
+     * emitted (OP_CHAR/backrefs carry effective ignore_case in arg2, the
+     * anchors carry effective multiline in arg1) rather than read from
+     * prog->* at match time -- the AST_MODIFIER_GROUP case below toggles
+     * the prog fields only for the duration of this compile walk, so a
+     * (?i:...) body's instructions must capture the toggled value while it
+     * is in effect. dot_all needs no instruction bit: `.` is a CharClass
+     * built at lex time, where re_parser.c does the equivalent toggle. */
     switch (node->type) {
-        case AST_ASSERT_START: emit(prog, OP_ASSERT_START, 0, 0, 0, 0, false); break;
-        case AST_ASSERT_END:   emit(prog, OP_ASSERT_END, 0, 0, 0, 0, false); break;
+        case AST_ASSERT_START: emit(prog, OP_ASSERT_START, prog->multiline, 0, 0, 0, false); break;
+        case AST_ASSERT_END:   emit(prog, OP_ASSERT_END, prog->multiline, 0, 0, 0, false); break;
         case AST_WORD_BOUNDARY:emit(prog, OP_WORD_BOUNDARY, 0, 0, 0, 0, false); break;
         case AST_NON_WORD_BOUNDARY:emit(prog, OP_NON_WORD_BOUNDARY, 0, 0, 0, 0, false); break;
-        case AST_BACKREF:      emit(prog, OP_BACKREF, node->id, 0, 0, 0, false); break;
+        case AST_BACKREF:      emit(prog, OP_BACKREF, node->id, prog->ignore_case, 0, 0, false); break;
         case AST_NAMED_BACKREF: {
+            /* Emit OP_NAMED_BACKREF, not OP_BACKREF: with ES2025 duplicate
+             * group names, which group a \k<name> refers to is only known
+             * at match time (whichever same-named group actually
+             * participated), and the VM's OP_NAMED_BACKREF implements
+             * exactly that search. Binding to the first same-named id at
+             * compile time -- as this used to -- made \k<x> silently match
+             * empty whenever a *different* alternative's group had
+             * captured (found via test262's duplicate-names tests). */
             int gid = -1;
             for (int i = 1; i <= prog->group_count; i++) {
                 if (strcmp(prog->group_names[i], node->name) == 0) {
@@ -108,7 +124,7 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
                     break;
                 }
             }
-            if (gid != -1) emit(prog, OP_BACKREF, gid, 0, 0, 0, false);
+            if (gid != -1) emit(prog, OP_NAMED_BACKREF, gid, prog->ignore_case, 0, 0, false);
             break;
         }
         case AST_MODIFIER_GROUP: {
@@ -128,7 +144,7 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
             prog->ignore_case = old_ignore_case; prog->multiline = old_multiline; prog->dot_all = old_dot_all;
             break;
         }
-        case AST_LITERAL: emit(prog, OP_CHAR, node->ch, 0, 0, 0, false); break;
+        case AST_LITERAL: emit(prog, OP_CHAR, node->ch, prog->ignore_case, 0, 0, false); break;
         case AST_CLASS:
             if (prog->classes[node->id].string_count > 0) compile_class_with_strings(prog, node->id, rtl);
             else emit(prog, OP_CLASS, node->id, 0, 0, 0, false);

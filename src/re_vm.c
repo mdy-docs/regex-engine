@@ -330,7 +330,7 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                         if (prog->unicode) cp = decode_utf16(&next_sp, text_end);
                         else cp = *next_sp++;
                         
-                        if (prog->ignore_case) {
+                        if (inst.arg2) {
                             uint32_t inst_cp = inst.arg1;
                             uint32_t match_cp = cp;
                             if (prog->unicode) {
@@ -351,7 +351,7 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                         uint32_t cp;
                         if (prog->unicode) cp = decode_utf16_backward(&next_sp, original_text);
                         else cp = *(--next_sp);
-                        if (prog->ignore_case) {
+                        if (inst.arg2) {
                             uint32_t inst_cp = inst.arg1;
                             uint32_t match_cp = cp;
                             if (prog->unicode) {
@@ -394,8 +394,8 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                 }
             } break;
             case OP_SAVE: { current.captures[inst.arg1] = current.sp; current.pc++; } break;
-            case OP_ASSERT_START: { if (current.sp == original_text || (prog->multiline && current.sp > original_text && *(current.sp - 1) == '\n')) current.pc++; else { path_failed = true; break; } } break;
-            case OP_ASSERT_END:   { if (current.sp >= text_end || (prog->multiline && *current.sp == '\n')) current.pc++; else { path_failed = true; break; } } break;
+            case OP_ASSERT_START: { if (current.sp == original_text || (inst.arg1 && current.sp > original_text && *(current.sp - 1) == '\n')) current.pc++; else { path_failed = true; break; } } break;
+            case OP_ASSERT_END:   { if (current.sp >= text_end || (inst.arg1 && *current.sp == '\n')) current.pc++; else { path_failed = true; break; } } break;
             case OP_WORD_BOUNDARY: {
                 /* The sp < text_end guard mirrors OP_ASSERT_END's: text need
                  * not be NUL-terminated (text_units is authoritative, per
@@ -431,7 +431,7 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                 }
                 if (start && end) {
                     bool match = true;
-                    if (prog->ignore_case) {
+                    if (inst.arg2) {
                         const uint16_t* temp_sp = current.sp;
                         if (step > 0) {
                             const uint16_t* temp_start = start;
