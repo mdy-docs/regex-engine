@@ -217,7 +217,7 @@ static bool rx_name_append_utf8(char* buf, int* len, uint32_t cp) {
     else if (cp < 0x800) { tmp[0] = (char)(0xC0 | (cp >> 6)); tmp[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
     else if (cp < 0x10000) { tmp[0] = (char)(0xE0 | (cp >> 12)); tmp[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); tmp[2] = (char)(0x80 | (cp & 0x3F)); n = 3; }
     else { tmp[0] = (char)(0xF0 | (cp >> 18)); tmp[1] = (char)(0x80 | ((cp >> 12) & 0x3F)); tmp[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); tmp[3] = (char)(0x80 | (cp & 0x3F)); n = 4; }
-    if (*len + n >= 32) return false;
+    if (*len + n >= MAX_GROUP_NAME) return false;
     for (int i = 0; i < n; i++) buf[(*len)++] = tmp[i];
     return true;
 }
@@ -370,10 +370,17 @@ static void fill_builtin_class(CharClass* cls, char type, bool unicode) {
  * WASM (single-threaded) and single-threaded native embedders, but a
  * native embedder compiling patterns from multiple threads concurrently
  * must add its own serialization around regex_compile. */
+/* \p{...} name/value buffer size: the longest canonical spelling in the
+ * generated ucd.h ("RGI_Emoji_Modifier_Sequence", 27 bytes) plus generous
+ * headroom; names that don't fit fail the parse loudly via the
+ * unterminated-escape path. Shared by the parse buffers at both \p sites
+ * and the cache key below. */
+#define MAX_PROP_NAME 64
+
 #define MAX_PROP_CACHE 64
 static struct {
     int kind;
-    char name[64];
+    char name[MAX_PROP_NAME];
     CharClass cls;
 } prop_cache[MAX_PROP_CACHE];
 static int prop_cache_count = 0;
@@ -451,7 +458,7 @@ static bool fill_unicode_property(CharClass* cls, const char* key, const char* n
 
         if (prop_cache_count < MAX_PROP_CACHE) {
             prop_cache[prop_cache_count].kind = kind;
-            strncpy(prop_cache[prop_cache_count].name, name, 63);
+            strncpy(prop_cache[prop_cache_count].name, name, MAX_PROP_NAME - 1);
             prop_cache[prop_cache_count].cls = temp;
             prop_cache_count++;
         }
@@ -663,10 +670,10 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                     if (lexer->prog->unicode) {
                         if (lexer->src[lexer->pos] == '{') {
                             lexer->pos++;
-                            char prop[64] = {0};
+                            char prop[MAX_PROP_NAME] = {0};
                             int prop_len = 0;
                             char* val = prop;
-                            while (lexer->src[lexer->pos] != '}' && lexer->src[lexer->pos] != '\0' && prop_len < 63) {
+                            while (lexer->src[lexer->pos] != '}' && lexer->src[lexer->pos] != '\0' && prop_len < MAX_PROP_NAME - 1) {
                                 char c = (char)lexer->src[lexer->pos++];
                                 prop[prop_len++] = c;
                                 if (c == '=') val = prop + prop_len;
@@ -871,7 +878,7 @@ void next_token(Lexer* lexer) {
                     lexer->current = (Token){TOK_NEG_LOOKBEHIND, 0, 0, 0, 0, ""};
                 } else {
                 lexer->pos += 2; /* consume '?<' */
-                char name[32] = {0};
+                char name[MAX_GROUP_NAME] = {0};
                 if (!parse_group_name(lexer, name)) return;
                 Token t = {TOK_NAMED_GROUP, 0, 0, 0, 0, ""};
                 strcpy(t.name, name);
@@ -965,7 +972,7 @@ void next_token(Lexer* lexer) {
                         return;
                     }
                     lexer->pos++; /* consume '<' */
-                    char name[32] = {0};
+                    char name[MAX_GROUP_NAME] = {0};
                     if (!parse_group_name(lexer, name)) return;
                     Token t = {TOK_NAMED_BACKREF};
                     strcpy(t.name, name);
@@ -999,10 +1006,10 @@ void next_token(Lexer* lexer) {
                 if (lexer->prog->unicode) {
                     if (lexer->src[lexer->pos] == '{') {
                         lexer->pos++;
-                        char prop[64] = {0};
+                        char prop[MAX_PROP_NAME] = {0};
                         int prop_len = 0;
                         char* val = prop;
-                        while (lexer->src[lexer->pos] != '}' && lexer->src[lexer->pos] != '\0' && prop_len < 63) {
+                        while (lexer->src[lexer->pos] != '}' && lexer->src[lexer->pos] != '\0' && prop_len < MAX_PROP_NAME - 1) {
                             char prop_ch = (char)lexer->src[lexer->pos++];
                             prop[prop_len++] = prop_ch;
                             if (prop_ch == '=') val = prop + prop_len;

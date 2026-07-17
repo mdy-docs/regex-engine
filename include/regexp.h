@@ -9,6 +9,13 @@
 #define MAX_CLASSES 64
 #define MAX_COUNTERS 16
 #define CACHE_SIZE 8192
+/* Capture-group name buffer size in bytes: 31 UTF-8 bytes + NUL. An engine
+ * limit, not a spec one (ECMAScript puts no length cap on group names) --
+ * over-long names fail compilation loudly (docs/IMPROVEMENTS.md #1.9).
+ * Shared by Program.group_names, the parser/lexer's Token/ASTNode name
+ * buffers, and the append bound in rx_name_append_utf8; sizing one without
+ * the others would silently reintroduce a truncation bug. */
+#define MAX_GROUP_NAME 32
 
 /* Unlike the four MAX_* above (which size fixed arrays and are checked at
  * their respective allocation sites -- see docs/IMPROVEMENTS.md #1.2), this
@@ -34,39 +41,23 @@
 #define REGEX_FLAG_INDICES 64
 #define REGEX_FLAG_UNICODE_SETS 128
 
+/* The enum members ARE the short names: every use site already said OP_*
+ * (via a full set of aliasing macros this header used to carry); the
+ * REGEX_OP_* spellings were referenced nowhere else in this repo or by
+ * any known consumer, so the double naming was collapsed
+ * (docs/IMPROVEMENTS.md section 4). */
 typedef enum {
-    REGEX_OP_CHAR, REGEX_OP_CLASS, REGEX_OP_SPLIT, REGEX_OP_JMP, REGEX_OP_SAVE, REGEX_OP_LOOKAHEAD, REGEX_OP_NEG_LOOKAHEAD, REGEX_OP_MATCH,
-    REGEX_OP_INIT_COUNTER, REGEX_OP_INC_COUNTER, REGEX_OP_CHECK_COUNTER, REGEX_OP_ASSERT_START, REGEX_OP_ASSERT_END, REGEX_OP_BACKREF, REGEX_OP_NAMED_BACKREF, REGEX_OP_WORD_BOUNDARY,
-    REGEX_OP_NON_WORD_BOUNDARY, REGEX_OP_LOOKBEHIND, REGEX_OP_NEG_LOOKBEHIND, REGEX_OP_CLEAR_CAPTURES
+    OP_CHAR, OP_CLASS, OP_SPLIT, OP_JMP, OP_SAVE, OP_LOOKAHEAD, OP_NEG_LOOKAHEAD, OP_MATCH,
+    OP_INIT_COUNTER, OP_INC_COUNTER, OP_CHECK_COUNTER, OP_ASSERT_START, OP_ASSERT_END, OP_BACKREF, OP_NAMED_BACKREF, OP_WORD_BOUNDARY,
+    OP_NON_WORD_BOUNDARY, OP_LOOKBEHIND, OP_NEG_LOOKBEHIND, OP_CLEAR_CAPTURES
 } RegexOpCode;
-
-#define OP_CHAR REGEX_OP_CHAR
-#define OP_CLASS REGEX_OP_CLASS
-#define OP_SPLIT REGEX_OP_SPLIT
-#define OP_JMP REGEX_OP_JMP
-#define OP_SAVE REGEX_OP_SAVE
-#define OP_LOOKAHEAD REGEX_OP_LOOKAHEAD
-#define OP_NEG_LOOKAHEAD REGEX_OP_NEG_LOOKAHEAD
-#define OP_MATCH REGEX_OP_MATCH
-#define OP_INIT_COUNTER REGEX_OP_INIT_COUNTER
-#define OP_INC_COUNTER REGEX_OP_INC_COUNTER
-#define OP_CHECK_COUNTER REGEX_OP_CHECK_COUNTER
-#define OP_ASSERT_START REGEX_OP_ASSERT_START
-#define OP_ASSERT_END REGEX_OP_ASSERT_END
-#define OP_BACKREF REGEX_OP_BACKREF
-#define OP_NAMED_BACKREF REGEX_OP_NAMED_BACKREF
-#define OP_WORD_BOUNDARY REGEX_OP_WORD_BOUNDARY
-#define OP_NON_WORD_BOUNDARY REGEX_OP_NON_WORD_BOUNDARY
-#define OP_LOOKBEHIND REGEX_OP_LOOKBEHIND
-#define OP_NEG_LOOKBEHIND REGEX_OP_NEG_LOOKBEHIND
-#define OP_CLEAR_CAPTURES REGEX_OP_CLEAR_CAPTURES
 
 typedef struct {
     RegexOpCode op;
-    int arg1; 
-    int arg2; 
-    int arg3;  // Max bounds for REGEX_OP_CHECK_COUNTER
-    int arg4;  // Jump target for REGEX_OP_CHECK_COUNTER
+    int arg1;
+    int arg2;
+    int arg3;  // Max bounds for OP_CHECK_COUNTER
+    int arg4;  // Jump target for OP_CHECK_COUNTER
     bool lazy; // Lazy routing flag
 } Instruction;
 
@@ -91,7 +82,7 @@ typedef struct {
 typedef struct {
     Instruction code[MAX_OPCODES];
     CharClass classes[MAX_CLASSES];
-    char group_names[MAX_GROUPS][32];
+    char group_names[MAX_GROUPS][MAX_GROUP_NAME];
     int code_count;
     int class_count;
     int group_count;

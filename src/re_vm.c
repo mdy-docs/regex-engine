@@ -58,6 +58,28 @@ static inline uint32_t decode_utf16(const uint16_t** sp, const uint16_t* limit) 
     return cp;
 }
 
+/* Mirror of decode_utf16 for right-to-left matching (lookbehind): decode
+ * one code point ending just before *sp, moving *sp back past it (2 units
+ * for a valid surrogate pair whose lead is still at or after `start`, 1
+ * otherwise). Extracted from four independently-maintained inline copies
+ * (OP_CHAR/OP_CLASS backward, and both sides of the ignore-case
+ * backreference comparison) -- docs/IMPROVEMENTS.md section 4 flagged that
+ * duplication as an entire class of "fixed on one side, not the mirror
+ * side" bug risk, and #1.5 proved it: the forward decoder's OOB read got
+ * probed and fixed while these stayed separate. Callers must ensure
+ * *sp > start before calling. */
+static inline uint32_t decode_utf16_backward(const uint16_t** sp, const uint16_t* start) {
+    uint32_t cp = *--(*sp);
+    if (cp >= 0xDC00 && cp <= 0xDFFF && *sp > start) {
+        uint32_t lead = *(*sp - 1);
+        if (lead >= 0xD800 && lead <= 0xDBFF) {
+            cp = ((lead - 0xD800) << 10) + (cp - 0xDC00) + 0x10000;
+            (*sp)--;
+        }
+    }
+    return cp;
+}
+
 static inline bool is_word_char(uint32_t c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
 }
@@ -327,18 +349,8 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                     if (current.sp > original_text) {
                         const uint16_t* next_sp = current.sp;
                         uint32_t cp;
-                        if (prog->unicode) {
-                            next_sp--; cp = *next_sp;
-                            if (cp >= 0xDC00 && cp <= 0xDFFF && next_sp > original_text) {
-                                uint32_t lead = *(next_sp - 1);
-                                if (lead >= 0xD800 && lead <= 0xDBFF) {
-                                    cp = ((lead - 0xD800) << 10) + (cp - 0xDC00) + 0x10000;
-                                    next_sp--;
-                                }
-                            }
-                        } else {
-                            cp = *(--next_sp);
-                        }
+                        if (prog->unicode) cp = decode_utf16_backward(&next_sp, original_text);
+                        else cp = *(--next_sp);
                         if (prog->ignore_case) {
                             uint32_t inst_cp = inst.arg1;
                             uint32_t match_cp = cp;
@@ -372,18 +384,8 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                     if (current.sp > original_text) {
                         const uint16_t* next_sp = current.sp;
                         uint32_t cp;
-                        if (prog->unicode) {
-                            next_sp--; cp = *next_sp;
-                            if (cp >= 0xDC00 && cp <= 0xDFFF && next_sp > original_text) {
-                                uint32_t lead = *(next_sp - 1);
-                                if (lead >= 0xD800 && lead <= 0xDBFF) {
-                                    cp = ((lead - 0xD800) << 10) + (cp - 0xDC00) + 0x10000;
-                                    next_sp--;
-                                }
-                            }
-                        } else {
-                            cp = *(--next_sp);
-                        }
+                        if (prog->unicode) cp = decode_utf16_backward(&next_sp, original_text);
+                        else cp = *(--next_sp);
                         CharClass* cls = &prog->classes[inst.arg1];
                         bool matched = class_contains(cls, cp);
                         if (cls->negated) matched = !matched;
@@ -461,16 +463,11 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                                 if (temp_sp <= original_text) { match = false; break; }
                                 uint32_t cp1, cp2;
                                 if (prog->unicode) {
-                                    temp_sp--; cp1 = *temp_sp;
-                                    if (cp1 >= 0xDC00 && cp1 <= 0xDFFF && temp_sp > original_text) {
-                                        uint32_t lead = *(temp_sp - 1);
-                                        if (lead >= 0xD800 && lead <= 0xDBFF) { cp1 = ((lead - 0xD800) << 10) + (cp1 - 0xDC00) + 0x10000; temp_sp--; }
-                                    }
-                                    temp_end--; cp2 = *temp_end;
-                                    if (cp2 >= 0xDC00 && cp2 <= 0xDFFF && temp_end > start) {
-                                        uint32_t lead = *(temp_end - 1);
-                                        if (lead >= 0xD800 && lead <= 0xDBFF) { cp2 = ((lead - 0xD800) << 10) + (cp2 - 0xDC00) + 0x10000; temp_end--; }
-                                    }
+                                    /* Like the forward direction above, the
+                                     * capture-side decode is bounded by the
+                                     * capture's own start, not the text's. */
+                                    cp1 = decode_utf16_backward(&temp_sp, original_text);
+                                    cp2 = decode_utf16_backward(&temp_end, start);
                                     cp1 = unicode_casefold(cp1);
                                     cp2 = unicode_casefold(cp2);
                                 } else {

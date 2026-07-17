@@ -976,46 +976,46 @@ guarding against any of them once fixed.
   than jsvm2's original textual position (`decode_utf16`, `is_word_char`,
   and `annexb_canonicalize` all ended up in `re_vm.c`, the only place that
   calls them, despite being positioned before jsvm2's "LEXER" section).
-- **Forward/backward branch duplication in the VM** (documented in
-  `docs/ARCHITECTURE.md`) is the direct cause of at least one of the bugs
-  above having a fix needed in two places conceptually (1.4's `\b`/`\B` is
-  actually not direction-dependent, but 1.5's `decode_utf16` forward path
-  and the VM's separate inlined backward-surrogate-decode logic — e.g.
-  `re_vm.c:134` onward — are two independently-maintained
-  implementations of "decode one code point in this direction," and only
-  one of them was probed here). Extracting shared
-  `decode_forward(sp, text_end)` / `decode_backward(sp, text_start)`
-  helpers used by both `OP_CHAR` and `OP_CLASS` (and the backreference
-  matching code, which duplicates this a *third* time at `re_vm.c:242` and
-  `:261`) would both shrink `re_vm.c` substantially and remove an entire
-  class of "fixed on one side, not the mirror side" bug risk — this is
-  independent of and not addressed by the file split above, which
-  reorganized without deduplicating.
-- `include/regexp.h:28–47` defines `OP_CHAR`/`OP_CLASS`/etc. as macros
-  aliasing `REGEX_OP_CHAR`/`REGEX_OP_CLASS`/etc. (the actual enum members).
-  Every use site across the engine's four `re_*.c` files uses the short
-  `OP_*` form; the `REGEX_OP_*` names are never referenced anywhere except
-  their own enum/macro definitions. This double-naming appears to be a
-  leftover from some prior refactor or namespacing concern — worth
-  collapsing to one name (presumably the enum becomes `OP_*` directly)
-  unless there's an external reason (e.g. a header consumer elsewhere in
-  jsvm2) to keep the `REGEX_OP_*` prefix as the "public" name.
-- `fill_unicode_property` (`re_lexer.c:342–468`) is a large `if`/`else if`
-  chain of `strcmp` calls mapping short Unicode general-category aliases
-  (`Lu`, `Ll`, `Nd`, ...) to their long names, plus another chain for the
-  grouped categories (`L`, `M`, `N`, ...). A small static lookup table
-  (array of `{short, long}` pairs, linear- or binary-searched) would be
-  more maintainable and marginally faster than ~30 sequential `strcmp`s
-  per lookup — low priority since this only runs at compile time, not
-  per-match, but it's the least readable function in the file today.
-- Magic numbers without named constants in a few spots: the `32`-byte
-  group-name buffer size appears as a literal in multiple structs
-  (`Token.name`, `ASTNode.name`, `Program.group_names[MAX_GROUPS][32]`)
-  rather than a shared `#define`; the `64`-byte property-name buffer in
-  the `\p{...}` parsing code (`re_lexer.c:654, 987`) is similarly a bare
-  literal repeated at each call site. Not a bug, just a maintainability
-  nit — a future change to one and not the others would silently
-  reintroduce a truncation bug.
+- ~~**Forward/backward branch duplication in the VM**~~ — **RESOLVED.**
+  The forward direction was already unified (`decode_utf16`, which is
+  where #1.5's bounds fix landed); the backward direction existed as
+  **four** independently-maintained inline copies (`OP_CHAR` backward,
+  `OP_CLASS` backward, and both sides of the ignore-case backreference
+  comparison — one more than this finding counted). All four now call a
+  single `decode_utf16_backward(sp, start)` (`re_vm.c`), the mirror of
+  `decode_utf16`'s signature including the bound parameter — the
+  backreference's capture-side decode is bounded by the capture's own
+  `start`, matching the forward direction's `end`-bounding from #1.5.
+  Verified behavior-preserving against Node on the paths only the
+  backward decoder serves: lookbehind over surrogate pairs
+  (`(?<=😀)x`, multi-unit bodies), `\p{L}` lookbehind on astral letters,
+  negative lookbehind, and `(?<=(.)\1)x/iu` (the backward ignore-case
+  backreference over pairs) — plus the full probe battery (235 property
+  cases et al.) and all three suites, under ASan+UBSan.
+- ~~`include/regexp.h:28–47` defines `OP_CHAR`/`OP_CLASS`/etc. as macros
+  aliasing `REGEX_OP_CHAR`/`REGEX_OP_CLASS`/etc.~~ — **RESOLVED**: the
+  enum members are now the `OP_*` names directly and the 20 aliasing
+  macros are gone. Re-verified before collapsing that `REGEX_OP_*` was
+  referenced nowhere outside its own definitions (grep across `src/`,
+  `include/`, `test/`, `web/`); the only casualties were two comments in
+  the `Instruction` struct that used the long spellings.
+- ~~`fill_unicode_property` (`re_lexer.c:342–468`) is a large `if`/`else if`
+  chain of `strcmp` calls~~ — **RESOLVED as a side effect of the
+  `\p{Key=Value}` spec-compliance fix** (see the 1.9 follow-up in
+  section 1): the generator now emits every alias spelling and grouped
+  General_Category value as a direct, kind-tagged table entry in `ucd.h`,
+  so the entire ~80-line chain was deleted rather than reorganized into
+  the lookup table this finding suggested — the data was always
+  generator-derivable, so the table belonged in the generated file, not
+  hand-maintained C.
+- ~~Magic numbers without named constants in a few spots~~ — **RESOLVED**:
+  the group-name buffer size is `MAX_GROUP_NAME` (`include/regexp.h`,
+  with a comment on why every user must share it — it's also the bound
+  `rx_name_append_utf8` enforces loudly per #1.9), used by
+  `Program.group_names`, `Token.name`, `ASTNode.name`, `NameSet.names`,
+  and the parser/lexer's local parse buffers; the property-name buffer
+  size is `MAX_PROP_NAME` (`re_lexer.c`), shared by both `\p{...}` parse
+  sites and the `prop_cache` key.
 
 ## 5. Suggested order of work
 

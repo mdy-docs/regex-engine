@@ -74,7 +74,7 @@ static ASTNode* parse_primary(Lexer* lexer) {
         bool is_noncap = (lexer->current.type == TOK_NONCAP_GROUP);
         bool is_named = (lexer->current.type == TOK_NAMED_GROUP);
         bool is_modifier = (lexer->current.type == TOK_MODIFIER_GROUP);
-        char name[32] = {0};
+        char name[MAX_GROUP_NAME] = {0};
         int flags_on = 0, flags_off = 0;
         if (is_named) strcpy(name, lexer->current.name);
         if (is_modifier) {

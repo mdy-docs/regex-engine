@@ -35,7 +35,7 @@ typedef struct {
     int class_id;
     int min;
     int max;
-    char name[32];
+    char name[MAX_GROUP_NAME];
     int flags_on;
     int flags_off;
 } Token;
@@ -77,7 +77,7 @@ typedef enum {
 
 typedef struct ASTNode {
     ASTType type; uint32_t ch; int id; int min; int max; bool lazy;
-    char name[32];
+    char name[MAX_GROUP_NAME];
     int flags_on; int flags_off;
     struct ASTNode* left; struct ASTNode* right;
     /* Height of this node's subtree (leaves are 1); maintained incrementally
@@ -90,7 +90,7 @@ typedef struct ASTNode {
 } ASTNode;
 
 typedef struct {
-    char names[MAX_GROUPS][32];
+    char names[MAX_GROUPS][MAX_GROUP_NAME];
     int count;
 } NameSet;
 
