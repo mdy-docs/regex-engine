@@ -42,22 +42,23 @@ Compiler (compile_node)  --- walks the AST once, emits Instruction[]
 Program  (Instruction[] + CharClass[] + group metadata + flags)
    |
    v
-VM (vm_execute_internal) --- backtracking interpreter over Program.code,
+VM (vm_execute + VMContext) - backtracking interpreter over Program.code,
                               invoked once per candidate start offset by
-                              the caller (regex_exec in regex_wasm.c)
+                              the caller (regex_exec in regex_wasm.c),
+                              with one VMContext reused across the scan
 ```
 
-`compile_into` (`re_compiler.c:208`) is the single entry point that drives
+`compile_into` (`re_compiler.c:317`) is the single entry point that drives
 lexer → parser → validation → compiler and populates a caller-owned
 `Program`. There is no separate "optimize" pass — bytecode is emitted
 directly from the AST in one recursive walk (`compile_node`,
-`re_compiler.c:66`).
+`re_compiler.c:129`).
 
-## The `Program` struct — why it's all fixed-size arrays
+## The `Program` struct — why it's (almost) all fixed-size arrays
 
 ```c
 typedef struct {
-    Instruction code[MAX_OPCODES];       // 16384
+    Instruction code[MAX_OPCODES];       // 32768
     CharClass classes[MAX_CLASSES];      // 64
     char group_names[MAX_GROUPS][32];    // 255
     int code_count, class_count, group_count, counter_count;
@@ -66,18 +67,28 @@ typedef struct {
 } Program;
 ```
 
-No `malloc` happens during *compilation* except the one
-`malloc(sizeof(Program))` (or `sizeof(RegexHandle)` in the WASM shim) up
-front — `Program` itself is ~2MB of fixed-size arrays, deliberately sized to
-avoid any dynamic growth logic in a component meant to run inside a WASM
-sandbox with no realloc-heavy allocator pressure. (*Matching* allocates a
-`VMContext` — backtrack stacks, capture arenas, fail caches — once per
-`regex_exec` call, reused across every start position; see the VM section
-below.) `compile_into`'s top
-comment (`re_compiler.c:208`) explains why it *doesn't* zero the whole struct on
-each compile (`= {0}` would touch all ~2MB) — only the bookkeeping counters
-and `group_names` (which is read by name lookups even for slots that were
-never written) get reset.
+`Program` itself is ~2MB of fixed-size arrays, deliberately sized to avoid
+dynamic growth logic in a component meant to run inside a WASM sandbox
+with no realloc-heavy allocator pressure. The **one deliberate exception**
+is each `CharClass`'s string set (`\q{…}` alternatives and Unicode
+"properties of strings"): `CharClass.strings` is a heap-allocated,
+right-sized buffer grown on demand during compilation — `\p{RGI_Emoji}`
+alone carries 2604 sequences, which embedded inline at `MAX_CLASSES`
+scale would add >10MB to every `Program` (see `CharClass` in
+`include/regexp.h` for the ownership rules, and the since-fixed
+`docs/CONFORMANCE_GAPS.md` #3 for the 128-sequence truncation this
+replaced). Consequences: a `Program` must be **zero-initialized before
+its first `compile_into`** (`regex_compile` uses `calloc`), re-compiling
+into the same `Program` frees the previous compile's buffers, and
+teardown must release them (`regex_free` does; a native host driving
+`compile_into` directly calls the public `class_strings_free` per class).
+(*Matching* allocates a `VMContext` — backtrack stacks, capture arenas,
+fail caches — once per `regex_exec` call, reused across every start
+position; see the VM section below.) `compile_into`'s top comment
+(`re_compiler.c:317`) explains why it *doesn't* zero the whole struct on
+each compile (`= {0}` would touch all ~2MB) — only the bookkeeping
+counters and `group_names` (which is read by name lookups even for slots
+that were never written) get reset.
 
 All of `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS`/`MAX_COUNTERS` are
 enforced at their allocation sites (they originally weren't — see
@@ -91,45 +102,76 @@ pattern — a new unchecked site reintroduces exactly #1.2's bug.
 ## Lexer (`re_lexer.c`; `Lexer`/`Token` types in `re_internal.h`)
 
 One token of lookahead (`lexer->current`), hand-written character-class
-dispatch in `next_token` (`re_lexer.c:823`). Notable pieces:
+dispatch in `next_token` (`re_lexer.c:1289`). Notable pieces:
 
-- `decode_utf16_lexer` (`re_lexer.c:24`) advances by one *code point* when
+- `decode_utf16_lexer` (`re_lexer.c:26`) advances by one *code point* when
   `prog->unicode` is set (surrogate-pair aware), one *code unit* otherwise —
   this is the general pattern throughout the engine: unicode-mode
   operations are code-point-based, non-unicode-mode operations are
   UTF-16-code-unit-based (see `docs/IMPROVEMENTS.md`'s note on the `255`
   cap bug, which violates this pattern in one place).
 - Escape sequences (`\d`, `\p{...}`, `\u{...}`, `\k<name>`, `\cX`, etc.) are
-  all resolved inside `next_token`'s `case '\\':` block or inside
-  `parse_char_class` for class-internal escapes — there's no separate
+  all resolved inside `next_token`'s `case '\\':` block or inside the
+  class parsers for class-internal escapes — there's no separate
   escape-resolution pass.
-- Character classes (`[...]`) are parsed by `parse_char_class`
-  (`re_lexer.c:542`), which also implements `/v`-mode set operations (`&&`,
-  `--`, nested `[...]`) and `\q{...}` string-literal alternatives in
-  classes — these are `/v`-only (`unicode_sets`) ECMAScript 2024 features,
-  gated on `lexer->prog->unicode_sets`.
+- Character classes (`[...]`) have **two parsers for two grammars**:
+  `parse_char_class` (`re_lexer.c:759`) handles `/u` and legacy modes,
+  while `/v` (`unicode_sets`) classes go to `parse_char_class_v`
+  (`re_lexer.c:1196`) — a genuinely different ECMAScript 2024 grammar
+  (`ClassSetExpression`) with set operators (`&&` intersection, `--`
+  subtraction, both over single operands only and never mixed), nested
+  classes, `\q{...}` string-alternative disjunctions (`parse_q_strings`,
+  `re_lexer.c:988`; single-codepoint alternatives normalize into the
+  codepoint ranges, so set ops see them there), reserved/doubled
+  punctuators as syntax errors, and set algebra over the codepoint and
+  string components independently (`class_union_v` /
+  `class_intersect_v` / `class_subtract_v`). Everything is evaluated to
+  one concrete `CharClass` at compile time — no expression tree survives
+  parsing. Nested-class recursion shares the parser's `MAX_AST_DEPTH`
+  guard via `Lexer.parse_depth`, and each frame's ~25KB `CharClass`
+  operand scratch is heap-allocated so that guard's full depth can't
+  overflow the C stack.
+- Case-insensitive matching is a **compile-time set transformation, not a
+  match-time comparison**, for everything except single `OP_CHAR`
+  literals: `apply_case_folding` (`re_lexer.c:559`) closes a class's
+  ranges under simple case folding (`/u`/`/v`) or Annex B canonicalization
+  (legacy), and the built-in escapes (`\w` → `fill_builtin_class`),
+  `\p{...}`/`\P{...}` (`parse_property_escape_class`, `re_lexer.c:704`),
+  and `/v` operands all fold as they are built. Ordering is load-bearing:
+  positive sets fold **before** `\W`/`\D`/`\S` complement (or a character
+  could match both `\w` and `\W`), and `\P`'s fold/complement order
+  differs between `/iu` and `/iv` — the comments at those functions carry
+  the Node-verified details (`docs/CONFORMANCE_GAPS.md`, since-fixed
+  gaps #1–#2).
 - `CharClass` ranges are kept **sorted and coalesced** by `add_range`
-  (`re_lexer.c:234`) — every insertion merges into adjacent/overlapping
+  (`re_lexer.c:316`) — every insertion merges into adjacent/overlapping
   ranges, so `cls->ranges` is always a minimal sorted disjoint-range
-  representation. This is what makes `OP_CLASS` matching a linear scan over
-  a small range list rather than a per-character membership test.
+  representation. This is what lets `OP_CLASS` matching binary-search the
+  range list (`class_contains`, `re_vm.c:132`) instead of scanning it —
+  `\p{L}` alone is ~700 ranges, paid per text position.
+- `CharClass` string sets are heap-owned (`class_strings_push` /
+  `class_strings_free`, `re_lexer.c:291`) — right-sized buffers with
+  deep-copy/ownership-transfer discipline, not fixed arrays; see the
+  `Program` section above.
 - Capture group names go through `parse_group_name` /
   `rx_idname_cp` / `rx_is_id_start` / `rx_is_id_continue`
-  (`re_lexer.c:90–233`), which implement the actual ECMAScript
+  (`re_lexer.c:130–283`), which implement the actual ECMAScript
   `RegExpIdentifierName` grammar (including `\u` escapes *inside* a group
   name, e.g. `(?<a>x)`) against the UCD `ID_Start`/`ID_Continue`
   binary-search tables — not a simplified ASCII-only approximation.
-- `fill_unicode_property` (`re_lexer.c:342`) has a small LRU-less cache
+- `fill_unicode_property` (`re_lexer.c:479`) has a small LRU-less cache
   (`prop_cache`, 64 entries) so repeated `\p{...}` escapes for the same
   property across one compile don't redo the UCD range union each time —
   cache is compile-scoped in practice since it's a `static` file-scope
   array that just grows across the process lifetime (see
-  `docs/IMPROVEMENTS.md` for the thread-safety implication). It also feeds
-  `CharClass.strings` for "properties of strings" (`\p{RGI_Emoji}` and
-  similar, `/v`-mode only) — see `docs/IMPROVEMENTS.md`'s "Fixed since this
-  analysis" section for how those actually get matched, since a single
-  `OP_CLASS` instruction can't do it (that part lives in `re_compiler.c`'s
-  `compile_class_with_strings`, described below).
+  `docs/IMPROVEMENTS.md` for the thread-safety implication). The cache
+  holds **ranges only** plus a pointer back to the generated
+  `UCDProperty`: string sequences for "properties of strings"
+  (`\p{RGI_Emoji}` and similar, `/v`-mode only) are re-copied from the
+  immutable `ucd.h` table on every use, so the process-lifetime cache
+  never owns heap string buffers. How those strings actually get
+  *matched* — a single `OP_CLASS` instruction can't do it — lives in
+  `re_compiler.c`'s `compile_class_with_strings`, described below.
 
 ## Parser (`re_parser.c`)
 
@@ -163,74 +205,90 @@ the four walkers above — or the parser's own recursion, for deeply nested
 groups/alternation — ever gets that deep.
 
 Group numbering happens during parsing, not compilation:
-`parse_primary`'s group case (`re_parser.c:77`) does
-`node->id = ++lexer->prog->group_count` immediately, so group numbers are
-assigned in the order groups' **opening parens** appear in the source —
-standard ECMAScript numbering.
+`parse_primary`'s group case (`re_parser.c:106`) claims
+`gid = ++lexer->prog->group_count` at the **opening paren**, before the
+body is parsed, so group numbers follow source order of `(` — standard
+ECMAScript numbering.
 
-## Compiler (`compile_node`, `re_compiler.c:66`)
+## Compiler (`compile_node`, `re_compiler.c:129`)
 
 One switch over `ASTNode.type`, walked once, emitting directly into
-`prog->code[]` via `emit()` (`re_compiler.c:24`). A few things worth
-knowing before you touch this:
+`prog->code[]` via `emit()` (`re_compiler.c:35`). Match-time flag
+decisions are **baked into instructions as they're emitted** rather than
+read from `prog->*` at match time — `OP_CHAR`/backrefs carry effective
+`ignore_case` in `arg2`, anchors carry effective `multiline` in `arg1`,
+and `\b`/`\B` carry effective `ignore_case` in `arg1` (for `/iu`'s
+fold-aware word-character set) — because `AST_MODIFIER_GROUP`
+(`(?i:...)`/`(?-s:...)`) toggles those `prog` fields only for the
+duration of the body's compile walk (the parser does the equivalent
+toggle around the body's *lex*, for `.` and classes, which are built at
+lex time). A few more things worth knowing before you touch this:
 
 - **Quantifiers compile to a counter loop, not unrolled repetition.**
-  `AST_QUANTIFIER` (`re_compiler.c:152`) emits `OP_INIT_COUNTER` /
-  `OP_CHECK_COUNTER` / body / `OP_INC_COUNTER` / `OP_JMP` back to the
-  check. `OP_CHECK_COUNTER` carries `min`/`max`/`exit_pc` and a `lazy` bit,
-  and the VM's handling of it (`re_vm.c:349`) is where greedy-vs-lazy
+  `AST_QUANTIFIER` (`re_compiler.c:233`) emits `OP_INIT_COUNTER` /
+  `OP_CHECK_COUNTER` / `OP_CLEAR_CAPTURES` (resetting the captures of
+  groups defined inside the body at the top of each iteration, per
+  ECMA-262's RepeatMatcher — `group_id_range` computes the contiguous id
+  span) / body / `OP_INC_COUNTER` / `OP_JMP` back to the check.
+  `OP_CHECK_COUNTER` carries `min`/`max`/`exit_pc` and a `lazy` bit,
+  and the VM's handling of it (`re_vm.c:585`) is where greedy-vs-lazy
   actually branches: greedy pushes the "give up and exit" thread onto the
   backtrack stack and continues into the body first; lazy does the
   opposite. Each quantifier gets its own counter slot
-  (`prog->counter_count++`) — this is the `MAX_COUNTERS` = 16 resource this
-  repo's `docs/IMPROVEMENTS.md` flags as unbounded.
+  (`prog->counter_count++`), bounds-checked against `MAX_COUNTERS` = 16.
 - **Lookaround compiles to an out-of-line subroutine plus a jump around
-  it.** `AST_LOOKAHEAD`/`AST_LOOKBEHIND` (`re_compiler.c:125`) emit an
+  it.** `AST_LOOKAHEAD`/`AST_LOOKBEHIND` (`re_compiler.c:206`) emit an
   unconditional `OP_JMP` past the lookaround body, compile the body inline
   right after the jump (so it's reachable by PC but not by fallthrough),
   terminate it with `OP_MATCH`, then patch the jump target and emit
   `OP_LOOKAHEAD`/`OP_LOOKBEHIND` (whose `arg1` is the body's start PC) at
   the point where control actually flows. At runtime, `OP_LOOKAHEAD` etc.
-  (`re_vm.c:309`) don't jump to that PC at all — they make a **fresh
-  recursive call to `vm_execute_internal`** starting at that PC, with a
+  (`re_vm.c:520`) don't jump to that PC at all — they make a **fresh
+  recursive call to `vm_run`** at `depth + 1`, starting at that PC, with a
   copy of the current captures, and only splice the captures back in on
   success. This is why lookaround is a real recursive call (C stack, not
-  the VM's own thread stack) — deeply nested lookarounds cost C stack
-  frames.
+  the VM's own thread stack) — though each depth's heavy scratch
+  (backtrack stack, arena, fail cache) lives in the `VMContext`'s
+  per-depth slots on the heap, so the C frames themselves are small
+  (`docs/IMPROVEMENTS.md` #1.1 has the ~2.2MB-per-frame history).
 - **Lookbehind reuses the same compiler in reverse (`rtl=true`).**
-  `compile_node`'s `rtl` parameter (`re_compiler.c:66`) flips `AST_CONCAT`'s
+  `compile_node`'s `rtl` parameter (`re_compiler.c:129`) flips `AST_CONCAT`'s
   emission order and `AST_GROUP`'s save-instruction order, so the *same*
   AST for the lookbehind body compiles into bytecode that matches
-  right-to-left. The VM's `step` parameter (`vm_execute_internal`'s 2nd-to-
-  last-but-one arg, +1 or -1) then walks `sp` backward instead of forward
+  right-to-left. The VM's `step` parameter (+1 or -1) then walks `sp`
+  backward instead of forward
   for `OP_CHAR`/`OP_CLASS`/backreference matching — every one of those
   opcode handlers in the VM has a `step > 0` / `else` branch pair
-  (`re_vm.c:106` onward) implementing forward vs. backward matching
+  (`re_vm.c:335` onward) implementing forward vs. backward matching
   logic side by side. If you fix a bug in one branch, check whether the
   mirror branch has the same bug — several of `docs/IMPROVEMENTS.md`'s
   findings are exactly this (a bounds check present on one side, missing
-  on the other).
-- **Backreferences resolve group *numbers* at compile time even for named
-  backrefs.** `AST_NAMED_BACKREF` (`re_compiler.c:74`) looks up the name
-  against `prog->group_names[]` at compile time and emits a plain
-  `OP_BACKREF` with the resolved numeric id — `OP_NAMED_BACKREF` exists as
-  an opcode and has VM support (`re_vm.c:216`, the
-  `inst.op == OP_NAMED_BACKREF` branch re-resolves by name at *runtime* to
-  handle the "duplicate group name across mutually-exclusive alternation
-  branches" ES2025 case) but is never actually emitted by the compiler —
-  `AST_NAMED_BACKREF` always emits `OP_BACKREF`. That runtime-resolution VM
-  code path is currently dead; worth knowing before assuming
-  `OP_NAMED_BACKREF` is reachable.
+  on the other). The surrogate decoding itself is shared
+  (`decode_utf16`/`decode_utf16_backward`), extracted from what used to be
+  four independently-maintained inline copies.
+- **Named backreferences resolve at *match* time, not compile time.**
+  `AST_NAMED_BACKREF` (`re_compiler.c:147`) emits `OP_NAMED_BACKREF`, and
+  the VM's handler (`re_vm.c:426`) searches all same-named group ids for
+  the one that actually *participated* in the match — required for ES2025
+  duplicate group names across mutually-exclusive alternation branches,
+  where which `(?<x>…)` a `\k<x>` refers to is only knowable at runtime.
+  (Numeric backrefs still compile to `OP_BACKREF` with the id baked in.)
 - **Character classes containing multi-codepoint strings** (`\q{...}` or a
-  Unicode "property of strings" like `\p{RGI_Emoji_Flag_Sequence}`, `/v`
+  Unicode "property of strings" like `\p{RGI_Emoji}`, `/v`
   mode only) don't compile to a plain `OP_CLASS` — `compile_class_with_strings`
-  (`re_compiler.c:42`) expands them into a real `OP_SPLIT`/`OP_CHAR`
+  (`re_compiler.c:69`) expands them into a real `OP_SPLIT`/`OP_CHAR`
   alternation instead, since a single `OP_CLASS` instruction can only ever
-  test one code point. See `docs/IMPROVEMENTS.md`'s "Fixed since this
-  analysis" section for the bug this fixed and why an alternation (reusing
-  existing VM machinery) was chosen over a new opcode.
+  test one code point. Strings are emitted **longest-first** (a stable
+  `qsort` over heap-sized scratch — the spec's v-mode matcher tries string
+  alternatives in descending length order, and the `OP_SPLIT` chain's
+  emission order is its preference order), then the ordinary
+  single-codepoint ranges as a trailing `OP_CLASS` branch. See
+  `docs/IMPROVEMENTS.md`'s "Fixed since this analysis" section for why an
+  alternation (reusing existing VM backtracking) was chosen over a new
+  opcode — a one-shot string matcher couldn't backtrack from `\q{ab|a}`'s
+  longer alternative to its shorter one.
 
-### Opcodes (`include/regexp.h:22`)
+### Opcodes (`include/regexp.h:53`)
 
 | Opcode | Meaning |
 |---|---|
@@ -241,10 +299,10 @@ knowing before you touch this:
 | `OP_LOOKAHEAD`/`OP_NEG_LOOKAHEAD`/`OP_LOOKBEHIND`/`OP_NEG_LOOKBEHIND` | recursive sub-match, no `sp` consumption on success |
 | `OP_MATCH` | success (top-level or lookaround-subroutine) |
 | `OP_INIT_COUNTER`/`OP_INC_COUNTER`/`OP_CHECK_COUNTER` | bounded-repetition loop control |
-| `OP_ASSERT_START`/`OP_ASSERT_END` | `^`/`$` (multiline-aware) |
-| `OP_BACKREF`/`OP_NAMED_BACKREF` | match previously captured text |
-| `OP_WORD_BOUNDARY`/`OP_NON_WORD_BOUNDARY` | `\b`/`\B` |
-| `OP_CLEAR_CAPTURES` | **defined, VM-implemented, never emitted by the compiler** — see `docs/IMPROVEMENTS.md`; this is the missing piece behind the "stale captures from earlier alternation branch survive a later iteration" bug |
+| `OP_ASSERT_START`/`OP_ASSERT_END` | `^`/`$` (multiline baked into `arg1`) |
+| `OP_BACKREF`/`OP_NAMED_BACKREF` | match previously captured text (numeric id baked in / re-resolved by name at match time for ES2025 duplicate names) |
+| `OP_WORD_BOUNDARY`/`OP_NON_WORD_BOUNDARY` | `\b`/`\B` (`arg1` = effective ignoreCase; under `/iu` the word set folds, adding U+017F/U+212A) |
+| `OP_CLEAR_CAPTURES` | reset captures `[arg1..arg2]` — emitted at the top of every quantifier iteration so a group that doesn't participate in the final iteration reads as unset (ECMA-262 RepeatMatcher; `docs/IMPROVEMENTS.md` #1.8) |
 
 ## VM (`vm_run` via `vm_execute`/`VMContext`, `re_vm.c`)
 
@@ -299,7 +357,7 @@ typedef struct {
   helper that copies the *data* `.captures` points to explicitly, into the
   destination thread's own already-assigned slice.
 - `fail_cache` (`CacheEntry`, one per context depth slot,
-  `CACHE_SIZE` = 8192, `include/regexp.h:11`) is the ReDoS mitigation:
+  `CACHE_SIZE` = 8192, `include/regexp.h:15`) is the ReDoS mitigation:
   before running a popped thread, `hash_state` (power-of-two mask, not a
   division) hashes
   `(pc, sp, counters[])` and checks whether that exact state was already
@@ -308,26 +366,35 @@ typedef struct {
   so, the thread is dropped without re-running. This is what keeps classic
   catastrophic-backtracking patterns like `(a+)+$` fast in practice (see
   `docs/IMPROVEMENTS.md`'s "positive finding" — this genuinely works for
-  the common cases). It's allocated fresh per call, including per
-  recursive lookaround call, so it does **not** protect across a
-  lookaround boundary — a quantifier *containing* a lookaround that itself
-  contains a quantifier gets a fresh, uncorrelated cache for the inner
-  call each time the outer one is retried.
-- Each opcode handler is a big `if`/`else if` chain (not a jump table /
-  `switch`) inside the innermost `while (true)` loop (`re_vm.c:172`
-  onward) — this is the hot loop; see `docs/IMPROVEMENTS.md`'s performance
-  section for the `switch` vs `if`-chain tradeoff here.
+  the common cases). Each recursion depth's cache is allocated once per
+  context but **generation-cleared on every VM entry at that depth**, so
+  it does **not** protect across a lookaround boundary — a quantifier
+  *containing* a lookaround that itself contains a quantifier gets a
+  logically fresh, uncorrelated cache for the inner call each time the
+  outer one is retried.
+- Opcode dispatch is a dense `switch` over the opcode enum
+  (`re_vm.c:334`) inside the innermost `while (true)` loop — it compiles
+  to a jump table where the original `if`/`else if` chain compiled to
+  sequential compares (`docs/IMPROVEMENTS.md` §2 has the measurement);
+  each case's `path_failed = true; break;` idiom breaks the switch, and
+  the `if (path_failed) break;` after it completes the loop exit.
 - `OP_CHAR`/`OP_CLASS`/backreference matching each have a `step > 0` branch
   (forward, used for normal matching and lookahead) and a `step <= 0`
-  branch (backward, used for lookbehind) that independently reimplement
-  surrogate-pair decoding, case-folding, and bounds checks. They are *not*
-  shared helper functions — this duplication is the root cause of several
-  "bug fixed on one side, not the mirror side" findings.
+  branch (backward, used for lookbehind) implementing the matching logic
+  side by side — the surrogate decoding itself is shared
+  (`decode_utf16`/`decode_utf16_backward`), but the case-folding and
+  bounds logic around it is still per-branch; check the mirror branch
+  when fixing either side.
+- `is_word_char_fold` (`re_vm.c:92`) is the `\b`/`\B` word-character
+  test: plain ASCII `[a-zA-Z0-9_]`, widened via `unicode_casefold` when
+  the instruction's baked-in ignoreCase bit *and* `prog->unicode` are
+  both set (ECMA-262 `GetWordCharacters` — exactly U+017F and U+212A in
+  current Unicode, but derived from the fold table, not hardcoded).
 
-`vm_get_indices` (`re_vm.c:379`) is the only other public entry point —
+`vm_get_indices` (`re_vm.c:643`) is the only other public entry point —
 it converts the VM's raw `const uint16_t*` capture pointers back into
 integer offsets relative to `original_text`, which is what
-`regex_exec` (`src/regex_wasm.c:132`) calls after a successful match.
+`regex_exec` (`src/regex_wasm.c:137`) calls after a successful match.
 
 ## Unicode data (`include/ucd.h`, `scripts/generate_ucd.py`)
 
@@ -353,7 +420,14 @@ spec's table-binary-unicode-properties (data-file extras like contributory
 properties are deliberately not emitted — real engines reject them), and
 the grouped General_Category values (`Letter`, `LC`, `punct`, ...) are
 pre-computed unions, so `re_lexer.c` needs no alias/grouping special
-cases. Also generated: case-folding pairs
+cases. "Properties of strings" (`RGI_Emoji` and friends) additionally
+carry a `UCDStringSequence[]` array of multi-codepoint sequences; those
+come from `emoji-sequences.txt`/`emoji-zwj-sequences.txt`, which Unicode
+stopped publishing under versioned `Public/emoji/<ver>/` directories
+after 16.0 — the script fetches `Public/emoji/latest/` and **hard-verifies
+each file's `# Version:` header against the pinned `EMOJI_SEQ_VERSION`**,
+so a silent upstream move to a newer emoji version fails generation
+instead of drifting the data. Also generated: case-folding pairs
 (`UCD_CASE_FOLD[]`, binary-searched by `unicode_casefold`), simple upper/
 lowercase mappings, combining-class/decomposition/composition-exclusion
 tables (present in `ucd.h` but currently **unused** by the engine — no
@@ -363,14 +437,18 @@ data.
 ## WASM shim (`src/regex_wasm.c`)
 
 Thin opaque-handle wrapper: `RegexHandle` bundles a `Program` (embedded by
-value — this is where that ~2MB comes from per handle) with a separately
-`malloc`'d `int32_t* captures` buffer sized to `(group_count+1)*2`. All
+value — this is where that ~2MB comes from per handle; `calloc`'d, since
+`compile_into` requires a zero-initialized `Program` before first use)
+with a separately `malloc`'d `int32_t* captures` buffer sized to
+`(group_count+1)*2`. `regex_free` — and every `regex_compile` failure
+path — also releases each class's heap-owned string set via
+`class_strings_free` (see the `Program` section above). All
 state (the last compile error, the current handle's captures) is accessed
 through the handle or a single `static g_last_error` buffer — there's
 **no thread-local isolation**, matching the fact that a WASM module
 instance is single-threaded by default; don't assume this is safe to call
 from multiple Web Workers sharing one instantiated module. `regex_exec`
-(`src/regex_wasm.c:132`) is also where the **global (non-sticky) search
+(`src/regex_wasm.c:137`) is also where the **global (non-sticky) search
 loop** lives — it's the shim, not the engine core, that scans start offsets
 looking for the first match, advancing by code point under `/u`/`/v` so a
 surrogate pair is never split mid-scan.
