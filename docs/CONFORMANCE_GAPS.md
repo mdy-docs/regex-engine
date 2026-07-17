@@ -19,24 +19,6 @@ Verify every fix the way the rest of this repo does: diff against Node
 
 ---
 
-## 3. [real/feature] Full multi-codepoint sequence coverage (RGI_Emoji cap)
-
-**Fails:** `unicodeSets/generated/rgi-emoji-*.js`, and any real use of the
-five large properties-of-strings (`RGI_Emoji` has 2604 sequences,
-`RGI_Emoji_ZWJ_Sequence` 1468, …) expecting full coverage.
-
-**What's wrong:** `CharClass.strings` is a fixed `[128]` array
-(`include/regexp.h`), so these properties match only their first 128
-sequences. Documented at length in `docs/IMPROVEMENTS.md` ("Residual
-limitation surfaced by this fix").
-
-**Approach:** the honest fix is to stop storing sequence sets inline in the
-fixed-size `Program`. Options: a separate heap-allocated, right-sized
-sequence pool referenced by the class; or (since these are compile-time
-constants) point directly at the `ucd.h` `UCDStringSequence[]` arrays
-instead of copying. The latter is cleanest but changes the `CharClass`
-ownership model. Weigh against the ~2MB `Program` footprint goal.
-
 ## 4. [scope] Match-result object descriptors
 
 **Fails:** `match-indices/indices-property.js`,

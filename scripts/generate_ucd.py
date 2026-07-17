@@ -10,13 +10,18 @@ if not os.path.exists(CACHE_DIR):
 # Unicode version to generate against. Bump this (and re-run) to update ucd.h.
 UNICODE_VERSION = "17.0.0"
 # Emoji sequence files (emoji-sequences.txt / emoji-zwj-sequences.txt) are
-# released on their own cadence under Public/emoji/<ver>/. There is no emoji/17.0
-# release, so pin the latest published set. (emoji-data.txt lives inside the UCD
-# tree and does track UNICODE_VERSION.)
-EMOJI_SEQ_VERSION = "16.0"
+# released on their own cadence under Public/emoji/. Unicode stopped minting
+# a versioned Public/emoji/<ver>/ directory after 16.0 -- the 17.0 files are
+# served only from Public/emoji/latest/ -- so fetch from `latest` but verify
+# each file's own "# Version:" header matches this pin: `latest` will
+# silently become 18.0 one day (18.0 already exists in Public/draft/), and a
+# version bump here must stay a deliberate act, not a side effect of
+# regenerating. (emoji-data.txt lives inside the UCD tree and does track
+# UNICODE_VERSION.)
+EMOJI_SEQ_VERSION = "17.0"
 
 UCD_BASE = f"https://www.unicode.org/Public/{UNICODE_VERSION}/ucd/"
-EMOJI_URL = f"https://www.unicode.org/Public/emoji/{EMOJI_SEQ_VERSION}/"
+EMOJI_URL = "https://www.unicode.org/Public/emoji/latest/"
 
 def get_ucd_file(url):
     # Key the cache on the full URL path so different Unicode/Emoji versions do
@@ -172,6 +177,14 @@ string_ranges = {}
 
 def parse_emoji_sequences(url):
     content = get_ucd_file(url)
+    version_lines = [l for l in content.splitlines() if l.startswith("# Version:")]
+    if not version_lines or version_lines[0].split(":", 1)[1].strip() != EMOJI_SEQ_VERSION:
+        found = version_lines[0].split(":", 1)[1].strip() if version_lines else "<missing>"
+        raise SystemExit(
+            f"{url}: expected emoji data version {EMOJI_SEQ_VERSION}, got {found} -- "
+            f"Public/emoji/latest/ has moved on; bump EMOJI_SEQ_VERSION deliberately "
+            f"(and clear the cache dir) if that's intended."
+        )
     for line in content.splitlines():
         line = line.split('#')[0].strip()
         if not line: continue

@@ -91,20 +91,17 @@ regression coverage added to `test/smoke.c`:
   now correctly fails to compile, matching real engines, instead of
   silently doing nothing.
 
-  **Residual limitation surfaced by this fix, not introduced by it:**
-  `CharClass.strings` is a fixed `[128]` array (same size `\q{...}` parsing
-  already enforced before this fix). Several real Unicode properties have
-  far more sequences than that — `RGI_Emoji` has 2604, `RGI_Emoji_ZWJ_Sequence`
-  1468, `RGI_Emoji_Modifier_Sequence` 655, `RGI_Emoji_Flag_Sequence` 259,
-  `Basic_Emoji` 207 — so those specific properties now match their first
-  128 sequences (in generation order) rather than silently matching
-  nothing, but still don't match *every* valid sequence. Raising the cap to
-  fit the largest property in full (2604) would add well over 10MB to
-  `Program` (already the dominant cost at ~2MB, per `docs/ARCHITECTURE.md`)
-  for a single class slot — the same fixed-size-vs-unbounded-input tension
-  as finding 1.2 above, not a new problem, and out of scope for this fix to
-  resolve. Worth knowing if a consuming project leans on one of the five
-  large properties named above expecting full coverage.
+  **Residual limitation surfaced by this fix — since resolved
+  (CONFORMANCE_GAPS #3):** `CharClass.strings` was a fixed `[128]` array,
+  so the large properties of strings (`RGI_Emoji` has 2604 sequences,
+  `RGI_Emoji_ZWJ_Sequence` 1468, `RGI_Emoji_Modifier_Sequence` 655,
+  `RGI_Emoji_Flag_Sequence` 259, `Basic_Emoji` 207) matched only their
+  first 128 sequences. The string set is a heap-allocated, right-sized
+  buffer now (grown on demand, freed at handle teardown — see `CharClass`
+  in `include/regexp.h` for the ownership rules), which sidesteps the
+  raise-the-cap-inline option that would have added >10MB to the ~2MB
+  `Program`; `MAX_OPCODES` doubled to 32768 so a full `\p{RGI_Emoji}`
+  alternation (~17.5k instructions) compiles.
 
 - **Nested capture groups were numbered backwards.** The parser assigned
   `node->id = ++group_count` only *after* a group's body had been parsed,
@@ -974,10 +971,12 @@ assertions, native) and `test/node_smoke.mjs` (13 against the real compiled
   them locally). Current status: **286 pass, 11 known failures**, all
   triaged in the expectations file — 3 are match-result-object descriptor
   plumbing (out of a standalone matcher's scope), the rest real,
-  documented gaps (Unicode case folding of built-in class escapes under
-  `/iu`; the `Unknown`/`Zzzz` script value; `\p{...}` as a class-range
-  endpoint; and, under `--generated`, `/v` set operations and the
-  RGI_Emoji 128-sequence cap). **Standing this up found and fixed two real
+  documented gaps, every one of which has since been closed (Unicode case
+  folding of built-in class escapes under `/iu`; the `Unknown`/`Zzzz`
+  script value; `\p{...}` as a class-range endpoint; and, under
+  `--generated`, `/v` set operations and the RGI_Emoji 128-sequence cap —
+  see `docs/CONFORMANCE_GAPS.md`, whose numbered entries are all resolved
+  and deleted except the out-of-scope #4). **Standing this up found and fixed two real
   engine bugs**: inline modifier groups (`(?i:...)`, `(?s:...)`) were
   parsed but never took effect, because a group body's `.`/classes are
   built at *lex* time from `prog->dot_all`/`ignore_case` — the parser now

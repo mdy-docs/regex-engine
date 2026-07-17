@@ -74,7 +74,10 @@ int regex_flag_bit(int flag_char) {
 EMSCRIPTEN_KEEPALIVE
 uintptr_t regex_compile(const uint16_t* pattern, int pattern_units, int flags) {
     (void)pattern_units; /* compile_into expects a NUL-terminated unit buffer */
-    RegexHandle* h = (RegexHandle*)malloc(sizeof(RegexHandle));
+    /* calloc, not malloc: compile_into requires a zero-initialized Program
+     * before its first use, so the heap-owned class string buffers (see
+     * CharClass in regexp.h) are never freed from garbage pointers. */
+    RegexHandle* h = (RegexHandle*)calloc(1, sizeof(RegexHandle));
     if (!h) {
         set_last_error("OutOfMemory: could not allocate Program");
         return 0;
@@ -83,6 +86,7 @@ uintptr_t regex_compile(const uint16_t* pattern, int pattern_units, int flags) {
     compile_into(&h->prog, pattern, flags);
     if (h->prog.error) {
         set_last_error(h->prog.error);
+        for (int i = 0; i < h->prog.class_count; i++) class_strings_free(&h->prog.classes[i]);
         free(h);
         return 0;
     }
@@ -90,6 +94,7 @@ uintptr_t regex_compile(const uint16_t* pattern, int pattern_units, int flags) {
     h->captures = (int32_t*)malloc(sizeof(int32_t) * (size_t)pair_count);
     if (!h->captures) {
         set_last_error("OutOfMemory: could not allocate capture buffer");
+        for (int i = 0; i < h->prog.class_count; i++) class_strings_free(&h->prog.classes[i]);
         free(h);
         return 0;
     }
@@ -191,11 +196,13 @@ const int32_t* regex_captures_ptr(uintptr_t handle) {
     return h ? h->captures : NULL;
 }
 
-/* Releases everything associated with a compiled-pattern handle. */
+/* Releases everything associated with a compiled-pattern handle,
+ * including the classes' heap-owned string sets. */
 EMSCRIPTEN_KEEPALIVE
 void regex_free(uintptr_t handle) {
     RegexHandle* h = (RegexHandle*)(uintptr_t)handle;
     if (!h) return;
+    for (int i = 0; i < h->prog.class_count; i++) class_strings_free(&h->prog.classes[i]);
     free(h->captures);
     free(h);
 }

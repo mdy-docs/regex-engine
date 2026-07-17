@@ -14,6 +14,8 @@
  */
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "regexp.h"
@@ -52,30 +54,45 @@ static int emit(Program* prog, RegexOpCode op, int arg1, int arg2, int arg3, int
  * structured (ranges and sequences are disjoint code point sets in every
  * property this engine generates); rtl mirrors AST_CONCAT's lookbehind
  * handling by emitting each string's code points in reverse. */
+/* qsort comparator over {length, index} pairs: descending length, with the
+ * original index as tiebreak so equal-length strings keep declaration
+ * order (qsort itself is not stable). */
+typedef struct { int length; int index; } StringOrder;
+
+static int string_order_cmp(const void* pa, const void* pb) {
+    const StringOrder* a = (const StringOrder*)pa;
+    const StringOrder* b = (const StringOrder*)pb;
+    if (a->length != b->length) return b->length - a->length;
+    return a->index - b->index;
+}
+
 static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
     CharClass* cls = &prog->classes[class_id];
-    int jmp_pcs[128];
-    int jmp_count = 0;
-    /* Longest strings first (stable): the spec's v-mode CharacterClass
-     * matcher tries a class's string alternatives in descending length
-     * order, so \q{ab|abc} against "abc" must consume all three units.
-     * The VM's OP_SPLIT chain tries alternatives in emission order, so
-     * emission order IS preference order. */
-    int order[128];
-    for (int i = 0; i < cls->string_count; i++) order[i] = i;
-    for (int i = 1; i < cls->string_count; i++) {
-        int v = order[i], j = i;
-        while (j > 0 && cls->strings[order[j - 1]].length < cls->strings[v].length) {
-            order[j] = order[j - 1];
-            j--;
-        }
-        order[j] = v;
+    /* Heap scratch sized to the actual string count -- these were fixed
+     * [128] arrays back when the string set itself was capped at 128;
+     * a full \p{RGI_Emoji} is 2604 alternatives now. */
+    int* jmp_pcs = malloc(sizeof(int) * (size_t)cls->string_count);
+    StringOrder* order = malloc(sizeof(StringOrder) * (size_t)cls->string_count);
+    if (!jmp_pcs || !order) {
+        fprintf(stderr, "Fatal Error: Out of memory\n");
+        exit(EXIT_FAILURE);
     }
+    int jmp_count = 0;
+    /* Longest strings first: the spec's v-mode CharacterClass matcher
+     * tries a class's string alternatives in descending length order, so
+     * \q{ab|abc} against "abc" must consume all three units. The VM's
+     * OP_SPLIT chain tries alternatives in emission order, so emission
+     * order IS preference order. */
+    for (int i = 0; i < cls->string_count; i++) {
+        order[i].length = cls->strings[i].length;
+        order[i].index = i;
+    }
+    qsort(order, (size_t)cls->string_count, sizeof(StringOrder), string_order_cmp);
     for (int i = 0; i < cls->string_count; i++) {
         bool has_more = (i < cls->string_count - 1) || (cls->range_count > 0);
         int split = has_more ? emit(prog, OP_SPLIT, 0, 0, 0, 0, false) : -1;
         if (split != -1) prog->code[split].arg1 = prog->code_count;
-        StringSequence* seq = &cls->strings[order[i]];
+        StringSequence* seq = &cls->strings[order[i].index];
         if (rtl) {
             for (int k = seq->length - 1; k >= 0; k--) emit(prog, OP_CHAR, seq->cps[k], prog->ignore_case, 0, 0, false);
         } else {
@@ -89,6 +106,8 @@ static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
     if (cls->range_count > 0) emit(prog, OP_CLASS, class_id, 0, 0, 0, false);
     int end_pc = prog->code_count;
     for (int i = 0; i < jmp_count; i++) prog->code[jmp_pcs[i]].arg1 = end_pc;
+    free(jmp_pcs);
+    free(order);
 }
 
 /* Smallest and largest capture-group id *defined* inside this subtree --
@@ -300,7 +319,12 @@ void compile_into(Program* prog, const uint16_t* regex, int flags) {
      * dominated RegExp construction cost. Only the bookkeeping needs
      * initialisation: code[]/classes[] entries are fully written before use
      * and never read past their counts; group_names IS read by name lookups
-     * for unnamed groups, so it stays zeroed. */
+     * for unnamed groups, so it stays zeroed. Class string sets are heap-
+     * owned (see CharClass in regexp.h), so a re-compile into the same
+     * Program must release the previous compile's buffers first -- which
+     * also means a Program must be ZERO-initialized (calloc) before its
+     * FIRST compile_into, or this loop would free garbage pointers. */
+    for (int i = 0; i < prog->class_count; i++) class_strings_free(&prog->classes[i]);
     memset(prog->group_names, 0, sizeof(prog->group_names));
     prog->code_count = 0;
     prog->class_count = 0;

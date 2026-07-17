@@ -137,6 +137,13 @@ Notes:
   recompile per match attempt. If footprint matters for your target (e.g.
   compiling many distinct patterns at once), shrinking those `MAX_*`
   constants in `include/regexp.h` is the lever — see that file.
+- If you call `compile_into` directly (bypassing `regex_compile`), the
+  `Program` must be **zero-initialized before its first compile** (`calloc`
+  or `memset`), and released via per-class `class_strings_free` — class
+  string sets (`\q{…}`, Unicode properties of strings) are heap-owned,
+  right-sized buffers, not part of the fixed-size struct; `regex_compile`/
+  `regex_free` handle both automatically. See `CharClass` in
+  `include/regexp.h` for the ownership rules.
 - `regex_exec` honors the sticky (`/y`) and unicode (`/u`, `/v`) flags baked
   into the compiled pattern automatically (no need to pass them again):
   sticky anchors exactly at `start_index`; unicode mode advances the search

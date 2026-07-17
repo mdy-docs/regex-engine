@@ -1236,6 +1236,36 @@ int main(void) {
         }
     }
 
+    /* Full multi-codepoint sequence coverage (docs/CONFORMANCE_GAPS.md
+     * gap #3, since fixed): CharClass string sets are heap-sized now, so
+     * the large properties of strings match ALL their sequences, not just
+     * the first 128 -- \p{RGI_Emoji} has 2604. Both probes below sit far
+     * past the old cap in the generated table. */
+    {
+        int v = regex_flag_bit('v');
+        /* U+1F426 U+200D U+2B1B (bird + ZWJ + black square: "black bird") */
+        uint16_t blackbird[] = { 0xD83D, 0xDC26, 0x200D, 0x2B1B };
+        /* U+1F1E8 U+1F1F6 (regional indicators C+Q: Sark's flag) */
+        uint16_t flag_cq[] = { 0xD83C, 0xDDE8, 0xD83C, 0xDDF6 };
+
+        uint16_t* p1 = to_utf16("\\p{RGI_Emoji}");
+        uintptr_t h1 = regex_compile(p1, 0, v);
+        check(h1 != 0, "\\p{RGI_Emoji}/v compiles (2604 sequences, no truncation error)");
+        const int32_t* caps1 = regex_captures_ptr(h1);
+        check(regex_exec(h1, blackbird, 4, 0) && caps1[0] == 0 && caps1[1] == 4,
+              "\\p{RGI_Emoji}/v matches a ZWJ sequence past the old 128 cap");
+        check(regex_exec(h1, flag_cq, 4, 0) && caps1[0] == 0 && caps1[1] == 4,
+              "\\p{RGI_Emoji}/v matches a flag sequence past the old 128 cap");
+        free(p1); regex_free(h1);
+
+        /* Set operations over the full-size string set. */
+        uint16_t* p2 = to_utf16("[\\p{RGI_Emoji}--\\q{\\u{1F1E8}\\u{1F1F6}}]");
+        uintptr_t h2 = regex_compile(p2, 0, v);
+        check(h2 != 0 && regex_exec(h2, blackbird, 4, 0) && !regex_exec(h2, flag_cq, 4, 0),
+              "[\\p{RGI_Emoji}--\\q{flag CQ}]/v keeps 2603 sequences, drops the subtracted one");
+        free(p2); regex_free(h2);
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;

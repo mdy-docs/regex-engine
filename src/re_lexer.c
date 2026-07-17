@@ -65,6 +65,11 @@ static int alloc_class(Program* prog) {
         return MAX_CLASSES - 1;
     }
     int cid = prog->class_count++;
+    /* Belt-and-braces: compile_into re-entry already freed every slot's
+     * heap string buffer, and class_strings_free NULLs the pointer, so
+     * this is a no-op there -- but it keeps the "slot is built in place"
+     * invariant self-contained rather than trusting the caller's reset. */
+    class_strings_free(&prog->classes[cid]);
     memset(&prog->classes[cid], 0, sizeof(CharClass)); /* slot is built in place */
     return cid;
 }
@@ -276,6 +281,38 @@ static bool parse_group_name(Lexer* lexer, char* out) {
     return true;
 }
 
+/* Appends one sequence to a class's heap-owned string set, growing it as
+ * needed. No fixed cap (the point of the since-fixed CONFORMANCE_GAPS #3:
+ * the old embedded strings[128] silently truncated RGI_Emoji's 2604
+ * sequences); allocation failure is fatal, matching the engine's OOM
+ * policy everywhere else. Deduplication is the caller's business
+ * (class_add_string) -- property fills come from already-duplicate-free
+ * UCD tables and skip the scan. */
+static void class_strings_push(CharClass* cls, const StringSequence* s) {
+    if (cls->string_count == cls->string_cap) {
+        int new_cap = cls->string_cap ? cls->string_cap * 2 : 16;
+        StringSequence* grown = realloc(cls->strings, sizeof(StringSequence) * (size_t)new_cap);
+        if (!grown) {
+            fprintf(stderr, "Fatal Error: Out of memory\n");
+            exit(EXIT_FAILURE);
+        }
+        cls->strings = grown;
+        cls->string_cap = new_cap;
+    }
+    cls->strings[cls->string_count++] = *s;
+}
+
+/* Non-static, public (declared in regexp.h): compile_into frees a previous
+ * compile's class strings on re-entry, regex_free frees them at handle
+ * teardown, and a native host driving compile_into directly must do the
+ * same before discarding a Program. */
+void class_strings_free(CharClass* cls) {
+    free(cls->strings);
+    cls->strings = NULL;
+    cls->string_count = 0;
+    cls->string_cap = 0;
+}
+
 static bool add_range(CharClass* cls, uint32_t start, uint32_t end) {
     if (start > end) return true;
     
@@ -395,10 +432,15 @@ static void fill_builtin_class(CharClass* cls, char type, bool unicode, bool fol
 #define MAX_PROP_NAME 64
 
 #define MAX_PROP_CACHE 64
+/* The cached CharClass carries RANGES only (its strings stay NULL): string
+ * sequences are re-copied from the immutable generated table (via `prop`)
+ * on every use instead, so the cache never owns heap string buffers and
+ * CharClass's ownership rules don't extend into process-lifetime statics. */
 static struct {
     int kind;
     char name[MAX_PROP_NAME];
     CharClass cls;
+    const UCDProperty* prop;
 } prop_cache[MAX_PROP_CACHE];
 static int prop_cache_count = 0;
 
@@ -443,18 +485,18 @@ static bool fill_unicode_property(CharClass* cls, const char* key, const char* n
         else return false;
     }
 
-    CharClass temp = {0};
-    bool cached = false;
+    const CharClass* src = NULL;
+    const UCDProperty* ucd_prop = NULL;
     for (int i = 0; i < prop_cache_count; i++) {
         if (prop_cache[i].kind == kind && strcmp(prop_cache[i].name, name) == 0) {
-            temp = prop_cache[i].cls;
-            cached = true;
+            src = &prop_cache[i].cls;
+            ucd_prop = prop_cache[i].prop;
             break;
         }
     }
 
-    if (!cached) {
-        const UCDProperty* ucd_prop;
+    CharClass local; /* range build target only when the cache is full */
+    if (!src) {
         if (kind == -1) {
             ucd_prop = lookup_unicode_property(name, UCD_KIND_GC);
             if (!ucd_prop) ucd_prop = lookup_unicode_property(name, UCD_KIND_BINARY);
@@ -462,50 +504,53 @@ static bool fill_unicode_property(CharClass* cls, const char* key, const char* n
             ucd_prop = lookup_unicode_property(name, kind);
         }
         if (!ucd_prop) return false;
+        CharClass* build = (prop_cache_count < MAX_PROP_CACHE) ? &prop_cache[prop_cache_count].cls : &local;
+        memset(build, 0, sizeof(CharClass));
         for (int i = 0; i < ucd_prop->count; i++) {
-            add_range(&temp, ucd_prop->ranges[i].start, ucd_prop->ranges[i].end);
+            add_range(build, ucd_prop->ranges[i].start, ucd_prop->ranges[i].end);
         }
-        /* "Properties of strings" (RGI_Emoji, RGI_Emoji_Flag_Sequence,
-         * Basic_Emoji, etc. -- /v mode only) carry multi-codepoint
-         * sequences alongside or instead of single-codepoint ranges. A
-         * sequence longer than cps[16] is skipped whole rather than
-         * truncated: a prefix-truncated sequence would wrongly MATCH the
-         * prefix, where skipping merely fails to match that one sequence
-         * (moot today -- the longest in the generated ucd.h is 10 -- but
-         * the guard shouldn't silently corrupt if a future Unicode
-         * release exceeds it). */
-        for (int i = 0; i < ucd_prop->sequence_count && temp.string_count < 128; i++) {
-            const UCDStringSequence* seq = &ucd_prop->sequences[i];
-            if (seq->length > 16) continue;
-            StringSequence* out = &temp.strings[temp.string_count++];
-            for (int k = 0; k < seq->length; k++) out->cps[k] = seq->cps[k];
-            out->length = seq->length;
-        }
-
         if (prop_cache_count < MAX_PROP_CACHE) {
             prop_cache[prop_cache_count].kind = kind;
             strncpy(prop_cache[prop_cache_count].name, name, MAX_PROP_NAME - 1);
-            prop_cache[prop_cache_count].cls = temp;
+            prop_cache[prop_cache_count].prop = ucd_prop;
             prop_cache_count++;
         }
+        src = build;
     }
 
-    if (temp.string_count > 0 && !allow_strings) return false;
+    if (ucd_prop->sequence_count > 0 && !allow_strings) return false;
 
     if (negate) {
-        if (temp.string_count > 0) return false;
+        if (ucd_prop->sequence_count > 0) return false;
         uint32_t current = 0;
-        for (int i = 0; i < temp.range_count; i++) {
-            if (temp.ranges[i].start > current) {
-                add_range(cls, current, temp.ranges[i].start - 1);
+        for (int i = 0; i < src->range_count; i++) {
+            if (src->ranges[i].start > current) {
+                add_range(cls, current, src->ranges[i].start - 1);
             }
-            current = temp.ranges[i].end + 1;
+            current = src->ranges[i].end + 1;
         }
         if (current <= 0x10FFFF) add_range(cls, current, 0x10FFFF);
     } else {
-        for (int i = 0; i < temp.range_count; i++) add_range(cls, temp.ranges[i].start, temp.ranges[i].end);
-        for (int i = 0; i < temp.string_count && cls->string_count < 128; i++) {
-            cls->strings[cls->string_count++] = temp.strings[i];
+        for (int i = 0; i < src->range_count; i++) add_range(cls, src->ranges[i].start, src->ranges[i].end);
+        /* "Properties of strings" (RGI_Emoji, RGI_Emoji_Flag_Sequence,
+         * Basic_Emoji, etc. -- /v mode only) carry multi-codepoint
+         * sequences alongside or instead of single-codepoint ranges;
+         * copied in full from the generated table now that the string set
+         * is heap-sized (the old embedded strings[128] silently truncated
+         * RGI_Emoji to its first 128 of 2604 sequences). A sequence longer
+         * than cps[16] is skipped whole rather than truncated: a
+         * prefix-truncated sequence would wrongly MATCH the prefix, where
+         * skipping merely fails to match that one sequence (moot today --
+         * the longest in the generated ucd.h is 10 -- but the guard
+         * shouldn't silently corrupt if a future Unicode release exceeds
+         * it). */
+        for (int i = 0; i < ucd_prop->sequence_count; i++) {
+            const UCDStringSequence* seq = &ucd_prop->sequences[i];
+            if (seq->length > 16) continue;
+            StringSequence out = {0};
+            for (int k = 0; k < seq->length; k++) out.cps[k] = seq->cps[k];
+            out.length = seq->length;
+            class_strings_push(cls, &out);
         }
     }
     return true;
@@ -566,6 +611,10 @@ static void invert_class(CharClass* cls) {
     }
     if (current <= 0x10FFFF) add_range(&res, current, 0x10FFFF);
     res.negated = false;
+    /* Every caller complements string-free classes (negating a string set
+     * is rejected upstream), so this free is a no-op guard against a
+     * future caller leaking the heap buffer through the overwrite. */
+    class_strings_free(cls);
     *cls = res;
 }
 
@@ -591,20 +640,20 @@ static bool class_has_string(const CharClass* cls, const StringSequence* s) {
     return false;
 }
 
-static void class_add_string(Lexer* lexer, CharClass* cls, const StringSequence* s) {
+static void class_add_string(CharClass* cls, const StringSequence* s) {
     if (class_has_string(cls, s)) return;
-    if (cls->string_count >= 128) {
-        if (!lexer->prog->error) lexer->prog->error = "InternalError: Too many strings in character class";
-        return;
-    }
-    cls->strings[cls->string_count++] = *s;
+    class_strings_push(cls, s);
 }
 
-static void class_union_v(Lexer* lexer, CharClass* dst, const CharClass* src) {
+static void class_union_v(CharClass* dst, const CharClass* src) {
     for (int i = 0; i < src->range_count; i++) add_range(dst, src->ranges[i].start, src->ranges[i].end);
-    for (int i = 0; i < src->string_count; i++) class_add_string(lexer, dst, &src->strings[i]);
+    for (int i = 0; i < src->string_count; i++) class_add_string(dst, &src->strings[i]);
 }
 
+/* The intersect/subtract results are built in a local and then MOVED into
+ * a: the local's heap string buffer transfers ownership through the struct
+ * assignment after a's own buffer is freed -- the one sanctioned
+ * ownership-transfer idiom (see CharClass in regexp.h). */
 static void class_intersect_v(CharClass* a, const CharClass* b) {
     CharClass res = {0};
     for (int i = 0; i < a->range_count; i++) {
@@ -615,7 +664,8 @@ static void class_intersect_v(CharClass* a, const CharClass* b) {
         }
     }
     for (int i = 0; i < a->string_count; i++)
-        if (class_has_string(b, &a->strings[i])) res.strings[res.string_count++] = a->strings[i];
+        if (class_has_string(b, &a->strings[i])) class_strings_push(&res, &a->strings[i]);
+    class_strings_free(a);
     *a = res;
 }
 
@@ -632,7 +682,8 @@ static void class_subtract_v(CharClass* a, const CharClass* b) {
         }
     }
     for (int i = 0; i < a->string_count; i++)
-        if (!class_has_string(b, &a->strings[i])) res.strings[res.string_count++] = a->strings[i];
+        if (!class_has_string(b, &a->strings[i])) class_strings_push(&res, &a->strings[i]);
+    class_strings_free(a);
     *a = res;
 }
 
@@ -977,8 +1028,7 @@ static void parse_q_strings(Lexer* lexer, CharClass* out) {
         if (lexer->prog->ignore_case)
             for (int k = 0; k < seq.length; k++) seq.cps[k] = unicode_casefold(seq.cps[k]);
         if (seq.length == 1) add_range(out, seq.cps[0], seq.cps[0]);
-        else class_add_string(lexer, out, &seq);
-        if (lexer->prog->error) return;
+        else class_add_string(out, &seq);
         if (lexer->src[lexer->pos] == '|') { lexer->pos++; continue; }
         break;
     }
@@ -1164,7 +1214,7 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
         memset(tmp, 0, sizeof(CharClass));
         parse_class_v_element(lexer, tmp, &single);
         if (!lexer->prog->error) {
-            class_union_v(lexer, cls, tmp);
+            class_union_v(cls, tmp);
             /* Only peek at pos+1 when pos isn't already the terminator: a
              * truncated pattern ("[a") would otherwise read one unit past
              * the buffer (fuzzer-found, ASan heap-buffer-overflow). */
@@ -1175,6 +1225,7 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
                  * chained over single operands, nothing else. */
                 while (!lexer->prog->error && lexer->src[lexer->pos] == o0 && lexer->src[lexer->pos + 1] == o0) {
                     lexer->pos += 2;
+                    class_strings_free(tmp);
                     memset(tmp, 0, sizeof(CharClass));
                     uint32_t ch = 0;
                     if (!parse_class_set_operand(lexer, tmp, &ch)) {
@@ -1198,14 +1249,16 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
                         lexer->prog->error = "SyntaxError: Invalid set operation in character class";
                         break;
                     }
+                    class_strings_free(tmp);
                     memset(tmp, 0, sizeof(CharClass));
                     parse_class_v_element(lexer, tmp, &single);
                     if (lexer->prog->error) break;
-                    class_union_v(lexer, cls, tmp);
+                    class_union_v(cls, tmp);
                 }
             }
         }
     }
+    class_strings_free(tmp);
     free(tmp);
     if (lexer->prog->error) { lexer->parse_depth--; return; }
 

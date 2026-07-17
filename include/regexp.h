@@ -4,7 +4,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define MAX_OPCODES 16384
+/* 32768, not the original 16384: string-set classes compile to one
+ * alternation branch per string (see re_compiler.c), and a full
+ * \p{RGI_Emoji} -- 2604 sequences now that CharClass.strings is heap-sized
+ * rather than capped at 128 -- needs ~17.5k instructions on its own. */
+#define MAX_OPCODES 32768
 #define MAX_GROUPS 255
 #define MAX_CLASSES 64
 #define MAX_COUNTERS 16
@@ -74,8 +78,20 @@ typedef struct {
 typedef struct {
     CodePointRange ranges[2048];
     int range_count;
-    StringSequence strings[128];
+    /* Heap-owned, right-sized string set (grown on demand; NULL iff
+     * string_count == 0). This used to be a fixed strings[128] embedded
+     * array, which silently truncated the large Unicode properties of
+     * strings (RGI_Emoji alone has 2604 sequences -- see
+     * docs/CONFORMANCE_GAPS.md, since-fixed gap #3). Ownership: a CharClass
+     * owns its buffer; copies must deep-copy (re_lexer.c's
+     * class_strings_push) or deliberately transfer ownership, and the
+     * buffers are released by class_strings_free -- compile_into frees a
+     * previous compile's buffers on re-entry, regex_free frees them at
+     * teardown. A Program must be ZERO-INITIALIZED before its first
+     * compile_into so those frees never see garbage pointers. */
+    StringSequence* strings;
     int string_count;
+    int string_cap;
     bool negated;
 } CharClass;
 
@@ -103,6 +119,12 @@ typedef struct {
 } CaptureIndex;
 
 void compile_into(Program* prog, const uint16_t* regex, int flags);
+
+/* Releases one class's heap-owned string set (safe on an empty class; the
+ * pointer is NULLed). A host that drives compile_into directly must call
+ * this for classes[0..class_count) before discarding a Program -- the
+ * regex_wasm.c shim's regex_free does exactly that. */
+void class_strings_free(CharClass* cls);
 
 /* Reusable execution scratch (backtrack stacks, capture arenas, fail
  * caches -- one set per lookaround recursion depth, allocated lazily and
