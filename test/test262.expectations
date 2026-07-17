@@ -6,7 +6,10 @@
 # so this list can only shrink silently: fix a gap and its test starts
 # passing, which fails the run until the line is removed here. Every entry
 # below is a real, understood gap or an out-of-scope concern -- not a
-# rubber stamp.
+# rubber stamp. docs/CONFORMANCE_GAPS.md is the human-facing work-through
+# list (what each gap is, why, and how to fix it); this file is the exact
+# machine-checked set. Keep them in sync -- fixing a gap means deleting its
+# line HERE and its entry THERE.
 #
 # Pinned test262 commit: see TEST262_SHA in scripts/get_test262.sh. Bumping
 # it may add/remove tests; re-triage this file when you do.

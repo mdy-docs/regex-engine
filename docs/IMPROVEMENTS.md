@@ -987,6 +987,8 @@ assertions, native) and `test/node_smoke.mjs` (13 against the real compiled
   `\k<name>` to the first same-named group at compile time instead of the
   participating one at match time (now emits `OP_NAMED_BACKREF`, which the
   VM already resolved correctly). Both have `test/smoke.c` regressions.
+  The remaining known failures are enumerated, with fix approaches, in
+  `docs/CONFORMANCE_GAPS.md` — the work-through list.
 - ~~**No negative/error-path tests.**~~ — **resolved** as a side effect of
   the §1 fixes and the conformance work: `test/smoke.c` now checks the
   `MAX_*` limits, out-of-range backrefs, malformed/unknown property

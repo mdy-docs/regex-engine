@@ -35,10 +35,13 @@ against jsvm2's own regex test coverage").
    layout, the UCD table generator. Read this before touching
    `src/re_lexer.c`/`re_parser.c`/`re_compiler.c`/`re_vm.c`.
 3. `docs/IMPROVEMENTS.md` — a structural/quality/perf/testing/correctness
-   analysis with concrete, verified findings (several are confirmed memory-
-   safety bugs, not style nits). **Read this before assuming the engine is
-   fully spec-correct or safe on adversarial input** — it currently is
-   neither, in specific, enumerated ways.
+   analysis with concrete, verified findings. Originally a list of open
+   bugs; now mostly a record of fixes (all of §1–§4 addressed), so read it
+   for *how the engine got to where it is* and what was deliberately left.
+4. `docs/CONFORMANCE_GAPS.md` — the remaining, enumerated ways the engine
+   diverges from a real ECMAScript engine, each with a fix approach. The
+   work-through list; paired with `test/test262.expectations` (the
+   machine-checked set the `make test262` CI job enforces).
 
 ## Layout (see README.md for the authoritative version)
 
