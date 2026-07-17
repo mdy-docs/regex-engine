@@ -13,6 +13,13 @@ Status legend: **[real]** a genuine spec divergence worth closing ·
 **[scope]** deliberately outside a standalone matcher's job ·
 **[feature]** an unimplemented spec feature, larger than a bug fix.
 
+**Current status:** the engine-side gaps are all closed — #1 (`/iu` case
+folding of built-in class escapes), #2 (`/v` set operations), and #3 (the
+RGI_Emoji 128-sequence cap) were fixed and de-listed per the rule above,
+and both test262 scopes (`make test262` and `--generated`) pass with only
+the three out-of-scope files below failing. Entry #4 keeps its historical
+number and is the sole remaining entry, by decision rather than by debt.
+
 Verify every fix the way the rest of this repo does: diff against Node
 (`node -e "…"`) for the exact cases, run `make test`, `make test-asan`,
 `make test262`, and a `make fuzz` burst.
