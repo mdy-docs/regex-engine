@@ -1051,6 +1051,91 @@ int main(void) {
         free(legacy);
     }
 
+    /* Unicode case folding of BUILT-IN class escapes and word boundaries
+     * under /iu (docs/CONFORMANCE_GAPS.md gap #1, since fixed). Simple case
+     * folding sends U+017F LONG S to 's' and U+212A KELVIN SIGN to 'k', so
+     * under /iu they are word characters: \w and \b must treat them as
+     * such, and \W/\B must not -- all-or-nothing, or a char matches both.
+     * \p/\P fold too, with mode-dependent complement order (see
+     * re_lexer.c's \p token path). All expectations diffed against Node
+     * over full 0..0x10FFFF sweeps, not just these samples. */
+    {
+        int iu = regex_flag_bit('i') | regex_flag_bit('u');
+        uint16_t longs[] = { 0x017F };
+        uint16_t kelvin[] = { 0x212A };
+
+        uint16_t* pw = to_utf16("\\w");
+        uintptr_t hw = regex_compile(pw, 0, iu);
+        check(regex_exec(hw, longs, 1, 0), "\\w/iu matches U+017F (folds to 's')");
+        check(regex_exec(hw, kelvin, 1, 0), "\\w/iu matches U+212A (folds to 'k')");
+        free(pw); regex_free(hw);
+
+        uint16_t* pwu = to_utf16("\\w");
+        uintptr_t hwu = regex_compile(pwu, 0, regex_flag_bit('u'));
+        check(!regex_exec(hwu, longs, 1, 0), "\\w/u (no /i) does not match U+017F");
+        free(pwu); regex_free(hwu);
+
+        uint16_t* pW = to_utf16("\\W");
+        uintptr_t hW = regex_compile(pW, 0, iu);
+        uint16_t ess[] = { 's' };
+        check(!regex_exec(hW, longs, 1, 0), "\\W/iu does not match U+017F (would double-match with \\w)");
+        check(!regex_exec(hW, kelvin, 1, 0), "\\W/iu does not match U+212A");
+        check(!regex_exec(hW, ess, 1, 0), "\\W/iu does not match 's'");
+        free(pW); regex_free(hW);
+
+        /* In-class \W must exclude the fold-partners too: the end-of-class
+         * fold used to re-add 's'/'k' via the wrongly-included U+017F/U+212A. */
+        uint16_t* pcW = to_utf16("[\\W]");
+        uintptr_t hcW = regex_compile(pcW, 0, iu);
+        check(!regex_exec(hcW, ess, 1, 0), "[\\W]/iu does not match 's'");
+        check(!regex_exec(hcW, longs, 1, 0), "[\\W]/iu does not match U+017F");
+        free(pcW); regex_free(hcW);
+
+        /* \b: 'a' followed by U+017F is word-then-word under /iu (no
+         * boundary), word-then-non-word without /i (boundary). */
+        uint16_t ab[] = { 'a', 0x017F };
+        uint16_t* pb = to_utf16("a\\b");
+        uintptr_t hb_iu = regex_compile(pb, 0, iu);
+        uintptr_t hb_u = regex_compile(pb, 0, regex_flag_bit('u'));
+        check(!regex_exec(hb_iu, ab, 2, 0), "a\\b/iu finds no boundary before U+017F");
+        check(regex_exec(hb_u, ab, 2, 0), "a\\b/u finds a boundary before U+017F");
+        free(pb); regex_free(hb_iu); regex_free(hb_u);
+
+        /* Modifier groups toggle the same folding: (?i:...) under /u. */
+        uint16_t* pm = to_utf16("(?i:\\w)");
+        uintptr_t hm = regex_compile(pm, 0, regex_flag_bit('u'));
+        check(regex_exec(hm, longs, 1, 0), "(?i:\\w)/u matches U+017F");
+        free(pm); regex_free(hm);
+        uint16_t* pmo = to_utf16("(?-i:\\w)");
+        uintptr_t hmo = regex_compile(pmo, 0, iu);
+        check(!regex_exec(hmo, longs, 1, 0), "(?-i:\\w)/iu does not match U+017F");
+        free(pmo); regex_free(hmo);
+        uint16_t zb[] = { 'Z', 0x017F };
+        uint16_t* pmb = to_utf16("(?i:Z\\B)");
+        uintptr_t hmb = regex_compile(pmb, 0, regex_flag_bit('u'));
+        check(regex_exec(hmb, zb, 2, 0), "(?i:Z\\B)/u matches 'Z'+U+017F (test262 modifier case)");
+        free(pmb); regex_free(hmb);
+
+        /* \p/\P folding, and the /u vs /v complement-order difference:
+         * \P{Lu}/iu matches 'A' (fold of already-complemented set reaches
+         * it via member 'a'); \P{Lu}/iv does not (fold precedes
+         * complement). Both match plain non-letters either way. */
+        uint16_t lower_a[] = { 'a' };
+        uint16_t upper_a[] = { 'A' };
+        uint16_t bang[] = { '!' };
+        uint16_t* pp = to_utf16("\\p{Lu}");
+        uintptr_t hp = regex_compile(pp, 0, iu);
+        check(regex_exec(hp, lower_a, 1, 0), "\\p{Lu}/iu matches 'a' (folds to set member 'A')");
+        free(pp); regex_free(hp);
+        uint16_t* pP = to_utf16("\\P{Lu}");
+        uintptr_t hP_iu = regex_compile(pP, 0, iu);
+        uintptr_t hP_iv = regex_compile(pP, 0, regex_flag_bit('i') | regex_flag_bit('v'));
+        check(regex_exec(hP_iu, upper_a, 1, 0), "\\P{Lu}/iu matches 'A' (closure of complement)");
+        check(!regex_exec(hP_iv, upper_a, 1, 0), "\\P{Lu}/iv does not match 'A' (complement of closure)");
+        check(regex_exec(hP_iu, bang, 1, 0) && regex_exec(hP_iv, bang, 1, 0), "\\P{Lu}/iu and /iv both match '!'");
+        free(pP); regex_free(hP_iu); regex_free(hP_iv);
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;

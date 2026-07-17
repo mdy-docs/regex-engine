@@ -84,6 +84,16 @@ static inline bool is_word_char(uint32_t c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
 }
 
+/* ECMA-262 GetWordCharacters: under /iu the word set additionally contains
+ * every character whose simple case folding lands in [a-zA-Z0-9_] (exactly
+ * U+017F and U+212A in current Unicode, but derived via the fold table
+ * rather than hardcoded). `fold` is the emitted instruction's effective
+ * ignoreCase (arg1) AND prog->unicode -- plain /i never widens \b. */
+static inline bool is_word_char_fold(uint32_t c, bool fold) {
+    if (fold) c = unicode_casefold(c);
+    return is_word_char(c);
+}
+
 /* Non-unicode-mode (Annex B) per-character canonicalization: fold via the
  * character's simple uppercase mapping, except when that mapping would cross
  * from a non-ASCII source into an ASCII target -- real engines skip that
@@ -402,13 +412,15 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                  * README), so end-of-text must be detected by bound, not by
                  * reading a terminator (docs/IMPROVEMENTS.md #1.4, confirmed
                  * OOB read one past a tightly-sized buffer). */
-                bool left_is_word = (current.sp > original_text) && is_word_char(*(current.sp - 1));
-                bool right_is_word = (current.sp < text_end) && is_word_char(*current.sp);
+                bool fold = inst.arg1 && prog->unicode;
+                bool left_is_word = (current.sp > original_text) && is_word_char_fold(*(current.sp - 1), fold);
+                bool right_is_word = (current.sp < text_end) && is_word_char_fold(*current.sp, fold);
                 if (left_is_word != right_is_word) current.pc++; else { path_failed = true; break; }
             } break;
             case OP_NON_WORD_BOUNDARY: {
-                bool left_is_word = (current.sp > original_text) && is_word_char(*(current.sp - 1));
-                bool right_is_word = (current.sp < text_end) && is_word_char(*current.sp);
+                bool fold = inst.arg1 && prog->unicode;
+                bool left_is_word = (current.sp > original_text) && is_word_char_fold(*(current.sp - 1), fold);
+                bool right_is_word = (current.sp < text_end) && is_word_char_fold(*current.sp, fold);
                 if (left_is_word == right_is_word) current.pc++; else { path_failed = true; break; }
             } break;
             case OP_BACKREF:

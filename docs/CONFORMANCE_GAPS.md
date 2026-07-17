@@ -19,36 +19,6 @@ Verify every fix the way the rest of this repo does: diff against Node
 
 ---
 
-## 1. [real] Unicode case folding of built-in class escapes under `/iu`
-
-**Fails:** `regexp-modifiers/add-ignoreCase-affects-slash-{lower,upper}-{b,p,w}.js`
-(6 tests), and the same behavior at top level (`/\w/iu`, `/\p{Lu}/iu`, …),
-which test262 happens to exercise via the modifier directory.
-
-**What's wrong:** under `/iu`, the built-in class escapes must match via
-simple case folding — `U+017F` (LONG S) folds to `s`, so `/\w/iu` matches it
-and `/\W/iu` must *not*; `/\p{Lu}/iu` matches `a` (folds to `A ∈ Lu`). This
-engine already folds *explicit* `[...]` classes (`apply_case_folding` in
-`re_lexer.c`), but the standalone `\w`/`\d`/`\s`/`\p{…}` token paths never
-call it, and `\b`/`\B` use a fixed-ASCII `is_word_char`.
-
-**Why it's not a one-liner (and must be all-or-nothing):** folding the
-positive escapes (`\w`, `\p`) is easy — call `apply_case_folding` on their
-class the way `[...]` already does. But `\W`/`\D`/`\S` are stored as
-*pre-complemented positive sets* (see `fill_builtin_class`), so folding them
-naively is wrong. Half-fixing (fold `\w` but not `\W`) is worse than not
-folding: a character would match *both* `\w` and `\W`. The correct fix:
-represent `\W`/`\D`/`\S` with the `negated` flag over the folded positive
-set (let the VM's existing `if (cls->negated) matched = !matched` invert),
-and make `is_word_char` fold-aware for `\b`/`\B`.
-
-**Approach:** (a) give `\W`/`\D`/`\S` the negated-flag representation instead
-of pre-complementing; (b) call `apply_case_folding` on every built-in class
-and `\p{…}` result when `ignore_case && unicode`; (c) for `\b`/`\B` under
-`/iu`, fold before the word-char test. Diff a wide codepoint sweep against
-Node, not just the test's sample chars — folding has long tails (Kelvin
-sign, final sigma, etc.).
-
 ## 2. [feature] `/v`-mode set operations
 
 **Fails:** `unicodeSets/generated/*` intersection (`[a&&b]`), difference

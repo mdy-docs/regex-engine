@@ -71,6 +71,7 @@ static int alloc_class(Program* prog) {
  * used only within this file -- unlike next_token, this doesn't need to be
  * in re_internal.h. */
 static void invert_class(CharClass* cls);
+static void apply_case_folding(CharClass* cls, bool unicode);
 
 static bool parse_hex(Lexer* lexer, int digits, uint32_t* out) {
     uint32_t val = 0;
@@ -334,24 +335,25 @@ static bool add_range(CharClass* cls, uint32_t start, uint32_t end) {
  * the full UTF-16 code-unit range 0-0xFFFF (docs/ARCHITECTURE.md's lexer
  * invariant; docs/IMPROVEMENTS.md #1.7, diffed against Node). The \s list
  * itself is mode-independent per spec (WhiteSpace/LineTerminator don't
- * change under /u), so it gets no cutoff at all. */
-static void fill_builtin_class(CharClass* cls, char type, bool unicode) {
+ * change under /u), so it gets no cutoff at all.
+ *
+ * fold_case (= effective ignoreCase under /u) implements the spec's
+ * GetWordCharacters/Canonicalize coupling: under /iu the positive sets are
+ * closed under simple case folding BEFORE the uppercase variants are
+ * complemented (\w gains U+017F/U+212A via s/k; \W is the complement of
+ * that closed set). Order matters -- folding a pre-complemented \W instead
+ * would wrongly pull 's'/'k' back in via U+017F/U+212A, making characters
+ * match both \w and \W. Only \w has fold-crossing pairs today, but the
+ * closure is computed for \d/\s too rather than hardcoding that fact. */
+static void fill_builtin_class(CharClass* cls, char type, bool unicode, bool fold_case) {
     if (type == 'd') {
         add_range(cls, '0', '9');
-    } else if (type == 'D') {
-        add_range(cls, 0, '0' - 1);
-        add_range(cls, '9' + 1, unicode ? 0x10FFFF : 0xFFFF);
     } else if (type == 'w') {
         add_range(cls, '0', '9');
         add_range(cls, 'A', 'Z');
         add_range(cls, '_', '_');
         add_range(cls, 'a', 'z');
-    } else if (type == 'W') {
-        add_range(cls, 0, '0' - 1);
-        add_range(cls, '9' + 1, 'A' - 1);
-        add_range(cls, 'Z' + 1, '_' - 1);
-        add_range(cls, '_' + 1, 'a' - 1);
-        add_range(cls, 'z' + 1, unicode ? 0x10FFFF : 0xFFFF);
+        if (fold_case) apply_case_folding(cls, true);
     } else if (type == 's') {
         uint32_t spaces[] = {
             0x0009, 0x000D, 0x0020, 0x0020, 0x00A0, 0x00A0, 0x1680, 0x1680,
@@ -361,9 +363,10 @@ static void fill_builtin_class(CharClass* cls, char type, bool unicode) {
         for (size_t i = 0; i < sizeof(spaces)/sizeof(spaces[0]); i += 2) {
             add_range(cls, spaces[i], spaces[i+1]);
         }
-    } else if (type == 'S') {
+    } else { /* 'D', 'W', 'S': fold-close the positive set, then complement */
         CharClass temp = {0};
-        fill_builtin_class(&temp, 's', unicode);
+        fill_builtin_class(&temp, type - 'A' + 'a', unicode, fold_case);
+        if (fold_case) apply_case_folding(&temp, true);
         invert_class(&temp);
         uint32_t max_cp = unicode ? 0x10FFFF : 0xFFFF;
         for (int i = 0; i < temp.range_count; i++) {
@@ -419,7 +422,16 @@ static int prop_cache_count = 0;
  * must not fill the cache's 64 slots), and unknown names used to be
  * silently accepted as an empty class -- see docs/IMPROVEMENTS.md #1.9 and
  * the spec-compliance item below it. Callers must check the return value
- * and set prog->error accordingly. */
+ * and set prog->error accordingly.
+ *
+ * Under /iu the caller is responsible for case folding the RESULT (the
+ * standalone \p/\P token path folds the finished class; the in-class path
+ * relies on parse_char_class's end-of-parse fold). Folding always happens
+ * AFTER \P's complement, never before: CharacterSetMatcher canonicalizes
+ * the input against an already-complemented member set, so \P{Lu}/iu is
+ * closure(complement(Lu)) -- it MATCHES 'A' via folded member 'a'
+ * (confirmed vs Node with a full-codepoint sweep), where
+ * complement(closure(Lu)) would not. */
 static bool fill_unicode_property(CharClass* cls, const char* key, const char* name, bool negate, bool allow_strings) {
     int kind = -1; /* -1 = bare \p{Name}: binary or GC value */
     if (key) {
@@ -614,7 +626,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
             if (start_char == '\\') {
                 uint32_t esc = decode_utf16_lexer(lexer);
                 if (esc == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return; }
-                if (esc < 128 && strchr("dDwWsS", (char)esc)) { fill_builtin_class(&current_union, (char)esc, lexer->prog->unicode); is_special = true; }
+                if (esc < 128 && strchr("dDwWsS", (char)esc)) { fill_builtin_class(&current_union, (char)esc, lexer->prog->unicode, lexer->prog->unicode && lexer->prog->ignore_case); is_special = true; }
                 else if (esc == 'x') {
                     if (!parse_hex(lexer, 2, &start_char)) {
                         lexer->prog->error = "SyntaxError: Invalid hexadecimal escape sequence";
@@ -974,9 +986,9 @@ void next_token(Lexer* lexer) {
             if (esc == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return; }
             if (esc < 128 && strchr("dDwWsS", (char)esc)) {
                 int cid = alloc_class(lexer->prog);
-                fill_builtin_class(&lexer->prog->classes[cid], (char)esc, lexer->prog->unicode);
+                fill_builtin_class(&lexer->prog->classes[cid], (char)esc, lexer->prog->unicode, lexer->prog->unicode && lexer->prog->ignore_case);
                 lexer->current = (Token){TOK_CLASS, 0, cid};
-            } 
+            }
             else if (esc >= '1' && esc <= '9') {
                 if (lexer->prog->unicode && (esc == '8' || esc == '9')) {
                     lexer->prog->error = "SyntaxError: Invalid escape sequence in unicode mode";
@@ -1047,9 +1059,33 @@ void next_token(Lexer* lexer) {
                         const char* pkey = NULL;
                         if (val != prop) { prop[val - prop - 1] = '\0'; pkey = prop; }
                         int cid = alloc_class(lexer->prog);
-                        if (!fill_unicode_property(&lexer->prog->classes[cid], pkey, val, esc == 'P', lexer->prog->unicode_sets)) {
-                            lexer->prog->error = "SyntaxError: Invalid property name";
-                            return;
+                        /* prog->unicode is guaranteed here (\p is only a
+                         * property escape under /u), so effective
+                         * ignoreCase alone gates the fold. The fold/
+                         * complement ORDER differs by mode, full-sweep
+                         * confirmed vs Node: /iu canonicalizes against the
+                         * already-complemented set (\P = fold(complement)),
+                         * while /iv applies MaybeSimpleCaseFolding before
+                         * CharacterComplement (\P = complement(fold)) --
+                         * e.g. \P{Lu}/iu matches 'A' via folded member 'a',
+                         * \P{Lu}/iv does not. */
+                        if (esc == 'P' && lexer->prog->unicode_sets && lexer->prog->ignore_case) {
+                            if (!fill_unicode_property(&lexer->prog->classes[cid], pkey, val, false, true)) {
+                                lexer->prog->error = "SyntaxError: Invalid property name";
+                                return;
+                            }
+                            if (lexer->prog->classes[cid].string_count > 0) {
+                                lexer->prog->error = "SyntaxError: Invalid property name";
+                                return;
+                            }
+                            apply_case_folding(&lexer->prog->classes[cid], true);
+                            invert_class(&lexer->prog->classes[cid]);
+                        } else {
+                            if (!fill_unicode_property(&lexer->prog->classes[cid], pkey, val, esc == 'P', lexer->prog->unicode_sets)) {
+                                lexer->prog->error = "SyntaxError: Invalid property name";
+                                return;
+                            }
+                            if (lexer->prog->ignore_case) apply_case_folding(&lexer->prog->classes[cid], true);
                         }
                         lexer->current = (Token){TOK_CLASS, 0, cid};
                     } else {

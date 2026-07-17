@@ -96,7 +96,9 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
     if (!node) return;
     /* Match-time flag decisions are baked into each instruction as it's
      * emitted (OP_CHAR/backrefs carry effective ignore_case in arg2, the
-     * anchors carry effective multiline in arg1) rather than read from
+     * anchors carry effective multiline in arg1, the word boundaries carry
+     * effective ignore_case in arg1 for /iu's fold-aware IsWordChar) rather
+     * than read from
      * prog->* at match time -- the AST_MODIFIER_GROUP case below toggles
      * the prog fields only for the duration of this compile walk, so a
      * (?i:...) body's instructions must capture the toggled value while it
@@ -105,8 +107,8 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
     switch (node->type) {
         case AST_ASSERT_START: emit(prog, OP_ASSERT_START, prog->multiline, 0, 0, 0, false); break;
         case AST_ASSERT_END:   emit(prog, OP_ASSERT_END, prog->multiline, 0, 0, 0, false); break;
-        case AST_WORD_BOUNDARY:emit(prog, OP_WORD_BOUNDARY, 0, 0, 0, 0, false); break;
-        case AST_NON_WORD_BOUNDARY:emit(prog, OP_NON_WORD_BOUNDARY, 0, 0, 0, 0, false); break;
+        case AST_WORD_BOUNDARY:emit(prog, OP_WORD_BOUNDARY, prog->ignore_case, 0, 0, 0, false); break;
+        case AST_NON_WORD_BOUNDARY:emit(prog, OP_NON_WORD_BOUNDARY, prog->ignore_case, 0, 0, 0, false); break;
         case AST_BACKREF:      emit(prog, OP_BACKREF, node->id, prog->ignore_case, 0, 0, false); break;
         case AST_NAMED_BACKREF: {
             /* Emit OP_NAMED_BACKREF, not OP_BACKREF: with ES2025 duplicate

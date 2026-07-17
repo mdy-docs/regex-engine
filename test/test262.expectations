@@ -25,22 +25,6 @@ test/built-ins/RegExp/match-indices/indices-groups-object.js
 test/built-ins/RegExp/match-indices/indices-property.js
 test/built-ins/RegExp/named-groups/groups-object.js
 
-## Real gap: Unicode case-insensitive matching of BUILT-IN class escapes
-# and word boundaries. Under /iu, \w \W \p \P \b \B must fold via simple
-# case folding (e.g. U+017F LONG S folds to 's', so /\w/iu matches it, and
-# /\W/iu must not). This engine already folds *explicit* [...] classes
-# (apply_case_folding), but not the built-in escapes. It's all-or-nothing:
-# folding \w without \W would let one char match both, so the fix also
-# needs \W/\D/\S represented as a negated positive set (they're currently
-# pre-complemented) and is_word_char made fold-aware. Self-contained
-# correctness project, tracked separately.
-test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-b.js
-test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-p.js
-test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-w.js
-test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-b.js
-test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-p.js
-test/built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-w.js
-
 # NOTE: `node test/test262_runner.mjs --generated` additionally runs the
 # machine-generated exhaustive sweeps under */generated/, which surface two
 # further known gaps not enumerated line-by-line here: /v-mode set
