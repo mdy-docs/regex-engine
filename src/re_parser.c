@@ -8,7 +8,7 @@
  * Split out of what was originally a single file (src/regexp.c, itself a
  * verbatim copy of jsvm2's src/regexp.c) for maintainability -- see
  * CLAUDE.md/README.md's "Provenance" section for why that diverges from
- * upstream's layout, and docs/IMPROVEMENTS.md section 4 for the rationale.
+ * upstream's layout.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,8 +91,8 @@ static ASTNode* parse_primary(Lexer* lexer) {
          * real JS engine, visibly wrong in both reported capture indices
          * and numeric-backreference resolution the moment groups nest.
          *
-         * Bounds-checked against MAX_GROUPS (see docs/IMPROVEMENTS.md
-         * #1.2, a confirmed heap-buffer-overflow: an unchecked pattern
+         * Bounds-checked against MAX_GROUPS (a confirmed
+         * heap-buffer-overflow: an unchecked pattern
          * with more than MAX_GROUPS capture groups wrote past
          * prog->group_names[] and, at match time, past the VM's
          * captures[MAX_GROUPS*2] array). The safe ceiling is

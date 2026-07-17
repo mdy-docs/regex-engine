@@ -146,7 +146,7 @@ int regex_exec(uintptr_t handle, const uint16_t* text, int text_units, int start
      * scan loop below re-enters the VM at every offset, and per-position
      * setup (backtrack stack + fail-cache allocation and initialization)
      * used to dominate unanchored searches; see regexp.h's VMContext
-     * comment and docs/IMPROVEMENTS.md section 2. */
+     * comment. */
     VMContext* ctx = vm_context_new(&h->prog);
 
     if (h->prog.sticky) {

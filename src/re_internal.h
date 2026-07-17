@@ -82,8 +82,8 @@ typedef struct ASTNode {
     struct ASTNode* left; struct ASTNode* right;
     /* Height of this node's subtree (leaves are 1); maintained incrementally
      * as the parser attaches children, and checked against MAX_AST_DEPTH
-     * (see re_parser.c) to guard against the stack-overflow class of bug in
-     * docs/IMPROVEMENTS.md #1.3 -- free_ast, validate_group_names,
+     * (see re_parser.c) to guard against a stack-overflow class of bug --
+     * free_ast, validate_group_names,
      * validate_backrefs, validate_named_backrefs, and compile_node all
      * recurse through left/right with no depth limit of their own. */
     int depth;

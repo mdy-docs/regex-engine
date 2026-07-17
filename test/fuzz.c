@@ -2,7 +2,7 @@
  * through the same shim API (regex_compile + regex_exec's scan loop) an
  * embedder uses. The invariant under test is purely "never crashes, never
  * trips ASan/UBSan" -- matching *correctness* is the smoke suite's and
- * test262's job (docs/IMPROVEMENTS.md section 3). Build and run with
+ * test262's job. Build and run with
  * `make fuzz` (needs clang's -fsanitize=fuzzer, so CC must be clang).
  *
  * Input layout: byte 0 = flag bits (masked to real REGEX_FLAG_* values),

@@ -4,10 +4,9 @@
  * fail-cache that's the main defense against classic
  * catastrophic-backtracking patterns. All execution scratch lives in a
  * caller-provided VMContext (one per exec call, reused across every start
- * position and lookaround depth -- see regexp.h and docs/IMPROVEMENTS.md
- * section 2 for why: per-position setup used to dominate unanchored
- * searches by two orders of magnitude). See docs/ARCHITECTURE.md's "VM"
- * section for the full picture, and docs/IMPROVEMENTS.md #1.1 for the
+ * position and lookaround depth -- see regexp.h for why: per-position
+ * setup used to dominate unanchored searches by two orders of magnitude).
+ * See docs/ARCHITECTURE.md's "VM" section for the full picture. The
  * history here: lookaround recursion used to be this engine's most
  * serious known crash risk (a fixed ~2.2MB C-stack frame per call,
  * regardless of the pattern's actual group count, crashed the process at
@@ -24,7 +23,7 @@
  * Split out of what was originally a single file (src/regexp.c, itself a
  * verbatim copy of jsvm2's src/regexp.c) for maintainability -- see
  * CLAUDE.md/README.md's "Provenance" section for why that diverges from
- * upstream's layout, and docs/IMPROVEMENTS.md section 4 for the rationale.
+ * upstream's layout.
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -45,8 +44,7 @@
  * the trail-surrogate peek and is a deliberate divergence from upstream:
  * jsvm2 only decodes NUL-terminated JSStrings, but here text need not be
  * NUL-terminated, so a buffer whose last unit is a lead surrogate would
- * otherwise be read one unit past its end (docs/IMPROVEMENTS.md #1.5,
- * confirmed OOB read). */
+ * otherwise be read one unit past its end (a confirmed OOB read). */
 static inline uint32_t decode_utf16(const uint16_t** sp, const uint16_t* limit) {
     uint32_t cp = *(*sp)++;
     if (cp >= 0xD800 && cp <= 0xDBFF && *sp < limit) {
@@ -63,10 +61,10 @@ static inline uint32_t decode_utf16(const uint16_t** sp, const uint16_t* limit) 
  * for a valid surrogate pair whose lead is still at or after `start`, 1
  * otherwise). Extracted from four independently-maintained inline copies
  * (OP_CHAR/OP_CLASS backward, and both sides of the ignore-case
- * backreference comparison) -- docs/IMPROVEMENTS.md section 4 flagged that
- * duplication as an entire class of "fixed on one side, not the mirror
- * side" bug risk, and #1.5 proved it: the forward decoder's OOB read got
- * probed and fixed while these stayed separate. Callers must ensure
+ * backreference comparison) -- that duplication was an entire class of
+ * "fixed on one side, not the mirror side" bug risk, proven when the
+ * forward decoder's OOB read got probed and fixed while these stayed
+ * separate. Callers must ensure
  * *sp > start before calling. */
 static inline uint32_t decode_utf16_backward(const uint16_t** sp, const uint16_t* start) {
     uint32_t cp = *--(*sp);
@@ -121,14 +119,13 @@ static uint32_t annexb_canonicalize(uint32_t ch) {
 /* `gen` implements O(1) logical clearing: an entry counts as present only
  * if its gen matches the owning VMDepth's current generation, so "clearing"
  * the 8192-entry cache between VM entries is one integer increment instead
- * of an 8192-iteration reset (docs/IMPROVEMENTS.md section 2 -- that reset
- * used to run once per *start position* of an unanchored search). */
+ * of an 8192-iteration reset -- that reset used to run once per *start
+ * position* of an unanchored search. */
 typedef struct { int pc; const uint16_t* sp; unsigned int gen; } CacheEntry;
 
 /* Binary search over CharClass.ranges -- add_range (re_lexer.c) maintains
- * them sorted and coalesced, so this is a drop-in for the old linear scan
- * (docs/IMPROVEMENTS.md section 2); \p{L} alone is ~700 ranges, paid per
- * text position. */
+ * them sorted and coalesced, so this is a drop-in for the old linear
+ * scan; \p{L} alone is ~700 ranges, paid per text position. */
 static inline bool class_contains(const CharClass* cls, uint32_t cp) {
     int lo = 0, hi = cls->range_count - 1;
     while (lo <= hi) {
@@ -144,8 +141,8 @@ static inline bool class_contains(const CharClass* cls, uint32_t cp) {
  * directly in this struct -- and this struct was itself embedded 512 times
  * over in vm_execute_internal's backtrack stack, making that function's
  * own C stack frame ~2.2MB regardless of how many capture groups the
- * compiled pattern actually has. Confirmed via ASan (docs/IMPROVEMENTS.md
- * #1.1): this crashed the process after only ~3 levels of lookaround
+ * compiled pattern actually has. Confirmed via ASan: this crashed the
+ * process after only ~3 levels of lookaround
  * recursion, since every level of nesting is a fresh, non-tail call to
  * this same function, each paying that same ~2.2MB again. Fixed by making
  * captures a pointer into a shared arena that vm_execute_internal
@@ -193,7 +190,7 @@ static inline void thread_copy_state(Thread* dst, const Thread* src, int cap_pai
  * was a fixed Thread[512] with UNCHECKED pushes, meaning e.g. [a-z]+
  * against 600 consecutive letters wrote past its end (confirmed via ASan:
  * heap-buffer-overflow in thread_copy_state -- a text-driven memory-safety
- * bug, unlike the pattern-driven ones in docs/IMPROVEMENTS.md #1.2). The
+ * bug, unlike the pattern-driven MAX_* overflow class). The
  * stack now doubles on demand up to this many entries; a match needing
  * more is abandoned as no-match (a documented engine limit, like
  * MAX_GROUPS -- there's no error channel on the exec path) rather than
@@ -219,7 +216,7 @@ typedef struct {
  * fail-cache initialization used to dominate unanchored searches by
  * orders of magnitude). depth[] is indexed by lookaround recursion depth;
  * MAX_AST_DEPTH bounds it because every lookaround level costs at least
- * one AST level, which the parser caps (docs/IMPROVEMENTS.md #1.3). */
+ * one AST level, which the parser caps (MAX_AST_DEPTH, regexp.h). */
 struct VMContext {
     int cap_pairs;
     VMDepth depth[MAX_AST_DEPTH];
@@ -326,7 +323,7 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
             Instruction inst = prog->code[current.pc];
             /* A dense switch over the opcode enum compiles to a jump table
              * where the old if/else-if chain compiled to sequential
-             * compares (docs/IMPROVEMENTS.md section 2). The opcode bodies
+             * compares. The opcode bodies
              * are unchanged; their `path_failed = true; break;` idiom now
              * breaks the switch instead of this while, so the
              * `if (path_failed) break;` after the switch completes the
@@ -410,8 +407,8 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                 /* The sp < text_end guard mirrors OP_ASSERT_END's: text need
                  * not be NUL-terminated (text_units is authoritative, per
                  * README), so end-of-text must be detected by bound, not by
-                 * reading a terminator (docs/IMPROVEMENTS.md #1.4, confirmed
-                 * OOB read one past a tightly-sized buffer). */
+                 * reading a terminator (a confirmed OOB read one past a
+                 * tightly-sized buffer). */
                 bool fold = inst.arg1 && prog->unicode;
                 bool left_is_word = (current.sp > original_text) && is_word_char_fold(*(current.sp - 1), fold);
                 bool right_is_word = (current.sp < text_end) && is_word_char_fold(*current.sp, fold);
@@ -559,7 +556,7 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                  * comment above), so the old `i < MAX_GROUPS` bound would
                  * write past the end of a smaller pattern's arena slice.
                  * Emitted by compile_node's AST_QUANTIFIER case at the top
-                 * of every loop iteration (docs/IMPROVEMENTS.md #1.8). */
+                 * of every loop iteration (ECMA-262 RepeatMatcher). */
                 for (int i = inst.arg1; i <= inst.arg2 && i <= prog->group_count; i++) {
                     current.captures[i * 2] = NULL;
                     current.captures[i * 2 + 1] = NULL;

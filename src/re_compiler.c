@@ -10,7 +10,7 @@
  * Split out of what was originally a single file (src/regexp.c, itself a
  * verbatim copy of jsvm2's src/regexp.c) for maintainability -- see
  * CLAUDE.md/README.md's "Provenance" section for why that diverges from
- * upstream's layout, and docs/IMPROVEMENTS.md section 4 for the rationale.
+ * upstream's layout.
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -23,7 +23,7 @@
 
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 
-/* Bounds-checked against MAX_OPCODES (see docs/IMPROVEMENTS.md #1.2, a
+/* Bounds-checked against MAX_OPCODES (a
  * confirmed heap-buffer-overflow: an unchecked pattern compiling to more
  * than MAX_OPCODES instructions wrote past prog->code[]). Once the limit is
  * hit, prog->error is set and every subsequent call clamps to the last
@@ -115,7 +115,7 @@ static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
  * id is a reference to a paren, not a paren). Because the parser assigns
  * ids in source order, a subtree's ids always form the contiguous range
  * [lo, hi] -- the same parenIndex/parenCount range ECMA-262's RepeatMatcher
- * is specified over. Recursion depth is bounded by MAX_AST_DEPTH (#1.3). */
+ * is specified over. Recursion depth is bounded by MAX_AST_DEPTH. */
 static void group_id_range(ASTNode* node, int* lo, int* hi) {
     if (!node) return;
     if (node->type == AST_GROUP && node->id > 0) {
@@ -231,8 +231,8 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
             prog->code[jmp].arg1 = prog->code_count; break;
         }
         case AST_QUANTIFIER: {
-            /* Bounds-checked against MAX_COUNTERS (see docs/IMPROVEMENTS.md
-             * #1.2, a confirmed stack-buffer-overflow: a pattern with more
+            /* Bounds-checked against MAX_COUNTERS (a
+             * confirmed stack-buffer-overflow: a pattern with more
              * than MAX_COUNTERS bounded quantifiers wrote past the VM's
              * per-thread counters[MAX_COUNTERS]/counter_sp[MAX_COUNTERS]
              * arrays). No reserved-zero convention here (unlike group ids),
@@ -254,7 +254,7 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
              * reset at the start of every iteration, so a branch that
              * doesn't participate in the final iteration ends up unset
              * rather than keeping a stale value from an earlier one
-             * (docs/IMPROVEMENTS.md #1.8 -- OP_CLEAR_CAPTURES existed in
+             * (OP_CLEAR_CAPTURES existed in
              * the VM but was never emitted). Placing the clear after
              * OP_CHECK_COUNTER is what preserves the "last successful
              * iteration wins" retention on exit: the exit thread
@@ -367,7 +367,7 @@ void compile_into(Program* prog, const uint16_t* regex, int flags) {
      * escapes -- but this engine has no such fallback: the lexer tokenizes
      * backslash-digits as TOK_BACKREF in every mode, so an unvalidated id
      * indexes captures[] far out of bounds at match time
-     * (docs/IMPROVEMENTS.md #1.6, confirmed OOB read via /(a)\999/).
+     * (confirmed OOB read via /(a)\999/).
      * Validating unconditionally trades exact Annex B semantics for a
      * SyntaxError, which is strictly safer than the UB it replaces. */
     if (!prog->error) {

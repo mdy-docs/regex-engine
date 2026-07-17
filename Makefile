@@ -21,7 +21,7 @@ test: test/smoke
 	./test/smoke
 
 # Same smoke test under ASan+UBSan. The OOB-read regression tests
-# (docs/IMPROVEMENTS.md #1.4/#1.5) exercise one-past-the-end reads on
+# exercise one-past-the-end reads on
 # tightly-sized buffers -- a plain build can pass those by silently reading
 # adjacent memory, so only this target actually proves them fixed.
 # -fno-sanitize-recover: UBSan only *prints* its findings by default and
@@ -54,18 +54,18 @@ test-wasm: wasm
 	node test/node_smoke.mjs
 
 # STACK_OVERFLOW_CHECK=2 -- deeply nested lookaround used to be a confirmed
-# C-stack-overflow crash (docs/IMPROVEMENTS.md #1.1, fixed: the VM's
+# C-stack-overflow crash (since fixed: the VM's
 # backtrack stack/fail-cache/per-thread captures are heap-allocated and
 # right-sized to the pattern's actual group count now, not fixed ~2.2MB
 # C-stack locals on every recursive call). Parsing itself still recurses
 # per nested paren group and is now hard-capped at MAX_AST_DEPTH=200
-# (docs/IMPROVEMENTS.md #1.3) rather than unbounded, but 200 levels is
+# rather than unbounded, but 200 levels is
 # still enough to want headroom under WASM specifically: Emscripten's
 # default stack is only 64KB (confirmed: 8 nested lookaheads previously
 # overflowed a 64KB stack during parsing alone, well under the 200 cap).
 # STACK_SIZE is bumped to 8MB, matching a typical native default, so this
 # build tolerates the full MAX_AST_DEPTH range same as a native embedder
-# would. Kept as defense-in-depth even though #1.1 (the original, more
+# would. Kept as defense-in-depth even though the VM recursion (the original, more
 # severe reason for both flags) is fixed: STACK_OVERFLOW_CHECK turns any
 # *future* stack issue into a catchable RuntimeError (see web/app.js)
 # instead of silent linear-memory corruption, which is worth keeping

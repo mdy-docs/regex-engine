@@ -16,11 +16,9 @@ exact engine, compiled to WebAssembly, entirely in your browser.
 **New to this repo?** Start with [`CLAUDE.md`](CLAUDE.md) — it's the
 onboarding doc (for humans and AI agents alike) and points to
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (how the engine works
-internally) and [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md) (a
-structure/performance/testing/correctness analysis with several confirmed,
-reproducible findings — including memory-safety issues — worth reading
-before relying on this in anything security-sensitive or exposed to
-untrusted patterns).
+internally, including the memory-safety and correctness history worth
+knowing before relying on this in anything security-sensitive or exposed
+to untrusted patterns).
 
 ## Provenance
 
@@ -46,7 +44,7 @@ originally extracted here as a single verbatim file of the same name. It
 has since been split into `src/re_lexer.c` / `re_parser.c` / `re_compiler.c`
 / `re_vm.c` (plus a private `src/re_internal.h` for what's shared between
 them) for maintainability — see `docs/ARCHITECTURE.md`'s intro for the
-current layout and `docs/IMPROVEMENTS.md` section 4 for why. This is a
+current layout and why. This is a
 deliberate, acknowledged divergence from jsvm2's own single-file layout: if
 you're porting a fix from (or back to) jsvm2's `regexp.c`, the code itself
 is still line-for-line recognizable, just reorganized by pipeline stage —
@@ -75,7 +73,6 @@ web/
   index.html/style.css/app.js   the WASM playground demo (see "Web demo" below)
 docs/
   ARCHITECTURE.md  how the lexer/parser/compiler/VM actually work
-  IMPROVEMENTS.md  structure/perf/testing/correctness analysis with confirmed findings
 .github/workflows/
   test.yml         make test + make test-wasm on every push/PR
   pages.yml         builds the wasm demo and deploys web/ to GitHub Pages
@@ -227,10 +224,11 @@ can't do for you: in the repo's **Settings → Pages**, set **Source** to
 **GitHub Actions**.
 
 The demo's Makefile target enables Emscripten's `STACK_OVERFLOW_CHECK` and
-a larger `STACK_SIZE` specifically because this engine has a confirmed
-C-stack-overflow crash on some inputs (see `docs/IMPROVEMENTS.md` #1.1) —
-without those flags a crash can silently corrupt WASM linear memory instead
-of throwing a catchable error. `web/app.js` catches that error and
+a larger `STACK_SIZE` because deeply nested patterns once caused a
+confirmed C-stack-overflow crash here (since fixed, but parsing still
+recurses per nested group and Emscripten's default stack is only 64KB) —
+without those flags an overflow can silently corrupt WASM linear memory
+instead of throwing a catchable error. `web/app.js` catches that error and
 transparently reloads the WASM instance so the page keeps working; that's a
 build/host-level mitigation, not a fix for the underlying engine bug.
 

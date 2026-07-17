@@ -165,11 +165,10 @@ int main(void) {
      * string alternatives, exercised below too), so these always compiled
      * successfully but could never match anything. */
     {
-        /* Emoji_Keycap_Sequence: 12 short sequences (well under the
-         * existing 128-strings-per-class cap that \q{...} already had --
-         * larger properties like RGI_Emoji (2604 sequences) or
-         * RGI_Emoji_Flag_Sequence (259) still silently truncate to their
-         * first 128 after this fix; see docs/IMPROVEMENTS.md). */
+        /* Emoji_Keycap_Sequence: 12 short sequences. (The larger
+         * properties -- RGI_Emoji's 2604 sequences and friends -- are
+         * covered in full by the heap-sized string-set tests further
+         * down, now that the old 128-per-class cap is gone.) */
         uint16_t* pattern = to_utf16("\\p{Emoji_Keycap_Sequence}");
         uintptr_t h = regex_compile(pattern, 0, regex_flag_bit('v'));
         check(h != 0, "\\p{Emoji_Keycap_Sequence} compiles under /v");
@@ -228,7 +227,7 @@ int main(void) {
 
     /* MAX_CLASSES/MAX_GROUPS/MAX_COUNTERS/MAX_OPCODES bounds checking.
      * Regression tests for a confirmed bug: none of these were enforced
-     * (docs/IMPROVEMENTS.md #1.2) -- a pattern exceeding any of them wrote
+     * -- a pattern exceeding any of them wrote
      * past the corresponding fixed-size array (heap corruption for classes/
      * opcodes, stack corruption for groups/counters), confirmed via ASan.
      * Each "exceeds the limit" case below is chosen to reject *without*
@@ -299,7 +298,7 @@ int main(void) {
     }
 
     /* MAX_AST_DEPTH: regression tests for the actual stack-overflow bug
-     * (docs/IMPROVEMENTS.md #1.3) -- free_ast, validate_group_names,
+     * -- free_ast, validate_group_names,
      * validate_backrefs, validate_named_backrefs, and compile_node all
      * recurse through the parsed AST with no depth limit, and
      * parse_concat/parse_alt build linear (unbalanced) chains for flat
@@ -415,8 +414,8 @@ int main(void) {
         free(p);
     }
 
-    /* Nested lookaround no longer exhausts the C stack (docs/IMPROVEMENTS.md
-     * #1.1). vm_execute_internal used to stack-allocate a ~2.2MB backtrack
+    /* Nested lookaround no longer exhausts the C stack:
+     * vm_execute_internal used to stack-allocate a ~2.2MB backtrack
      * stack + fail-cache on *every* call, including every recursive call
      * OP_LOOKAHEAD/OP_LOOKBEHIND makes into itself -- confirmed via ASan to
      * crash the process after only 3 levels of lookaround nesting on an
@@ -479,14 +478,14 @@ int main(void) {
         regex_free(h);
     }
 
-    /* The three P1 OOB reads (docs/IMPROVEMENTS.md #1.4/#1.5/#1.6). The
+    /* Three confirmed, since-fixed OOB reads. The
      * buffer-edge cases below use exactly-sized heap buffers with no NUL
      * terminator and no slack -- explicitly allowed by regex_exec's contract
      * (text_units is authoritative; see README) -- so that the pre-fix
      * one-past-the-end reads are hard ASan violations under `make test-asan`
      * rather than silently reading whatever byte happens to follow. */
     {
-        /* #1.4: \b/\B at the very end of the text used to dereference one
+        /* \b/\B at the very end of the text used to dereference one
          * unit past text_end unconditionally (OP_ASSERT_END has the sp <
          * text_end guard; the word-boundary ops were missing it). Behavior
          * checked against Node: /abc\b/ matches 'abc', /abc\B/ does not. */
@@ -506,7 +505,7 @@ int main(void) {
         free(text);
     }
     {
-        /* #1.5: decode_utf16's trail-surrogate peek used to be unbounded, so
+        /* decode_utf16's trail-surrogate peek used to be unbounded, so
          * a buffer ending in a lone lead surrogate was read one unit past its
          * end. A lone surrogate must decode as itself (Node: /./u.exec of a
          * bare U+D83D matches it). */
@@ -525,7 +524,7 @@ int main(void) {
         regex_free(h);
     }
     {
-        /* #1.5, backreference path: the ignore-case backref comparison has
+        /* Backreference path of the same fix: the ignore-case backref comparison has
          * its own decode_utf16 calls; text of two lone lead surrogates puts
          * the second decode exactly at the buffer edge. Node:
          * /(.)\1/iu.exec('\uD83D\uD83D') matches the whole 2-unit string. */
@@ -544,7 +543,7 @@ int main(void) {
         regex_free(h);
     }
     {
-        /* #1.6: out-of-range numeric backreferences were only validated
+        /* Out-of-range numeric backreferences were only validated
          * under /u; in non-unicode mode /(a)\999/ emitted OP_BACKREF 999,
          * indexing captures[] far out of bounds at match time. Now a
          * SyntaxError in every mode -- a documented deviation from Annex B
@@ -568,8 +567,8 @@ int main(void) {
         regex_free(hgood);
     }
 
-    /* Non-unicode-mode builtin classes span the full UTF-16 code-unit space
-     * (docs/IMPROVEMENTS.md #1.7). `.`/`\D`/`\W`/`\S` were wrongly capped at
+    /* Non-unicode-mode builtin classes span the full UTF-16 code-unit
+     * space. `.`/`\D`/`\W`/`\S` were wrongly capped at
      * codepoint 255 (and \s dropped its >255 entries) -- ECMAScript has
      * never Latin-1-scoped these; /u only gates surrogate-pair decoding.
      * Every expectation below was diffed against Node with no flags. */
@@ -680,7 +679,7 @@ int main(void) {
     }
 
     /* Captures inside a quantified atom reset at the start of every
-     * iteration (ECMA-262 RepeatMatcher; docs/IMPROVEMENTS.md #1.8).
+     * iteration (ECMA-262 RepeatMatcher).
      * Regression tests for a confirmed bug: OP_CLEAR_CAPTURES existed in
      * the VM but was never emitted, so a branch that didn't participate in
      * the final iteration kept its stale value from an earlier one. Every
@@ -771,7 +770,7 @@ int main(void) {
         regex_free(h);
     }
 
-    /* Silent-failure spots (docs/IMPROVEMENTS.md #1.9): unknown \p{...}
+    /* Silent-failure spots: unknown \p{...}
      * names silently compiled to an empty class (so \p{Bogus} never matched
      * and \P{Bogus} matched EVERYTHING, where Node raises SyntaxError for
      * both), and capture-group names silently truncated to 31 UTF-8 bytes
@@ -820,8 +819,7 @@ int main(void) {
         free(pfit);
     }
 
-    /* \p{...} key/namespace handling per ECMA-262 (the spec-compliance item
-     * under docs/IMPROVEMENTS.md #1.9): bare names may only be binary
+    /* \p{...} key/namespace handling per ECMA-262: bare names may only be binary
      * properties or General_Category values; Script/Script_Extensions
      * require their keyed form; keys are case-sensitive; contributory
      * properties are rejected; properties of strings require /v. All of
@@ -914,12 +912,11 @@ int main(void) {
     }
 
     /* The backtrack stack grows on demand. Regression test for a confirmed
-     * crash (found while benchmarking, unlisted in docs/IMPROVEMENTS.md's
-     * original section 1): the greedy-quantifier loop pushes one backtrack
+     * crash (found while benchmarking): the greedy-quantifier loop pushes one backtrack
      * entry per iteration into what was a fixed 512-slot heap array with
      * UNCHECKED pushes -- [a-z]+ against ~600 consecutive matching units
      * wrote past its end (ASan: heap-buffer-overflow in thread_copy_state).
-     * Text-driven, unlike the pattern-driven overflows of #1.2: any
+     * Text-driven, unlike the pattern-driven MAX_* overflows: any
      * quantifier over a long enough run of ordinary text triggered it. */
     {
         int n = 100000;
@@ -1021,8 +1018,8 @@ int main(void) {
     }
 
     /* A class escape used as a character-class range endpoint is an early
-     * SyntaxError under /u (IsCharacterClass -> error). Regression for
-     * docs/CONFORMANCE_GAPS.md #4: the rejection covered \d\w\s but not
+     * SyntaxError under /u (IsCharacterClass -> error). Regression:
+     * the rejection covered \d\w\s but not
      * \p{...}, and /v-only && / -- exceptions wrongly suppressed it in
      * plain /u. Non-/u (Annex B legacy) still permits these. Diffed vs
      * Node. */
@@ -1052,7 +1049,7 @@ int main(void) {
     }
 
     /* Unicode case folding of BUILT-IN class escapes and word boundaries
-     * under /iu (docs/CONFORMANCE_GAPS.md gap #1, since fixed). Simple case
+     * under /iu (a since-fixed conformance gap). Simple case
      * folding sends U+017F LONG S to 's' and U+212A KELVIN SIGN to 'k', so
      * under /iu they are word characters: \w and \b must treat them as
      * such, and \W/\B must not -- all-or-nothing, or a char matches both.
@@ -1137,7 +1134,7 @@ int main(void) {
     }
 
     /* /v-mode set operations over both codepoint and string components
-     * (docs/CONFORMANCE_GAPS.md gap #2, since fixed): && and -- must act
+     * (a since-fixed conformance gap): && and -- must act
      * on \q{...} string sets and properties-of-strings, single-codepoint
      * \q alternatives live in the codepoint set, operators can't be mixed
      * with union or ranges, and /v's reserved punctuators are enforced.
@@ -1236,8 +1233,8 @@ int main(void) {
         }
     }
 
-    /* Full multi-codepoint sequence coverage (docs/CONFORMANCE_GAPS.md
-     * gap #3, since fixed): CharClass string sets are heap-sized now, so
+    /* Full multi-codepoint sequence coverage (a since-fixed conformance
+     * gap): CharClass string sets are heap-sized now, so
      * the large properties of strings match ALL their sequences, not just
      * the first 128 -- \p{RGI_Emoji} has 2604. Both probes below sit far
      * past the old cap in the generated table. */

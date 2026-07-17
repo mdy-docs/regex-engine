@@ -19,7 +19,7 @@ It was extracted from a JS engine called jsvm2 (see README.md
 compiler + VM in one file. That file (`src/regexp.c`) has since been split
 into `src/re_lexer.c` / `re_parser.c` / `re_compiler.c` / `re_vm.c` (plus
 `src/re_internal.h` for what's shared between them) for maintainability —
-see `docs/ARCHITECTURE.md`'s intro and `docs/IMPROVEMENTS.md` section 4.
+see `docs/ARCHITECTURE.md`'s intro.
 The *code* is still upstream-derived (treat it as "upstream-derived," not
 repo-native code you'd casually restyle) — the *file layout* is not; it's
 an intentional, acknowledged divergence from jsvm2's own single-file
@@ -34,14 +34,11 @@ against jsvm2's own regex test coverage").
    → AST → bytecode → backtracking VM with a fail-cache, `Program` struct
    layout, the UCD table generator. Read this before touching
    `src/re_lexer.c`/`re_parser.c`/`re_compiler.c`/`re_vm.c`.
-3. `docs/IMPROVEMENTS.md` — a structural/quality/perf/testing/correctness
-   analysis with concrete, verified findings. Originally a list of open
-   bugs; now mostly a record of fixes (all of §1–§4 addressed), so read it
-   for *how the engine got to where it is* and what was deliberately left.
-4. `docs/CONFORMANCE_GAPS.md` — the remaining, enumerated ways the engine
-   diverges from a real ECMAScript engine, each with a fix approach. The
-   work-through list; paired with `test/test262.expectations` (the
-   machine-checked set the `make test262` CI job enforces).
+3. `test/test262.expectations` — the machine-checked set of known test262
+   failures the `make test262` CI job enforces (it can only shrink, since
+   an unexpected *pass* also fails the run). Every engine-side conformance
+   gap has been closed; the remaining entries are deliberate scope
+   decisions, documented inline in that file.
 
 ## Layout (see README.md for the authoritative version)
 
@@ -58,7 +55,7 @@ src/regex_wasm.c      thin WASM shim: opaque handles, UTF-16-in/int32-out
 scripts/generate_ucd.py  regenerates include/ucd.h from unicode.org data
 test/smoke.c           native smoke test (no Emscripten needed)
 test/node_smoke.mjs    end-to-end test against the real compiled .wasm
-docs/                  ARCHITECTURE.md, IMPROVEMENTS.md (this repo's own docs)
+docs/                  ARCHITECTURE.md (this repo's own docs)
 web/                   browser regex-playground demo, deployed to GitHub Pages
 ```
 
@@ -79,8 +76,9 @@ make demo       # builds wasm, copies artifacts into web/, so the demo runs loca
 clear "command not found" — `make test` alone needs nothing but a C compiler.
 
 **Always run `make test` after editing any `src/re_*.c`/`.h` or `include/regexp.h`.**
-It's a broad regression suite now (every `docs/IMPROVEMENTS.md` §1 finding
-plus the conformance/fuzz-found bugs), but still not exhaustive — if you're
+It's a broad regression suite now (every historical memory-safety and
+correctness finding plus the conformance/fuzz-found bugs), but still not
+exhaustive — if you're
 touching matching semantics (not just the shim), also run `make test262`,
 and sanity-check new cases against a real JS engine
 (`node -e "console.log(/pattern/flags.exec('text'))"`). `make test262`
@@ -90,15 +88,17 @@ reasons in `test/test262.expectations`.
 ## Load-bearing constraints — do not violate these silently
 
 - **`Program` is a large fixed-size struct** (`MAX_OPCODES`, `MAX_CLASSES`,
-  `MAX_GROUPS`, `MAX_COUNTERS` in `include/regexp.h`), always heap-allocated,
-  never on the stack, and **compiled once and reused** across many
+  `MAX_GROUPS`, `MAX_COUNTERS` in `include/regexp.h` — the one heap-owned
+  exception is each class's string set; see `CharClass`'s ownership rules
+  there), always heap-allocated, never on the stack, **zero-initialized
+  before its first compile**, and **compiled once and reused** across many
   `regex_exec` calls — don't recompile per match attempt.
 - **All of those `MAX_*` bounds are now enforced at compile time** (they
-  weren't originally — see `docs/IMPROVEMENTS.md` §Correctness, P0 items,
-  all fixed): exceeding one sets `prog->error` and fails compilation
+  weren't originally — exceeding one was confirmed memory corruption):
+  exceeding one sets `prog->error` and fails compilation
   cleanly instead of overflowing a fixed-size array. If you add a new
   allocation site against any of these arrays, follow the same
-  check-before-index pattern (`docs/IMPROVEMENTS.md` #1.2) — the bound
+  check-before-index pattern used at every existing site — the bound
   being enforced elsewhere won't protect your new site.
 - `regex_compile`'s `pattern` **must be NUL-terminated**; `regex_exec`'s
   `text` does **not** need to be, and `text_units` is authoritative — a

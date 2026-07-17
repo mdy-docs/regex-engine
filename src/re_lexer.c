@@ -9,7 +9,7 @@
  * Split out of what was originally a single file (src/regexp.c, itself a
  * verbatim copy of jsvm2's src/regexp.c) for maintainability -- see
  * CLAUDE.md/README.md's "Provenance" section for why that diverges from
- * upstream's layout, and docs/IMPROVEMENTS.md section 4 for the rationale.
+ * upstream's layout.
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -50,7 +50,7 @@ static inline bool is_digit_char(uint32_t c) {
 }
 
 /* Allocates the next CharClass slot, bounds-checked against MAX_CLASSES
- * (previously unchecked -- see docs/IMPROVEMENTS.md #1.2, a confirmed heap-
+ * (previously unchecked -- a confirmed heap-
  * buffer-overflow: a pattern with more than MAX_CLASSES distinct classes
  * silently wrote past prog->classes[]). Once the limit is hit, prog->error
  * is set and every subsequent call clamps to the last valid slot instead of
@@ -227,8 +227,8 @@ static int64_t rx_idname_cp(const uint16_t* src, int* pos) {
  * bytes + NUL). Silently truncating instead used to be actively wrong, not
  * just lossy: two group names identical in their first 31 bytes collided
  * into a spurious "Duplicate capture group name" error, and a truncated
- * name would resolve \k<...> backreferences against the wrong spelling
- * (docs/IMPROVEMENTS.md #1.9). The spec puts no length limit on group
+ * name would resolve \k<...> backreferences against the wrong spelling.
+ * The spec puts no length limit on group
  * names, so rejecting long ones is an engine limit like MAX_GROUPS -- the
  * caller reports it as such, loudly. */
 static bool rx_name_append_utf8(char* buf, int* len, uint32_t cp) {
@@ -282,8 +282,8 @@ static bool parse_group_name(Lexer* lexer, char* out) {
 }
 
 /* Appends one sequence to a class's heap-owned string set, growing it as
- * needed. No fixed cap (the point of the since-fixed CONFORMANCE_GAPS #3:
- * the old embedded strings[128] silently truncated RGI_Emoji's 2604
+ * needed. No fixed cap (the point of this design: the previous embedded
+ * strings[128] silently truncated RGI_Emoji's 2604
  * sequences); allocation failure is fatal, matching the engine's OOM
  * policy everywhere else. Deduplication is the caller's business
  * (class_add_string) -- property fills come from already-duplicate-free
@@ -372,7 +372,7 @@ static bool add_range(CharClass* cls, uint32_t start, uint32_t end) {
  * ECMAScript's \D/\W/\S have never been Latin-1-scoped in any mode -- what
  * /u gates is surrogate-pair *decoding*, so without it the match space is
  * the full UTF-16 code-unit range 0-0xFFFF (docs/ARCHITECTURE.md's lexer
- * invariant; docs/IMPROVEMENTS.md #1.7, diffed against Node). The \s list
+ * invariant, diffed against Node). The \s list
  * itself is mode-independent per spec (WhiteSpace/LineTerminator don't
  * change under /u), so it gets no cutoff at all.
  *
@@ -417,8 +417,8 @@ static void fill_builtin_class(CharClass* cls, char type, bool unicode, bool fol
 }
 
 /* Process-lifetime cache of expanded \p{...} classes, keyed by property
- * name. Deliberately simple, with two documented consequences
- * (docs/IMPROVEMENTS.md #1.9): it never evicts (the 65th+ distinct
+ * name. Deliberately simple, with two documented consequences:
+ * it never evicts (the 65th+ distinct
  * property in a process just loses the caching speedup -- results stay
  * correct), and being file-scope static it is NOT thread-safe -- fine for
  * WASM (single-threaded) and single-threaded native embedders, but a
@@ -464,8 +464,7 @@ static int prop_cache_count = 0;
  *     codepoint complement (`\P{Basic_Emoji}` fails to compile even in /v).
  * Rejected expressions are never cached (a stream of distinct bogus names
  * must not fill the cache's 64 slots), and unknown names used to be
- * silently accepted as an empty class -- see docs/IMPROVEMENTS.md #1.9 and
- * the spec-compliance item below it. Callers must check the return value
+ * silently accepted as an empty class. Callers must check the return value
  * and set prog->error accordingly.
  *
  * Under /iu the caller is responsible for case folding the RESULT (the
@@ -878,7 +877,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                         /* Same rule for a class escape as the range END atom
                          * ([a-\d], [a-\p{Hex}]): SyntaxError in unicode mode.
                          * \p/\P (property escapes) must be rejected here too,
-                         * not just \d\w\s (docs/CONFORMANCE_GAPS.md #4). */
+                         * not just \d\w\s (confirmed vs Node). */
                         if (lexer->prog->unicode && esc < 128 &&
                             (strchr("dDwWsS", (char)esc) || esc == 'p' || esc == 'P')) {
                             lexer->prog->error = "SyntaxError: Invalid character class range";
@@ -1369,8 +1368,7 @@ void next_token(Lexer* lexer) {
         case '.': {
             int cid = alloc_class(lexer->prog);
             /* 0xFFFF, not 255, without /u: same full-code-unit-space
-             * invariant as fill_builtin_class above (docs/IMPROVEMENTS.md
-             * #1.7). The U+2028/U+2029 LineTerminator exclusion applies in
+             * invariant as fill_builtin_class above. The U+2028/U+2029 LineTerminator exclusion applies in
              * both modes -- the old non-unicode branch skipping it was only
              * ever masked by the 255 cap putting both out of reach. */
             uint32_t max_cp = lexer->prog->unicode ? 0x10FFFF : 0xFFFF;
