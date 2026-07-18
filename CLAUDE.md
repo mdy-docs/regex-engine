@@ -14,18 +14,6 @@ consumption modes:
 2. **WASM**, via `src/regex_wasm.c`'s low-level shim, consumed from JS in
    both browser and Node.
 
-It was extracted from a JS engine called jsvm2 (see README.md
-"Provenance") and started as a **verbatim copy** of that engine's regex
-compiler + VM in one file. That file (`src/regexp.c`) has since been split
-into `src/re_lexer.c` / `re_parser.c` / `re_compiler.c` / `re_vm.c` (plus
-`src/re_internal.h` for what's shared between them) for maintainability —
-see `docs/ARCHITECTURE.md`'s intro.
-The *code* is still upstream-derived (treat it as "upstream-derived," not
-repo-native code you'd casually restyle) — the *file layout* is not; it's
-an intentional, acknowledged divergence from jsvm2's own single-file
-version. Bugs found here likely exist in jsvm2 too (see README's "Testing
-against jsvm2's own regex test coverage").
-
 ## Read these next, in order
 
 1. `README.md` — build instructions, public API, integration guide. Ground
