@@ -135,6 +135,25 @@ void class_strings_free(CharClass* cls);
 typedef struct VMContext VMContext;
 VMContext* vm_context_new(const Program* prog);
 void vm_context_free(VMContext* ctx);
+
+/* Hard step budget: the maximum number of VM instructions this context may
+ * execute across every vm_execute entry (including lookaround recursion)
+ * for the context's whole lifetime. 0 (the default) means unlimited --
+ * existing consumers are unaffected unless they opt in. When the budget is
+ * exhausted the in-flight match is abandoned (vm_execute returns false,
+ * like the VM_STACK_MAX limit) and vm_context_budget_exhausted() reports
+ * true, letting a host distinguish "no match" from "gave up" and surface a
+ * catchable error instead of hanging. This is the engine's defense against
+ * catastrophic backtracking that the fail cache does not catch: the cache
+ * is direct-mapped (CACHE_SIZE slots, collisions evict) and is
+ * generation-cleared across lookaround boundaries, so pathological
+ * patterns -- /(a+)+$/ against a few hundred 'a's is enough -- still
+ * backtrack exponentially without a budget. Embedders running untrusted
+ * patterns should always set one; a budget linear in the subject length
+ * (e.g. 1e6 + 2000/unit) bounds superlinear blowup while leaving orders of
+ * magnitude of headroom for legitimate matching. */
+void vm_context_set_step_budget(VMContext* ctx, uint64_t max_steps);
+bool vm_context_budget_exhausted(const VMContext* ctx);
 bool vm_execute(Program* prog, VMContext* ctx, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures);
 
 /* One-shot convenience wrapper: creates a context, runs vm_execute once,

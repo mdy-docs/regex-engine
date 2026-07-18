@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "regex_wasm.h"
+#include "regexp.h" /* engine API: the step-budget block drives VMContext directly */
 
 static int failures = 0;
 
@@ -1261,6 +1262,66 @@ int main(void) {
         check(h2 != 0 && regex_exec(h2, blackbird, 4, 0) && !regex_exec(h2, flag_cq, 4, 0),
               "[\\p{RGI_Emoji}--\\q{flag CQ}]/v keeps 2603 sequences, drops the subtracted one");
         free(p2); regex_free(h2);
+    }
+
+    /* Step budget (vm_context_set_step_budget): the hard cap on VM work
+     * that the fail cache alone does not provide. Without a budget,
+     * /(a+)+$/ against a few hundred 'a's and no terminator backtracks
+     * exponentially (the cache is direct-mapped and counter-keyed states
+     * defeat it) -- the third check below hangs the suite if the budget
+     * mechanism regresses. Drives the engine API directly: budgets live on
+     * VMContext, which the regex_wasm.c shim does not (yet) expose. */
+    {
+        uint16_t* pattern = to_utf16("(a+)+$");
+        Program* prog = (Program*)calloc(1, sizeof(Program));
+        compile_into(prog, pattern, 0);
+        check(prog->error == NULL, "compile (a+)+$ succeeds");
+
+        /* subject: 200 'a's then 'b' -- no match, catastrophic without a cap */
+        int n = 201;
+        uint16_t* text = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)n);
+        for (int i = 0; i < n - 1; i++) text[i] = 'a';
+        text[n - 1] = 'b';
+        const uint16_t* caps[MAX_GROUPS * 2] = {0};
+
+        /* unlimited (default) still matches normal input */
+        VMContext* c1 = vm_context_new(prog);
+        check(vm_execute(prog, c1, 0, 1, text, text + (n - 1), text, caps),
+              "default (unlimited) context matches 200 a's with terminator absent"
+              " (anchored at $ over the a-run)");
+        check(!vm_context_budget_exhausted(c1), "unlimited context never reports exhaustion");
+        vm_context_free(c1);
+
+        /* a tiny budget trips and reports, instead of matching */
+        VMContext* c2 = vm_context_new(prog);
+        vm_context_set_step_budget(c2, 10);
+        check(!vm_execute(prog, c2, 0, 1, text, text + (n - 1), text, caps),
+              "10-step budget abandons the match");
+        check(vm_context_budget_exhausted(c2), "10-step budget reports exhaustion");
+        vm_context_free(c2);
+
+        /* the ReDoS case: full subject (a^200 b), scan loop over every start
+         * position sharing one context, generous-but-bounded budget. This
+         * check HANGS (exponential backtracking) if the budget stops being
+         * enforced. */
+        VMContext* c3 = vm_context_new(prog);
+        vm_context_set_step_budget(c3, 5 * 1000 * 1000);
+        bool matched = false;
+        for (int i = 0; i < n && !matched; i++)
+            matched = vm_execute(prog, c3, 0, 1, text, text + n, text + i, caps);
+        check(!matched && vm_context_budget_exhausted(c3),
+              "(a+)+$ over a^200:b exhausts a 5M-step budget instead of hanging");
+        /* exhaustion is sticky: the same context refuses further entries
+         * immediately (a matchable subject, but the context is spent) */
+        uint16_t just_a = 'a';
+        check(!vm_execute(prog, c3, 0, 1, &just_a, &just_a + 1, &just_a, caps),
+              "an exhausted context refuses further matches");
+        vm_context_free(c3);
+
+        for (int i = 0; i < prog->class_count; i++) class_strings_free(&prog->classes[i]);
+        free(prog);
+        free(pattern);
+        free(text);
     }
 
     if (failures == 0) {

@@ -370,6 +370,22 @@ typedef struct {
   *containing* a lookaround that itself contains a quantifier gets a
   logically fresh, uncorrelated cache for the inner call each time the
   outer one is retried.
+- The **step budget** (`vm_context_set_step_budget`, fields on
+  `VMContext`) is the hard backstop the cache is not: the cache is
+  direct-mapped (collisions evict) and hashes `(pc, sp, counters[])`, so
+  counter-keyed quantifier states defeat it — `(a+)+$` against a few
+  hundred characters with no terminator is confirmed exponential without a
+  budget (see `test/smoke.c`'s budget block, which hangs the suite if
+  enforcement regresses). One step = one instruction dispatch, counted in
+  the innermost loop across all VM entries and lookaround recursion for
+  the context's lifetime; backreference compares additionally charge their
+  O(capture length) unit-compare work. Exhaustion abandons the in-flight
+  match exactly like the `VM_STACK_MAX` abandon (plain `return false`; all
+  scratch is context-owned, so the context stays coherent), sets a sticky
+  flag readable via `vm_context_budget_exhausted`, and every subsequent
+  `vm_run` entry on that context fails immediately. Default is 0 =
+  unlimited — behavior is unchanged for consumers that don't opt in
+  (including, currently, the `regex_wasm.c` shim's `regex_exec`).
 - Opcode dispatch is a dense `switch` over the opcode enum
   (`re_vm.c:334`) inside the innermost `while (true)` loop — it compiles
   to a jump table where the original `if`/`else if` chain compiled to

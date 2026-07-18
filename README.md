@@ -149,6 +149,26 @@ Notes:
 - All offsets are **UTF-16 code units**, matching JS `String` indexing
   semantics (a `String.prototype.slice(caps[0], caps[1])` on the original
   JS string reconstructs the match).
+- **ReDoS / step budget**: the VM's fail cache defuses many classic
+  catastrophic-backtracking patterns, but not all of them (it is
+  direct-mapped and counter-keyed states defeat it — `(a+)+$` against a few
+  hundred characters backtracks exponentially). Native embedders running
+  untrusted patterns should drive the engine API directly and set a hard
+  step budget on their `VMContext`:
+
+  ```c
+  VMContext* ctx = vm_context_new(&prog);
+  vm_context_set_step_budget(ctx, 1000000 + 2000ull * text_units);
+  /* vm_execute(...) per start position ... */
+  if (vm_context_budget_exhausted(ctx)) { /* surface a catchable error */ }
+  vm_context_free(ctx);
+  ```
+
+  The budget spans the context's lifetime (all start positions of one exec
+  call, lookaround recursion included); 0 means unlimited, which is the
+  default — and what `regex_exec` in the WASM shim currently uses, so
+  shim consumers are *not* protected yet. See the comment above
+  `vm_context_set_step_budget` in `include/regexp.h`.
 
 ### Using from JavaScript via npm
 

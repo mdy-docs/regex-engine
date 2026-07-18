@@ -219,6 +219,15 @@ typedef struct {
  * one AST level, which the parser caps (MAX_AST_DEPTH, regexp.h). */
 struct VMContext {
     int cap_pairs;
+    /* Step budget (see regexp.h): counts every instruction executed through
+     * this context, across VM entries and lookaround recursion alike, for
+     * the context's lifetime. step_budget 0 = unlimited (the default via
+     * calloc); budget_exhausted is sticky so an exhausted context keeps
+     * refusing work instead of burning the tail of its budget once per
+     * start position of a scan loop. */
+    uint64_t step_budget;
+    uint64_t steps_used;
+    bool budget_exhausted;
     VMDepth depth[MAX_AST_DEPTH];
 };
 
@@ -230,6 +239,16 @@ VMContext* vm_context_new(const Program* prog) {
     }
     ctx->cap_pairs = (prog->group_count + 1) * 2;
     return ctx;
+}
+
+void vm_context_set_step_budget(VMContext* ctx, uint64_t max_steps) {
+    ctx->step_budget = max_steps;
+    ctx->steps_used = 0;
+    ctx->budget_exhausted = false;
+}
+
+bool vm_context_budget_exhausted(const VMContext* ctx) {
+    return ctx->budget_exhausted;
 }
 
 void vm_context_free(VMContext* ctx) {
@@ -271,6 +290,10 @@ static bool vm_grow_stack(VMDepth* d, int cap_pairs) {
 static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures) {
     int cap_pairs = ctx->cap_pairs;
     if (depth >= MAX_AST_DEPTH) return false; /* unreachable: the parser caps nesting */
+    /* Sticky budget check: once exhausted, every further entry (the scan
+     * loop's next start position, an outer thread retrying a lookaround)
+     * fails immediately instead of re-arming the counter. */
+    if (ctx->budget_exhausted) return false;
     VMDepth* d = &ctx->depth[depth];
     if (!d->stack) {
         d->capacity = VM_STACK_CAPACITY;
@@ -320,6 +343,14 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
         int path_start_pc = current.pc; const uint16_t* path_start_sp = current.sp; bool path_failed = false;
 
         while (true) {
+            /* One step = one instruction dispatch. Abandoning mid-path is
+             * safe for the same reason the VM_STACK_MAX abandon is: all
+             * scratch is context-owned and (re)initialized per entry, so a
+             * plain return leaves the context reusable. */
+            if (ctx->step_budget && ++ctx->steps_used > ctx->step_budget) {
+                ctx->budget_exhausted = true;
+                return false;
+            }
             Instruction inst = prog->code[current.pc];
             /* A dense switch over the opcode enum compiles to a jump table
              * where the old if/else-if chain compiled to sequential
@@ -439,6 +470,17 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                     }
                 }
                 if (start && end) {
+                    /* A backref compare is O(capture length) inside one
+                     * instruction dispatch; charge it against the budget so
+                     * long captures can't multiply per-step work past the
+                     * bound the budget is meant to enforce. */
+                    if (ctx->step_budget) {
+                        ctx->steps_used += (uint64_t)(end - start);
+                        if (ctx->steps_used > ctx->step_budget) {
+                            ctx->budget_exhausted = true;
+                            return false;
+                        }
+                    }
                     bool match = true;
                     if (inst.arg2) {
                         const uint16_t* temp_sp = current.sp;
