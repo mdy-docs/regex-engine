@@ -117,6 +117,8 @@ const char* regex_last_error(void);           // valid until the next regex_comp
 int      regex_group_count(uintptr_t handle); // capturing groups, not counting group 0 (the whole match)
 const char* regex_group_name(uintptr_t handle, int index); // "" if group `index` is unnamed
 int      regex_exec(uintptr_t handle, const uint16_t* text, int text_units, int start_index);
+void     regex_set_step_budget(uintptr_t handle, double max_steps); // 0 = unlimited (default); re-armed per exec
+int      regex_budget_exhausted(uintptr_t handle); // 1 iff the most recent exec gave up on its budget
 const int32_t* regex_captures_ptr(uintptr_t handle); // (group_count+1)*2 ints: [start0,end0, start1,end1, ...], -1 = unmatched
 void     regex_free(uintptr_t handle);
 ```
@@ -151,24 +153,24 @@ Notes:
   JS string reconstructs the match).
 - **ReDoS / step budget**: the VM's fail cache defuses many classic
   catastrophic-backtracking patterns, but not all of them (it is
-  direct-mapped and counter-keyed states defeat it — `(a+)+$` against a few
-  hundred characters backtracks exponentially). Native embedders running
-  untrusted patterns should drive the engine API directly and set a hard
-  step budget on their `VMContext`:
+  direct-mapped, collision-evicted, and bypassed entirely for patterns with
+  backreferences — `(a+)+$` against a few
+  hundred characters backtracks exponentially). Hosts running untrusted
+  patterns should always set a hard step budget. Through the shim:
 
   ```c
-  VMContext* ctx = vm_context_new(&prog);
-  vm_context_set_step_budget(ctx, 1000000 + 2000ull * text_units);
-  /* vm_execute(...) per start position ... */
-  if (vm_context_budget_exhausted(ctx)) { /* surface a catchable error */ }
-  vm_context_free(ctx);
+  regex_set_step_budget(handle, 1000000 + 2000.0 * text_units);
+  if (!regex_exec(handle, text, text_units, 0) && regex_budget_exhausted(handle)) {
+      /* gave up, not a genuine no-match -- surface a catchable error */
+  }
   ```
 
-  The budget spans the context's lifetime (all start positions of one exec
-  call, lookaround recursion included); 0 means unlimited, which is the
-  default — and what `regex_exec` in the WASM shim currently uses, so
-  shim consumers are *not* protected yet. See the comment above
-  `vm_context_set_step_budget` in `include/regexp.h`.
+  The budget is re-armed on every `regex_exec` call and spans that whole
+  call (all start positions, lookaround recursion included); 0 means
+  unlimited, which is the default. Native embedders driving the engine API
+  directly get the same via `vm_context_set_step_budget` /
+  `vm_context_budget_exhausted` on their `VMContext` — see the comment in
+  `include/regexp.h` for sizing guidance.
 
 ### Using from JavaScript via npm
 

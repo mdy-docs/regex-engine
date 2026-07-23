@@ -18,10 +18,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ucd.h"
 #include "regexp.h"
 #include "re_internal.h"
 
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+
+/* Under /i the fold both sides of an OP_CHAR comparison get is fixed at
+ * compile time (whether /u applies is a whole-pattern fact, and modifier
+ * groups toggle only i/m/s), and both folds are idempotent -- so the
+ * constant operand can be canonicalized once here, leaving the VM to fold
+ * only the input character per dispatch. */
+static uint32_t emit_char_operand(const Program* prog, uint32_t ch) {
+    if (!prog->ignore_case) return ch;
+    return prog->unicode ? unicode_casefold(ch) : annexb_canonicalize(ch);
+}
 
 /* Bounds-checked against MAX_OPCODES (a
  * confirmed heap-buffer-overflow: an unchecked pattern compiling to more
@@ -94,9 +105,9 @@ static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
         if (split != -1) prog->code[split].arg1 = prog->code_count;
         StringSequence* seq = &cls->strings[order[i].index];
         if (rtl) {
-            for (int k = seq->length - 1; k >= 0; k--) emit(prog, OP_CHAR, seq->cps[k], prog->ignore_case, 0, 0, false);
+            for (int k = seq->length - 1; k >= 0; k--) emit(prog, OP_CHAR, emit_char_operand(prog, seq->cps[k]), prog->ignore_case, 0, 0, false);
         } else {
-            for (int k = 0; k < seq->length; k++) emit(prog, OP_CHAR, seq->cps[k], prog->ignore_case, 0, 0, false);
+            for (int k = 0; k < seq->length; k++) emit(prog, OP_CHAR, emit_char_operand(prog, seq->cps[k]), prog->ignore_case, 0, 0, false);
         }
         if (has_more) {
             jmp_pcs[jmp_count++] = emit(prog, OP_JMP, 0, 0, 0, 0, false);
@@ -143,7 +154,7 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
         case AST_ASSERT_END:   emit(prog, OP_ASSERT_END, prog->multiline, 0, 0, 0, false); break;
         case AST_WORD_BOUNDARY:emit(prog, OP_WORD_BOUNDARY, prog->ignore_case, 0, 0, 0, false); break;
         case AST_NON_WORD_BOUNDARY:emit(prog, OP_NON_WORD_BOUNDARY, prog->ignore_case, 0, 0, 0, false); break;
-        case AST_BACKREF:      emit(prog, OP_BACKREF, node->id, prog->ignore_case, 0, 0, false); break;
+        case AST_BACKREF:      emit(prog, OP_BACKREF, node->id, prog->ignore_case, 0, 0, false); prog->has_backrefs = true; break;
         case AST_NAMED_BACKREF: {
             /* Emit OP_NAMED_BACKREF, not OP_BACKREF: with ES2025 duplicate
              * group names, which group a \k<name> refers to is only known
@@ -160,7 +171,7 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
                     break;
                 }
             }
-            if (gid != -1) emit(prog, OP_NAMED_BACKREF, gid, prog->ignore_case, 0, 0, false);
+            if (gid != -1) { emit(prog, OP_NAMED_BACKREF, gid, prog->ignore_case, 0, 0, false); prog->has_backrefs = true; }
             break;
         }
         case AST_MODIFIER_GROUP: {
@@ -180,7 +191,7 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
             prog->ignore_case = old_ignore_case; prog->multiline = old_multiline; prog->dot_all = old_dot_all;
             break;
         }
-        case AST_LITERAL: emit(prog, OP_CHAR, node->ch, prog->ignore_case, 0, 0, false); break;
+        case AST_LITERAL: emit(prog, OP_CHAR, emit_char_operand(prog, node->ch), prog->ignore_case, 0, 0, false); break;
         case AST_CLASS:
             if (prog->classes[node->id].string_count > 0) compile_class_with_strings(prog, node->id, rtl);
             else emit(prog, OP_CLASS, node->id, 0, 0, 0, false);
@@ -326,10 +337,12 @@ void compile_into(Program* prog, const uint16_t* regex, int flags) {
      * FIRST compile_into, or this loop would free garbage pointers. */
     for (int i = 0; i < prog->class_count; i++) class_strings_free(&prog->classes[i]);
     memset(prog->group_names, 0, sizeof(prog->group_names));
+    memset(prog->name_chain, 0, sizeof(prog->name_chain));
     prog->code_count = 0;
     prog->class_count = 0;
     prog->group_count = 0;
     prog->counter_count = 0;
+    prog->has_backrefs = false;
     prog->error = NULL;
     prog->ignore_case = (flags & REGEX_FLAG_IGNORECASE) != 0;
     prog->multiline = (flags & REGEX_FLAG_MULTILINE) != 0;
@@ -375,6 +388,18 @@ void compile_into(Program* prog, const uint16_t* regex, int flags) {
     }
 
     if (!prog->error) {
+        /* Same-name chains for OP_NAMED_BACKREF (see name_chain in
+         * regexp.h); group_names is complete once parsing is done, so this
+         * runs before any instruction that consumes the chain is emitted. */
+        for (int i = 1; i <= prog->group_count; i++) {
+            if (!prog->group_names[i][0]) continue;
+            for (int j = i + 1; j <= prog->group_count; j++) {
+                if (strcmp(prog->group_names[i], prog->group_names[j]) == 0) {
+                    prog->name_chain[i] = j;
+                    break;
+                }
+            }
+        }
         emit(prog, OP_SAVE, 0, 0, 0, 0, false);
         compile_node(ast, prog, false);
         emit(prog, OP_SAVE, 1, 0, 0, 0, false);

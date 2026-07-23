@@ -105,6 +105,26 @@ function readCaptures(handle, groupCount) {
   regex_free(h);
 }
 
+// --- step budget: catastrophic backtracking abandons instead of hanging ---
+{
+  const regex_set_step_budget = Module.cwrap("regex_set_step_budget", null, ["number", "number"]);
+  const regex_budget_exhausted = Module.cwrap("regex_budget_exhausted", "number", ["number"]);
+
+  const [patPtr] = writeUtf16("(a+)+$");
+  const h = regex_compile(patPtr, 0, 0);
+  const [textPtr, textLen] = writeUtf16("a".repeat(120) + "b");
+  regex_set_step_budget(h, 5_000_000);
+  check(regex_exec(h, textPtr, textLen, 0) === 0, "budgeted (a+)+$ over a^120:b abandons instead of hanging");
+  check(regex_budget_exhausted(h) === 1, "regex_budget_exhausted reports the give-up");
+  // re-armed budget on the same handle: a matchable subject still matches
+  check(regex_exec(h, textPtr, textLen - 1, 0) === 1, "same handle matches a^120 after exhaustion");
+  check(regex_budget_exhausted(h) === 0, "exhaustion flag cleared by the successful exec");
+
+  Module._free(patPtr);
+  Module._free(textPtr);
+  regex_free(h);
+}
+
 if (failures === 0) {
   console.log("\nAll node smoke tests passed.");
   process.exit(0);

@@ -134,7 +134,9 @@ dispatch in `next_token` (`re_lexer.c:1289`). Notable pieces:
   overflow the C stack.
 - Case-insensitive matching is a **compile-time set transformation, not a
   match-time comparison**, for everything except single `OP_CHAR`
-  literals: `apply_case_folding` (`re_lexer.c:559`) closes a class's
+  literals — and even those get their *constant* operand canonicalized at
+  emit time (`emit_char_operand`, `re_compiler.c`), leaving only the input
+  side to fold per dispatch: `apply_case_folding` closes a class's
   ranges under simple case folding (`/u`/`/v`) or Annex B canonicalization
   (legacy), and the built-in escapes (`\w` → `fill_builtin_class`),
   `\p{...}`/`\P{...}` (`parse_property_escape_class`, `re_lexer.c:704`),
@@ -267,11 +269,15 @@ lex time). A few more things worth knowing before you touch this:
   (`decode_utf16`/`decode_utf16_backward`), extracted from what used to be
   four independently-maintained inline copies.
 - **Named backreferences resolve at *match* time, not compile time.**
-  `AST_NAMED_BACKREF` (`re_compiler.c:147`) emits `OP_NAMED_BACKREF`, and
-  the VM's handler (`re_vm.c:426`) searches all same-named group ids for
-  the one that actually *participated* in the match — required for ES2025
+  `AST_NAMED_BACKREF` emits `OP_NAMED_BACKREF`, and
+  the VM's handler picks, among all same-named group ids, the one that
+  actually *participated* in the match — required for ES2025
   duplicate group names across mutually-exclusive alternation branches,
   where which `(?<x>…)` a `\k<x>` refers to is only knowable at runtime.
+  The *candidate set* is compile-time, though: `compile_into` builds
+  `Program.name_chain` (each group id links to the next id sharing its
+  name), so the handler walks a short id chain instead of the strcmp scan
+  over every group name it used to do per execution.
   (Numeric backrefs still compile to `OP_BACKREF` with the id baked in.)
 - **Character classes containing multi-codepoint strings** (`\q{...}` or a
   Unicode "property of strings" like `\p{RGI_Emoji}`, `/v`
@@ -362,8 +368,17 @@ typedef struct {
   `(pc, sp, counters[])` and checks whether that exact state was already
   tried and failed on *this* VM entry (entries are generation-stamped, so
   "this entry's" failures never leak into the next start position's); if
-  so, the thread is dropped without re-running. This is what keeps classic
-  catastrophic-backtracking patterns like `(a+)+$` fast in practice —
+  so, the thread is dropped without re-running. The equality test covers
+  the *full* key — pc, sp, and the pattern's live `counters`/`counter_sp`
+  (stored in right-sized side arrays next to the cache; comparing pc/sp
+  alone let hash-colliding states with different counters alias, a
+  false-negative bug). Capture state is deliberately NOT part of the key;
+  it can only influence the future through backreferences, so the VM
+  **bypasses the cache entirely when `Program.has_backrefs` is set**
+  rather than paying a capture-sized key on every pattern (without the
+  bypass, `/(?:(x)|x)*\1y/` on `"xy"` returned the wrong match). This is
+  what keeps classic catastrophic-backtracking patterns like `(a+)+$`
+  fast in practice —
   verified, this genuinely works for the common cases. Each recursion depth's cache is allocated once per
   context but **generation-cleared on every VM entry at that depth**, so
   it does **not** protect across a lookaround boundary — a quantifier

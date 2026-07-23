@@ -94,6 +94,14 @@ typedef struct {
     int count;
 } NameSet;
 
+/* ---- VM (re_vm.c) --------------------------------------------------------
+ * ECMA-262 Canonicalize for the non-Unicode case (simple uppercase mapping
+ * with the non-ASCII -> ASCII fold exception). Lives in re_vm.c (it matches
+ * input at run time); the compiler also calls it to pre-canonicalize
+ * OP_CHAR's constant operand at emit time, so the VM folds only the input
+ * side. unicode_casefold (ucd.h) is its /u-mode counterpart. */
+uint32_t annexb_canonicalize(uint32_t ch);
+
 /* Parses a full Disjunction starting at lexer->current, consuming tokens via
  * next_token as it goes. Entry point re_compiler.c's compile_into calls to
  * get an AST; also called recursively within the parser for group bodies. */

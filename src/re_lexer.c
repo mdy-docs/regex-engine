@@ -404,7 +404,10 @@ static void fill_builtin_class(CharClass* cls, char type, bool unicode, bool fol
         }
     } else { /* 'D', 'W', 'S': fold-close the positive set, then complement */
         CharClass temp = {0};
-        fill_builtin_class(&temp, type - 'A' + 'a', unicode, fold_case);
+        /* fold_case=false here: the single closure below covers all three
+         * positive sets (passing it through used to fold-close 'w' twice --
+         * once inside the recursive fill, once below). */
+        fill_builtin_class(&temp, type - 'A' + 'a', unicode, false);
         if (fold_case) apply_case_folding(&temp, true);
         invert_class(&temp);
         uint32_t max_cp = unicode ? 0x10FFFF : 0xFFFF;
@@ -555,6 +558,22 @@ static bool fill_unicode_property(CharClass* cls, const char* key, const char* n
     return true;
 }
 
+/* Sorted-range membership test, same shape as the VM's class_contains --
+ * add_range keeps ranges sorted and coalesced, so the closure passes below
+ * can binary-search instead of linearly scanning up to 2048 ranges per
+ * fold-table entry (a large class under /i, e.g. [\p{L}], paid
+ * table-size x range_count per pass). */
+static inline bool cls_has_cp(const CharClass* cls, uint32_t cp) {
+    int lo = 0, hi = cls->range_count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (cp < cls->ranges[mid].start) hi = mid - 1;
+        else if (cp > cls->ranges[mid].end) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+
 static void apply_case_folding(CharClass* cls, bool unicode) {
     if (unicode) {
         bool changed;
@@ -563,12 +582,8 @@ static void apply_case_folding(CharClass* cls, bool unicode) {
             for (size_t i = 0; i < sizeof(UCD_CASE_FOLD)/sizeof(CaseFoldMapping); i++) {
                 uint32_t from = UCD_CASE_FOLD[i].from;
                 uint32_t to = UCD_CASE_FOLD[i].to;
-                bool from_in = false, to_in = false;
-                for (int j = 0; j < cls->range_count; j++) {
-                    if (from >= cls->ranges[j].start && from <= cls->ranges[j].end) from_in = true;
-                    if (to >= cls->ranges[j].start && to <= cls->ranges[j].end) to_in = true;
-                    if (from_in && to_in) break;
-                }
+                bool from_in = cls_has_cp(cls, from);
+                bool to_in = cls_has_cp(cls, to);
                 if (from_in && !to_in) { if (add_range(cls, to, to)) changed = true; }
                 if (to_in && !from_in) { if (add_range(cls, from, from)) changed = true; }
             }
@@ -586,12 +601,8 @@ static void apply_case_folding(CharClass* cls, bool unicode) {
                 uint32_t from = UCD_SIMPLE_UPPERCASE[i].cp;
                 uint32_t to = UCD_SIMPLE_UPPERCASE[i].mapping;
                 if (from >= 128 && to < 128) continue;
-                bool from_in = false, to_in = false;
-                for (int j = 0; j < cls->range_count; j++) {
-                    if (from >= cls->ranges[j].start && from <= cls->ranges[j].end) from_in = true;
-                    if (to >= cls->ranges[j].start && to <= cls->ranges[j].end) to_in = true;
-                    if (from_in && to_in) break;
-                }
+                bool from_in = cls_has_cp(cls, from);
+                bool to_in = cls_has_cp(cls, to);
                 if (from_in && !to_in) { if (add_range(cls, to, to)) changed = true; }
                 if (to_in && !from_in) { if (add_range(cls, from, from)) changed = true; }
             }
@@ -646,7 +657,17 @@ static void class_add_string(CharClass* cls, const StringSequence* s) {
 
 static void class_union_v(CharClass* dst, const CharClass* src) {
     for (int i = 0; i < src->range_count; i++) add_range(dst, src->ranges[i].start, src->ranges[i].end);
-    for (int i = 0; i < src->string_count; i++) class_add_string(dst, &src->strings[i]);
+    /* Every string set in this engine is built duplicate-free (property
+     * tables are generated that way; \q{} and the set ops dedupe as they
+     * build), so a union into an EMPTY dst can push directly -- the
+     * per-string dedupe scan is O(n^2), 3.4M sequence compares for
+     * \p{RGI_Emoji}'s 2604 strings, and only guards against duplicates
+     * ACROSS operands. */
+    if (dst->string_count == 0) {
+        for (int i = 0; i < src->string_count; i++) class_strings_push(dst, &src->strings[i]);
+    } else {
+        for (int i = 0; i < src->string_count; i++) class_add_string(dst, &src->strings[i]);
+    }
 }
 
 /* The intersect/subtract results are built in a local and then MOVED into
@@ -842,6 +863,8 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                 else if (esc == 'n') start_char = '\n';
                 else if (esc == 't') start_char = '\t';
                 else if (esc == 'r') start_char = '\r';
+                else if (esc == 'f') start_char = '\f';
+                else if (esc == 'v') start_char = '\v';
                 else if (esc == '0') start_char = '\0';
                 else {
                     if (lexer->prog->unicode && (esc >= 128 || !strchr("^$\\.*+?()[]{}|/-", (char)esc))) {
@@ -924,6 +947,8 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                         else if (esc == 'n') end_char = '\n';
                         else if (esc == 't') end_char = '\t';
                         else if (esc == 'r') end_char = '\r';
+                        else if (esc == 'f') end_char = '\f';
+                        else if (esc == 'v') end_char = '\v';
                         else if (esc == '0') end_char = '\0';
                         else {
                             if (lexer->prog->unicode && (esc >= 128 || !strchr("^$\\.*+?()[]{}|/-", (char)esc))) {
@@ -1397,7 +1422,15 @@ void next_token(Lexer* lexer) {
                 } else {
                     int backref_id = esc - '0';
                     while (is_digit_char(lexer->src[lexer->pos])) {
-                        backref_id = backref_id * 10 + (lexer->src[lexer->pos] - '0');
+                        /* Saturate past MAX_GROUPS instead of accumulating:
+                         * an id that large can never validate, and unbounded
+                         * accumulation was signed overflow (UB) -- a wrapped-
+                         * NEGATIVE id slipped past validate_backrefs' upper-
+                         * bound-only check and indexed captures[] out of
+                         * bounds at match time (confirmed ASan crash via
+                         * /(a)\4000000000/). */
+                        if (backref_id <= MAX_GROUPS)
+                            backref_id = backref_id * 10 + (lexer->src[lexer->pos] - '0');
                         lexer->pos++;
                     }
                     lexer->current = (Token){TOK_BACKREF, 0, backref_id};
@@ -1485,6 +1518,8 @@ void next_token(Lexer* lexer) {
             else if (esc == 'n') lexer->current = (Token){TOK_LITERAL, '\n'};
             else if (esc == 't') lexer->current = (Token){TOK_LITERAL, '\t'};
             else if (esc == 'r') lexer->current = (Token){TOK_LITERAL, '\r'};
+            else if (esc == 'f') lexer->current = (Token){TOK_LITERAL, '\f'};
+            else if (esc == 'v') lexer->current = (Token){TOK_LITERAL, '\v'};
             else if (esc == '0') lexer->current = (Token){TOK_LITERAL, '\0'};
             else {
                 if (lexer->prog->unicode && (esc >= 128 || !strchr("^$\\.*+?()[]{}|/", (char)esc))) {
@@ -1506,22 +1541,39 @@ void next_token(Lexer* lexer) {
             int min = 0, max = -1;
             bool has_min = false, has_comma = false, has_max = false;
             
+            /* Saturate rather than accumulate unboundedly: {99999999999}
+             * was signed overflow (UB), and a wrapped-negative bound made
+             * OP_CHECK_COUNTER's min/max tests nonsensical. Anything at or
+             * above the cap is already unreachable in practice (the VM's
+             * step budget / stack ceiling trip long before ~2^28
+             * iterations), so saturated bounds keep "effectively
+             * impossible" semantics without the UB. */
+            const int BOUND_CAP = 0x10000000;
             while (lexer->src[lexer->pos] >= '0' && lexer->src[lexer->pos] <= '9') {
-                min = min * 10 + (lexer->src[lexer->pos] - '0');
+                if (min < BOUND_CAP) min = min * 10 + (lexer->src[lexer->pos] - '0');
                 has_min = true; lexer->pos++;
             }
             if (lexer->src[lexer->pos] == ',') {
                 has_comma = true; lexer->pos++;
                 while (lexer->src[lexer->pos] >= '0' && lexer->src[lexer->pos] <= '9') {
                     if (max == -1) max = 0;
-                    max = max * 10 + (lexer->src[lexer->pos] - '0');
+                    if (max < BOUND_CAP) max = max * 10 + (lexer->src[lexer->pos] - '0');
                     has_max = true; lexer->pos++;
                 }
             } else if (has_min) max = min;
-            
+
             if (has_min && lexer->src[lexer->pos] == '}') {
                 lexer->pos++;
-                lexer->current = (Token){TOK_BOUNDS, 0, 0, min, (has_comma && !has_max) ? -1 : max};
+                int effective_max = (has_comma && !has_max) ? -1 : max;
+                /* Early error in every mode (confirmed vs Node): without
+                 * this, OP_CHECK_COUNTER's `c == max` exit test can never
+                 * fire once c passes max unsatisfied, so a{5,2} silently
+                 * behaved like a{5,}. */
+                if (effective_max != -1 && min > effective_max) {
+                    lexer->prog->error = "SyntaxError: numbers out of order in {} quantifier";
+                    return;
+                }
+                lexer->current = (Token){TOK_BOUNDS, 0, 0, min, effective_max};
                 break;
             }
             lexer->pos = start_pos;

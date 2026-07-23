@@ -1324,6 +1324,154 @@ int main(void) {
         free(text);
     }
 
+    /* Backreference-id digit accumulation must saturate, not overflow: the
+     * unbounded version wrapped negative, slipped past validate_backrefs'
+     * upper-bound-only check, and indexed captures[] with a negative
+     * subscript at match time (ASan BUS via this exact pattern). */
+    {
+        uint16_t* pattern = to_utf16("(a)\\4000000000");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        check(h == 0, "(a)\\4000000000 fails compilation cleanly (no id overflow)");
+        free(pattern);
+
+        /* Same saturation for quantifier bounds ({99999999999999} was UB). */
+        pattern = to_utf16("a{99999999999999}");
+        h = regex_compile(pattern, 0, 0);
+        check(h != 0, "a{99999999999999} compiles (saturated bound)");
+        uint16_t* text = to_utf16("aaa");
+        check(!regex_exec(h, text, 3, 0), "saturated huge quantifier doesn't match 3 a's");
+        free(pattern);
+        free(text);
+        regex_free(h);
+    }
+
+    /* \f and \v are ControlEscapes in every mode; they used to lex as
+     * literal 'f'/'v' (and a spurious SyntaxError under /u) everywhere
+     * outside /v-class and \q{} contexts. */
+    {
+        const char* pats[] = {"\\f", "\\v", "[\\f]", "[\\v]", "[\\v-\\r]"};
+        const char texts[] = {'\f', '\v', '\f', '\v', '\f'};
+        for (int i = 0; i < 5; i++) {
+            uint16_t* pattern = to_utf16(pats[i]);
+            uintptr_t h = regex_compile(pattern, 0, i == 0 ? regex_flag_bit('u') : 0);
+            check(h != 0, "\\f / \\v pattern compiles");
+            uint16_t text = (uint16_t)texts[i];
+            check(regex_exec(h, &text, 1, 0), "\\f / \\v pattern matches its control char");
+            const int32_t* caps = regex_captures_ptr(h);
+            check(caps[0] == 0 && caps[1] == 1, "\\f / \\v match span is [0,1)");
+            free(pattern);
+            regex_free(h);
+        }
+    }
+
+    /* Multiline anchors must accept every ECMA LineTerminator (LF, CR, LS,
+     * PS), not just '\n' -- /^a/m on "\ra" matches in every real engine. */
+    {
+        uint16_t* pattern = to_utf16("^a");
+        uintptr_t h = regex_compile(pattern, 0, regex_flag_bit('m'));
+        uint16_t text[2] = {'\r', 'a'};
+        check(regex_exec(h, text, 2, 0) && regex_captures_ptr(h)[0] == 1,
+              "/^a/m matches after \\r");
+        text[0] = 0x2028;
+        check(regex_exec(h, text, 2, 0) && regex_captures_ptr(h)[0] == 1,
+              "/^a/m matches after U+2028");
+        text[0] = ' ';
+        check(!regex_exec(h, text, 2, 0), "/^a/m does not match after a space");
+        free(pattern);
+        regex_free(h);
+
+        pattern = to_utf16("a$");
+        h = regex_compile(pattern, 0, regex_flag_bit('m'));
+        uint16_t text2[2] = {'a', '\r'};
+        check(regex_exec(h, text2, 2, 0) && regex_captures_ptr(h)[1] == 1,
+              "/a$/m matches before \\r");
+        text2[1] = 0x2029;
+        check(regex_exec(h, text2, 2, 0) && regex_captures_ptr(h)[1] == 1,
+              "/a$/m matches before U+2029");
+        free(pattern);
+        regex_free(h);
+    }
+
+    /* {min,max} with min > max is an early error ("numbers out of order");
+     * uncaught, OP_CHECK_COUNTER's == max exit test could never fire and
+     * a{5,2} silently behaved like a{5,}. */
+    {
+        uint16_t* pattern = to_utf16("a{5,2}");
+        check(regex_compile(pattern, 0, 0) == 0, "a{5,2} is a SyntaxError");
+        free(pattern);
+        pattern = to_utf16("a{2,5}");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t* text = to_utf16("aaa");
+        check(h != 0 && regex_exec(h, text, 3, 0) && regex_captures_ptr(h)[1] == 3,
+              "a{2,5} still matches 'aaa' greedily");
+        free(pattern);
+        free(text);
+        regex_free(h);
+    }
+
+    /* Fail-cache soundness with backreferences: the cache keys on (pc, sp,
+     * counters) but not captures, so a cached failure from one capture
+     * history used to suppress a viable thread with another -- this exact
+     * pattern returned "y"@1 instead of "xy"@0 (Node matches "xy" with
+     * group 1 unset). Patterns with backrefs now bypass the cache. */
+    {
+        uint16_t* pattern = to_utf16("(?:(x)|x)*\\1y");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t* text = to_utf16("xy");
+        check(h != 0 && regex_exec(h, text, 2, 0), "(?:(x)|x)*\\1y matches 'xy'");
+        const int32_t* caps = regex_captures_ptr(h);
+        check(caps[0] == 0 && caps[1] == 2, "whole match is [0,2), not the degenerate [1,2)");
+        check(caps[2] == -1 && caps[3] == -1, "group 1 is unset (branch without the capture won)");
+        free(pattern);
+        free(text);
+        regex_free(h);
+    }
+
+    /* Shim-level step budget (regex_set_step_budget/regex_budget_exhausted)
+     * + handle-cached VMContext: the budget re-arms per exec, so one
+     * runaway subject must not poison later execs on the same handle. */
+    {
+        uint16_t* pattern = to_utf16("(a+)+$");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        check(h != 0, "compile (a+)+$ via shim succeeds");
+
+        int n = 121;
+        uint16_t* text = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)n);
+        for (int i = 0; i < n - 1; i++) text[i] = 'a';
+        text[n - 1] = 'b';
+
+        regex_set_step_budget(h, 5 * 1000 * 1000);
+        check(!regex_exec(h, text, n, 0), "budgeted (a+)+$ over a^120:b abandons instead of hanging");
+        check(regex_budget_exhausted(h), "shim reports budget exhaustion");
+
+        /* Same handle, matchable subject: the re-armed budget must allow it. */
+        check(regex_exec(h, text, n - 1, 0), "same handle still matches a^120 after exhaustion");
+        check(!regex_budget_exhausted(h), "exhaustion flag cleared by the successful exec");
+
+        /* And repeated execs on one handle (the cached-context path). */
+        for (int i = 0; i < 3; i++)
+            check(regex_exec(h, text, n - 1, 0), "repeated exec on a reused handle context");
+
+        free(pattern);
+        free(text);
+        regex_free(h);
+    }
+
+    /* Named backrefs across ES2025 duplicate group names resolve via the
+     * compile-time name chain: whichever same-named group participated. */
+    {
+        uint16_t* pattern = to_utf16("(?:(?<d>x)|(?<d>y))\\k<d>");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        check(h != 0, "duplicate-name \\k<d> pattern compiles");
+        uint16_t* text = to_utf16("yy");
+        check(regex_exec(h, text, 2, 0), "\\k<d> resolves to the second-branch capture");
+        const int32_t* caps = regex_captures_ptr(h);
+        check(caps[0] == 0 && caps[1] == 2, "duplicate-name match span is [0,2)");
+        free(pattern);
+        free(text);
+        regex_free(h);
+    }
+
     if (failures == 0) {
         printf("\nAll smoke tests passed.\n");
         return 0;

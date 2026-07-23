@@ -107,10 +107,10 @@ static ASTNode* parse_primary(Lexer* lexer) {
         if (is_capture) {
             if (lexer->prog->group_count < MAX_GROUPS - 1) {
                 gid = ++lexer->prog->group_count;
+                if (is_named) strcpy(lexer->prog->group_names[gid], name);
             } else {
                 if (!lexer->prog->error) lexer->prog->error = "InternalError: pattern exceeds maximum capture group count";
             }
-            if (is_named) strcpy(lexer->prog->group_names[gid], name);
         }
 
         /* Modifier groups must take effect while the body is LEXED, not just

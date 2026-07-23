@@ -78,6 +78,16 @@ static inline uint32_t decode_utf16_backward(const uint16_t** sp, const uint16_t
     return cp;
 }
 
+/* ECMA-262 LineTerminator, for the multiline anchors: LF, CR, LS, PS --
+ * checking '\n' alone (as the anchors originally did) missed the other
+ * three, so /^a/m failed on "\ra" where every real engine matches. All four
+ * are single UTF-16 code units, so the anchors' raw-unit peeks need no
+ * surrogate decoding. The `.` class already excludes exactly this set
+ * (re_lexer.c); keep the two in sync. */
+static inline bool is_line_terminator(uint32_t c) {
+    return c == '\n' || c == '\r' || c == 0x2028 || c == 0x2029;
+}
+
 static inline bool is_word_char(uint32_t c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
 }
@@ -103,8 +113,13 @@ static inline bool is_word_char_fold(uint32_t c, bool fold) {
  * non-Unicode case, expressed with the "simple" (single-code-point) mapping
  * table -- which is exactly what a *simple* uppercase mapping already is, so
  * the "if toUppercase(ch) has length != 1, don't fold" spec clause falls out
- * for free rather than needing separate handling. */
-static uint32_t annexb_canonicalize(uint32_t ch) {
+ * for free rather than needing separate handling.
+ *
+ * Non-static (declared in re_internal.h): the compiler calls this too, to
+ * canonicalize OP_CHAR's constant operand once at emit time instead of on
+ * every dispatch (the binary search below used to run twice per candidate
+ * text position under non-unicode /i). */
+uint32_t annexb_canonicalize(uint32_t ch) {
     int lo = 0, hi = (int)(sizeof(UCD_SIMPLE_UPPERCASE) / sizeof(SimpleCaseMapping)) - 1;
     uint32_t cu = ch;
     while (lo <= hi) {
@@ -175,12 +190,16 @@ static inline unsigned int hash_state(const Thread* t, int counter_count) {
  * used to do for free back when captures was an embedded array; now that
  * it's a pointer, assignment would just copy the pointer value and leave
  * dst aliasing src's capture state instead of owning an independent copy. */
-static inline void thread_copy_state(Thread* dst, const Thread* src, int cap_pairs) {
+static inline void thread_copy_state(Thread* dst, const Thread* src, int cap_pairs, int counter_count) {
     dst->pc = src->pc;
     dst->sp = src->sp;
     memcpy((void*)dst->captures, src->captures, sizeof(const uint16_t*) * (size_t)cap_pairs);
-    memcpy(dst->counters, src->counters, sizeof(dst->counters));
-    memcpy(dst->counter_sp, src->counter_sp, sizeof(dst->counter_sp));
+    /* Only the pattern's live counters, not the full MAX_COUNTERS arrays
+     * (192 bytes when most patterns use 0-2 counters) -- this runs once per
+     * backtrack push and once per pop. Slots >= counter_count are never
+     * read: every access is by a compile-assigned counter id. */
+    memcpy(dst->counters, src->counters, sizeof(int) * (size_t)counter_count);
+    memcpy(dst->counter_sp, src->counter_sp, sizeof(const uint16_t*) * (size_t)counter_count);
 }
 
 #define VM_STACK_CAPACITY 512
@@ -207,6 +226,16 @@ typedef struct {
     const uint16_t** arena;            /* stack slots' capture slices */
     const uint16_t** current_captures; /* the in-flight thread's, outside the arena */
     CacheEntry* cache;
+    /* Per-slot counter state, keyed alongside cache: counter values feed
+     * OP_CHECK_COUNTER (and counter_sp its empty-iteration test), so two
+     * states agreeing on (pc, sp) but not on counters can still diverge --
+     * treating them as one cache key produced false negatives whenever
+     * their hashes collided (the hash mixed counters in, but the equality
+     * test didn't). Sized counter_count-per-slot (NULL when the pattern has
+     * no counters) rather than MAX_COUNTERS, mirroring the captures arena's
+     * right-sizing. */
+    int* cache_counters;
+    const uint16_t** cache_counter_sp;
     int capacity;
     unsigned int gen; /* current fail-cache generation, see CacheEntry */
 } VMDepth;
@@ -258,6 +287,8 @@ void vm_context_free(VMContext* ctx) {
         free((void*)ctx->depth[i].arena);
         free((void*)ctx->depth[i].current_captures);
         free(ctx->depth[i].cache);
+        free(ctx->depth[i].cache_counters);
+        free((void*)ctx->depth[i].cache_counter_sp);
     }
     free(ctx);
 }
@@ -295,12 +326,26 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
      * fails immediately instead of re-arming the counter. */
     if (ctx->budget_exhausted) return false;
     VMDepth* d = &ctx->depth[depth];
+    /* Memoizing failures is sound only when the cache key covers every bit
+     * of thread state that can influence the future; captures aren't in the
+     * key, so patterns with backreferences must not consult it at all (see
+     * has_backrefs in regexp.h). */
+    const bool use_cache = !prog->has_backrefs;
+    const int cc = prog->counter_count;
     if (!d->stack) {
         d->capacity = VM_STACK_CAPACITY;
         d->arena = malloc(sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)d->capacity);
         d->stack = malloc(sizeof(Thread) * (size_t)d->capacity);
         d->cache = malloc(sizeof(CacheEntry) * CACHE_SIZE);
         d->current_captures = malloc(sizeof(uint16_t*) * (size_t)cap_pairs);
+        if (cc > 0) {
+            d->cache_counters = malloc(sizeof(int) * (size_t)cc * CACHE_SIZE);
+            d->cache_counter_sp = malloc(sizeof(uint16_t*) * (size_t)cc * CACHE_SIZE);
+            if (!d->cache_counters || !d->cache_counter_sp) {
+                fprintf(stderr, "Fatal Error: Out of memory\n");
+                exit(EXIT_FAILURE);
+            }
+        }
         if (!d->arena || !d->stack || !d->cache || !d->current_captures) {
             fprintf(stderr, "Fatal Error: Out of memory\n");
             exit(EXIT_FAILURE);
@@ -335,10 +380,26 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
 
     while (stack_ptr > 0) {
         stack_ptr--;
-        thread_copy_state(&current, &stack[stack_ptr], cap_pairs);
+        thread_copy_state(&current, &stack[stack_ptr], cap_pairs, cc);
 
-        unsigned int h = hash_state(&current, prog->counter_count);
-        if (fail_cache[h].gen == gen && fail_cache[h].pc == current.pc && fail_cache[h].sp == current.sp) continue;
+        unsigned int h = 0;
+        /* Snapshot the popped state's counters now: they mutate as the path
+         * below executes, and the entry stored on failure must key the
+         * state the path STARTED from -- pc/sp get the same treatment via
+         * path_start_pc/path_start_sp. */
+        int path_start_counters[MAX_COUNTERS];
+        const uint16_t* path_start_counter_sp[MAX_COUNTERS];
+        if (use_cache) {
+            h = hash_state(&current, cc);
+            if (fail_cache[h].gen == gen && fail_cache[h].pc == current.pc && fail_cache[h].sp == current.sp &&
+                (cc == 0 || (memcmp(d->cache_counters + (size_t)h * cc, current.counters, sizeof(int) * (size_t)cc) == 0 &&
+                             memcmp(d->cache_counter_sp + (size_t)h * cc, current.counter_sp, sizeof(const uint16_t*) * (size_t)cc) == 0)))
+                continue;
+            if (cc > 0) {
+                memcpy(path_start_counters, current.counters, sizeof(int) * (size_t)cc);
+                memcpy(path_start_counter_sp, current.counter_sp, sizeof(const uint16_t*) * (size_t)cc);
+            }
+        }
 
         int path_start_pc = current.pc; const uint16_t* path_start_sp = current.sp; bool path_failed = false;
 
@@ -369,16 +430,11 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                         else cp = *next_sp++;
                         
                         if (inst.arg2) {
-                            uint32_t inst_cp = inst.arg1;
-                            uint32_t match_cp = cp;
-                            if (prog->unicode) {
-                                inst_cp = unicode_casefold(inst_cp);
-                                match_cp = unicode_casefold(match_cp);
-                            } else {
-                                inst_cp = annexb_canonicalize(inst_cp);
-                                match_cp = annexb_canonicalize(match_cp);
-                            }
-                            if (inst_cp == match_cp) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
+                            /* arg1 was canonicalized at emit time (see
+                             * re_compiler.c's emit_char_operand); only the
+                             * input side needs folding here. */
+                            uint32_t match_cp = prog->unicode ? unicode_casefold(cp) : annexb_canonicalize(cp);
+                            if ((uint32_t)inst.arg1 == match_cp) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
                         } else {
                             if (cp == (uint32_t)inst.arg1) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
                         }
@@ -390,16 +446,8 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                         if (prog->unicode) cp = decode_utf16_backward(&next_sp, original_text);
                         else cp = *(--next_sp);
                         if (inst.arg2) {
-                            uint32_t inst_cp = inst.arg1;
-                            uint32_t match_cp = cp;
-                            if (prog->unicode) {
-                                inst_cp = unicode_casefold(inst_cp);
-                                match_cp = unicode_casefold(match_cp);
-                            } else {
-                                inst_cp = annexb_canonicalize(inst_cp);
-                                match_cp = annexb_canonicalize(match_cp);
-                            }
-                            if (inst_cp == match_cp) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
+                            uint32_t match_cp = prog->unicode ? unicode_casefold(cp) : annexb_canonicalize(cp);
+                            if ((uint32_t)inst.arg1 == match_cp) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
                         } else {
                             if (cp == (uint32_t)inst.arg1) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
                         }
@@ -432,8 +480,8 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                 }
             } break;
             case OP_SAVE: { current.captures[inst.arg1] = current.sp; current.pc++; } break;
-            case OP_ASSERT_START: { if (current.sp == original_text || (inst.arg1 && current.sp > original_text && *(current.sp - 1) == '\n')) current.pc++; else { path_failed = true; break; } } break;
-            case OP_ASSERT_END:   { if (current.sp >= text_end || (inst.arg1 && *current.sp == '\n')) current.pc++; else { path_failed = true; break; } } break;
+            case OP_ASSERT_START: { if (current.sp == original_text || (inst.arg1 && current.sp > original_text && is_line_terminator(*(current.sp - 1)))) current.pc++; else { path_failed = true; break; } } break;
+            case OP_ASSERT_END:   { if (current.sp >= text_end || (inst.arg1 && is_line_terminator(*current.sp))) current.pc++; else { path_failed = true; break; } } break;
             case OP_WORD_BOUNDARY: {
                 /* The sp < text_end guard mirrors OP_ASSERT_END's: text need
                  * not be NUL-terminated (text_units is authoritative, per
@@ -459,13 +507,15 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                     start = current.captures[inst.arg1 * 2];
                     end = current.captures[inst.arg1 * 2 + 1];
                 } else {
-                    for (int i = 1; i <= prog->group_count; i++) {
-                        if (prog->group_names[i][0] && strcmp(prog->group_names[i], prog->group_names[inst.arg1]) == 0) {
-                            if (current.captures[i * 2] && current.captures[i * 2 + 1]) {
-                                start = current.captures[i * 2];
-                                end = current.captures[i * 2 + 1];
-                                break;
-                            }
+                    /* arg1 is the FIRST group with the referenced name;
+                     * name_chain (built at compile time, see regexp.h)
+                     * links the rest in ascending id order, replacing the
+                     * old per-execution strcmp scan over every group. */
+                    for (int i = inst.arg1; i != 0; i = prog->name_chain[i]) {
+                        if (current.captures[i * 2] && current.captures[i * 2 + 1]) {
+                            start = current.captures[i * 2];
+                            end = current.captures[i * 2 + 1];
+                            break;
                         }
                     }
                 }
@@ -614,7 +664,7 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                     stack = d->stack;
                     stack_capacity = d->capacity;
                 }
-                thread_copy_state(&stack[stack_ptr], &current, cap_pairs);
+                thread_copy_state(&stack[stack_ptr], &current, cap_pairs, cc);
                 stack[stack_ptr].pc = inst.arg2;
                 stack_ptr++;
                 current.pc = inst.arg1;
@@ -636,12 +686,12 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                             stack_capacity = d->capacity;
                         }
                         if (inst.lazy) {
-                            thread_copy_state(&stack[stack_ptr], &current, cap_pairs);
+                            thread_copy_state(&stack[stack_ptr], &current, cap_pairs, cc);
                             stack[stack_ptr].pc = current.pc + 1;
                             stack_ptr++;
                             current.pc = exit_pc;
                         } else {
-                            thread_copy_state(&stack[stack_ptr], &current, cap_pairs);
+                            thread_copy_state(&stack[stack_ptr], &current, cap_pairs, cc);
                             stack[stack_ptr].pc = exit_pc;
                             stack_ptr++;
                             current.pc++;
@@ -663,7 +713,13 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
             }
             if (path_failed) break;
         }
-        if (path_failed) { fail_cache[h].pc = path_start_pc; fail_cache[h].sp = path_start_sp; fail_cache[h].gen = gen; }
+        if (use_cache && path_failed) {
+            fail_cache[h].pc = path_start_pc; fail_cache[h].sp = path_start_sp; fail_cache[h].gen = gen;
+            if (cc > 0) {
+                memcpy(d->cache_counters + (size_t)h * cc, path_start_counters, sizeof(int) * (size_t)cc);
+                memcpy(d->cache_counter_sp + (size_t)h * cc, path_start_counter_sp, sizeof(const uint16_t*) * (size_t)cc);
+            }
+        }
     }
     return false;
 }

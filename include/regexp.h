@@ -97,6 +97,12 @@ typedef struct {
     Instruction code[MAX_OPCODES];
     CharClass classes[MAX_CLASSES];
     char group_names[MAX_GROUPS][MAX_GROUP_NAME];
+    /* name_chain[i] = the next group id > i sharing group i's name (0 =
+     * none). Built once by compile_into after parsing; OP_NAMED_BACKREF
+     * walks it to find the participating group among ES2025 duplicate
+     * names, replacing the strcmp scan over every group name the VM used
+     * to do per execution. */
+    int name_chain[MAX_GROUPS];
     int code_count;
     int class_count;
     int group_count;
@@ -108,6 +114,15 @@ typedef struct {
     bool unicode;
     bool has_indices;
     bool unicode_sets;
+    /* Set by the compiler when any (numeric or named) backreference is
+     * emitted. The VM's fail cache keys on (pc, sp, counters) but NOT on
+     * capture state, and captures feed back into matching only through
+     * backreferences -- so memoizing failures is unsound exactly when this
+     * is set (a cached failure from one capture history wrongly suppressed
+     * a viable thread with another: /(?:(x)|x)*\1y/ vs "xy"). The VM skips
+     * the cache for such patterns; the step budget remains their defense
+     * against catastrophic backtracking. */
+    bool has_backrefs;
     const char* error;
 } Program;
 

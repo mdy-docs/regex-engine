@@ -15,6 +15,8 @@ const char* regex_last_error(void);
 int regex_group_count(uintptr_t handle);
 const char* regex_group_name(uintptr_t handle, int index);
 int regex_exec(uintptr_t handle, const uint16_t* text, int text_units, int start_index);
+void regex_set_step_budget(uintptr_t handle, double max_steps);
+int regex_budget_exhausted(uintptr_t handle);
 const int32_t* regex_captures_ptr(uintptr_t handle);
 void regex_free(uintptr_t handle);
 

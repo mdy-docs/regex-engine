@@ -36,6 +36,16 @@
 typedef struct {
     Program prog;
     int32_t* captures; /* (prog.group_count + 1) * 2 ints, owned by this handle */
+    /* Created on first regex_exec and reused for the handle's lifetime:
+     * context creation is cheap but its lazily-built scratch (backtrack
+     * stack + arena + fail cache, ~200KB+ per lookaround depth) is not, and
+     * a per-exec context re-paid all of it on every call -- the same
+     * per-entry overhead VMContext exists to amortize, one level up. Safe
+     * to cache here: WASM is single-threaded and a context is tied to the
+     * Program it was created for, which is exactly this handle's. */
+    VMContext* ctx;
+    uint64_t step_budget;  /* 0 = unlimited; re-armed per exec call */
+    int budget_exhausted;  /* result of the most recent exec on this handle */
 } RegexHandle;
 
 static char g_last_error[256] = {0};
@@ -142,12 +152,13 @@ int regex_exec(uintptr_t handle, const uint16_t* text, int text_units, int start
     const uint16_t* captures[MAX_GROUPS * 2] = {0};
     int matched = 0;
 
-    /* One context for the whole call, not one per start position -- the
-     * scan loop below re-enters the VM at every offset, and per-position
-     * setup (backtrack stack + fail-cache allocation and initialization)
-     * used to dominate unanchored searches; see regexp.h's VMContext
-     * comment. */
-    VMContext* ctx = vm_context_new(&h->prog);
+    /* One context for the handle's whole lifetime, not one per call (see
+     * RegexHandle above). Re-arming the budget every call also resets the
+     * context's sticky exhaustion state, so one runaway subject doesn't
+     * poison later execs on the same handle. */
+    if (!h->ctx) h->ctx = vm_context_new(&h->prog);
+    VMContext* ctx = h->ctx;
+    vm_context_set_step_budget(ctx, h->step_budget);
 
     if (h->prog.sticky) {
         matched = vm_execute(&h->prog, ctx, 0, 1, text, text_end, text + start_index, captures);
@@ -165,7 +176,7 @@ int regex_exec(uintptr_t handle, const uint16_t* text, int text_units, int start
             }
         }
     }
-    vm_context_free(ctx);
+    h->budget_exhausted = vm_context_budget_exhausted(ctx) ? 1 : 0;
 
     int pair_count = (h->prog.group_count + 1) * 2;
     if (!matched) {
@@ -186,6 +197,31 @@ int regex_exec(uintptr_t handle, const uint16_t* text, int text_units, int start
     return 1;
 }
 
+/* Sets the VM step budget applied to every subsequent regex_exec() on this
+ * handle (re-armed per call): 0 = unlimited (the default). This is the
+ * engine's defense against catastrophic backtracking -- see
+ * vm_context_set_step_budget in regexp.h for how to size it (linear in the
+ * subject length, e.g. 1e6 + 2000/unit). Takes a double because JS numbers
+ * cross the WASM boundary as f64; budgets are well below 2^53 so the
+ * conversion is exact. Hosts running untrusted patterns should always set
+ * one. */
+EMSCRIPTEN_KEEPALIVE
+void regex_set_step_budget(uintptr_t handle, double max_steps) {
+    RegexHandle* h = (RegexHandle*)(uintptr_t)handle;
+    if (!h || max_steps < 0) return;
+    h->step_budget = (uint64_t)max_steps;
+}
+
+/* Whether the most recent regex_exec() on this handle stopped because it
+ * exhausted the step budget (1) rather than genuinely finding no match (0).
+ * Lets a host surface a catchable "pattern too expensive" error instead of
+ * conflating it with no-match. */
+EMSCRIPTEN_KEEPALIVE
+int regex_budget_exhausted(uintptr_t handle) {
+    RegexHandle* h = (RegexHandle*)(uintptr_t)handle;
+    return h ? h->budget_exhausted : 0;
+}
+
 /* Pointer to (regex_group_count(handle)+1)*2 int32 values, [start0,end0,
  * start1,end1, ...] in UTF-16-code-unit offsets into the text passed to the
  * most recent regex_exec() on this handle; -1 for an unmatched group. View
@@ -203,6 +239,7 @@ void regex_free(uintptr_t handle) {
     RegexHandle* h = (RegexHandle*)(uintptr_t)handle;
     if (!h) return;
     for (int i = 0; i < h->prog.class_count; i++) class_strings_free(&h->prog.classes[i]);
+    vm_context_free(h->ctx);
     free(h->captures);
     free(h);
 }

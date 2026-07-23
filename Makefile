@@ -80,7 +80,7 @@ wasm:
 		-s ALLOW_MEMORY_GROWTH=1 \
 		-s STACK_OVERFLOW_CHECK=2 \
 		-s STACK_SIZE=8388608 \
-		-s EXPORTED_FUNCTIONS='["_malloc","_free","_regex_compile","_regex_exec","_regex_free","_regex_last_error","_regex_group_count","_regex_group_name","_regex_captures_ptr","_regex_flag_bit"]' \
+		-s EXPORTED_FUNCTIONS='["_malloc","_free","_regex_compile","_regex_exec","_regex_free","_regex_last_error","_regex_group_count","_regex_group_name","_regex_captures_ptr","_regex_flag_bit","_regex_set_step_budget","_regex_budget_exhausted"]' \
 		-s EXPORTED_RUNTIME_METHODS='["cwrap","ccall","UTF8ToString","HEAPU16","HEAP16","HEAPU8","HEAP32"]' \
 		--no-entry
 	@echo "WASM build generated: $(WASM_TARGET) and $(WASM_OUT_DIR)/baru-re.wasm"
