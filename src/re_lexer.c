@@ -66,10 +66,10 @@ static int alloc_class(Program* prog) {
     }
     int cid = prog->class_count++;
     /* Belt-and-braces: compile_into re-entry already freed every slot's
-     * heap string buffer, and class_strings_free NULLs the pointer, so
+     * heap buffers, and class_free NULLs the pointers, so
      * this is a no-op there -- but it keeps the "slot is built in place"
      * invariant self-contained rather than trusting the caller's reset. */
-    class_strings_free(&prog->classes[cid]);
+    class_free(&prog->classes[cid]);
     memset(&prog->classes[cid], 0, sizeof(CharClass)); /* slot is built in place */
     return cid;
 }
@@ -302,20 +302,42 @@ static void class_strings_push(CharClass* cls, const StringSequence* s) {
     cls->strings[cls->string_count++] = *s;
 }
 
-/* Non-static, public (declared in regexp.h): compile_into frees a previous
- * compile's class strings on re-entry, regex_free frees them at handle
- * teardown, and a native host driving compile_into directly must do the
- * same before discarding a Program. */
-void class_strings_free(CharClass* cls) {
+static void class_strings_free(CharClass* cls) {
     free(cls->strings);
     cls->strings = NULL;
     cls->string_count = 0;
     cls->string_cap = 0;
 }
 
+/* Non-static, public (declared in regexp.h): releases BOTH heap buffers a
+ * class owns. Called wherever a class dies or is overwritten -- the
+ * set-algebra move idiom, compile_into re-entry / program_release, and
+ * every error path that abandons a locally-built class (with heap ranges,
+ * "just return" now leaks where the old embedded array did not). */
+void class_free(CharClass* cls) {
+    class_strings_free(cls);
+    free(cls->ranges);
+    cls->ranges = NULL;
+    cls->range_count = 0;
+    cls->range_cap = 0;
+}
+
+static void ranges_reserve(CharClass* cls, int need) {
+    if (need <= cls->range_cap) return;
+    int new_cap = cls->range_cap ? cls->range_cap * 2 : 16;
+    while (new_cap < need) new_cap *= 2;
+    CodePointRange* grown = realloc(cls->ranges, sizeof(CodePointRange) * (size_t)new_cap);
+    if (!grown) {
+        fprintf(stderr, "Fatal Error: Out of memory\n");
+        exit(EXIT_FAILURE);
+    }
+    cls->ranges = grown;
+    cls->range_cap = new_cap;
+}
+
 static bool add_range(CharClass* cls, uint32_t start, uint32_t end) {
     if (start > end) return true;
-    
+
     int i;
     for (i = 0; i < cls->range_count; i++) {
         if (cls->ranges[i].start > start) break;
@@ -358,8 +380,14 @@ static bool add_range(CharClass* cls, uint32_t start, uint32_t end) {
         return true;
     }
     
-    if (cls->range_count >= 2048) return false;
-    
+    /* Growable, no fixed cap: the range set was a fixed [2048] embedded
+     * array whose exhaustion silently DROPPED ranges. The count is
+     * intrinsically bounded by pattern content and property-table sizes
+     * (set ops produce at most the sum of their operands' counts), so
+     * growth is modest in practice; allocation failure stays fatal per the
+     * engine-wide OOM policy. */
+    ranges_reserve(cls, cls->range_count + 1);
+
     for (int j = cls->range_count; j > i; j--) {
         cls->ranges[j] = cls->ranges[j-1];
     }
@@ -416,6 +444,7 @@ static void fill_builtin_class(CharClass* cls, char type, bool unicode, bool fol
             uint32_t end = (temp.ranges[i].end > max_cp) ? max_cp : temp.ranges[i].end;
             add_range(cls, temp.ranges[i].start, end);
         }
+        class_free(&temp);
     }
 }
 
@@ -497,7 +526,12 @@ static bool fill_unicode_property(CharClass* cls, const char* key, const char* n
         }
     }
 
-    CharClass local; /* range build target only when the cache is full */
+    /* Range build target only when the cache is full -- its heap ranges
+     * must be freed before every return below (uncached_local tracks
+     * whether `local` is the live build; a cached build's buffer belongs
+     * to the process-lifetime cache instead). */
+    CharClass local = {0};
+    bool uncached_local = false;
     if (!src) {
         if (kind == -1) {
             ucd_prop = lookup_unicode_property(name, UCD_KIND_GC);
@@ -507,6 +541,7 @@ static bool fill_unicode_property(CharClass* cls, const char* key, const char* n
         }
         if (!ucd_prop) return false;
         CharClass* build = (prop_cache_count < MAX_PROP_CACHE) ? &prop_cache[prop_cache_count].cls : &local;
+        uncached_local = (build == &local);
         memset(build, 0, sizeof(CharClass));
         for (int i = 0; i < ucd_prop->count; i++) {
             add_range(build, ucd_prop->ranges[i].start, ucd_prop->ranges[i].end);
@@ -520,10 +555,16 @@ static bool fill_unicode_property(CharClass* cls, const char* key, const char* n
         src = build;
     }
 
-    if (ucd_prop->sequence_count > 0 && !allow_strings) return false;
+    if (ucd_prop->sequence_count > 0 && !allow_strings) {
+        if (uncached_local) class_free(&local);
+        return false;
+    }
 
     if (negate) {
-        if (ucd_prop->sequence_count > 0) return false;
+        if (ucd_prop->sequence_count > 0) {
+            if (uncached_local) class_free(&local);
+            return false;
+        }
         uint32_t current = 0;
         for (int i = 0; i < src->range_count; i++) {
             if (src->ranges[i].start > current) {
@@ -555,12 +596,13 @@ static bool fill_unicode_property(CharClass* cls, const char* key, const char* n
             class_strings_push(cls, &out);
         }
     }
+    if (uncached_local) class_free(&local);
     return true;
 }
 
 /* Sorted-range membership test, same shape as the VM's class_contains --
  * add_range keeps ranges sorted and coalesced, so the closure passes below
- * can binary-search instead of linearly scanning up to 2048 ranges per
+ * can binary-search instead of linearly scanning every range per
  * fold-table entry (a large class under /i, e.g. [\p{L}], paid
  * table-size x range_count per pass). */
 static inline bool cls_has_cp(const CharClass* cls, uint32_t cp) {
@@ -621,10 +663,11 @@ static void invert_class(CharClass* cls) {
     }
     if (current <= 0x10FFFF) add_range(&res, current, 0x10FFFF);
     res.negated = false;
-    /* Every caller complements string-free classes (negating a string set
-     * is rejected upstream), so this free is a no-op guard against a
-     * future caller leaking the heap buffer through the overwrite. */
-    class_strings_free(cls);
+    /* Move idiom: free the destination's own buffers, then transfer
+     * ownership of res's through the struct assignment. (The string free
+     * half is a no-op guard -- every caller complements string-free
+     * classes -- but the RANGES buffer is live and would leak.) */
+    class_free(cls);
     *cls = res;
 }
 
@@ -685,7 +728,7 @@ static void class_intersect_v(CharClass* a, const CharClass* b) {
     }
     for (int i = 0; i < a->string_count; i++)
         if (class_has_string(b, &a->strings[i])) class_strings_push(&res, &a->strings[i]);
-    class_strings_free(a);
+    class_free(a);
     *a = res;
 }
 
@@ -703,7 +746,8 @@ static void class_subtract_v(CharClass* a, const CharClass* b) {
     }
     for (int i = 0; i < a->string_count; i++)
         if (!class_has_string(b, &a->strings[i])) class_strings_push(&res, &a->strings[i]);
-    class_strings_free(a);
+    class_free(&binv);
+    class_free(a);
     *a = res;
 }
 
@@ -789,7 +833,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
             
             if (start_char == '\\') {
                 uint32_t esc = decode_utf16_lexer(lexer);
-                if (esc == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return; }
+                if (esc == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; class_free(&current_union); return; }
                 if (esc < 128 && strchr("dDwWsS", (char)esc)) { fill_builtin_class(&current_union, (char)esc, lexer->prog->unicode, lexer->prog->unicode && lexer->prog->ignore_case); is_special = true; }
                 else if (esc == 'x') {
                     if (!parse_hex(lexer, 2, &start_char)) {
@@ -817,7 +861,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                             if (val != prop) { prop[val - prop - 1] = '\0'; pkey = prop; }
                             if (!fill_unicode_property(&current_union, pkey, val, esc == 'P', lexer->prog->unicode_sets)) {
                                 lexer->prog->error = "SyntaxError: Invalid property name";
-                                return;
+                                { class_free(&current_union); return; }
                             }
                             is_special = true;
                         } else {
@@ -829,7 +873,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                 }
                 else if (esc == 'u') {
                     if (lexer->prog->unicode && lexer->src[lexer->pos] == '{') {
-                        if (!parse_braced_hex(lexer, &start_char)) return;
+                        if (!parse_braced_hex(lexer, &start_char)) { class_free(&current_union); return; }
                     } else {
                         if (!parse_hex(lexer, 4, &start_char)) {
                             if (lexer->prog->unicode) {
@@ -870,7 +914,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                      * escape path (legacy octal is an early error under /u). */
                     if (lexer->prog->unicode && is_digit_char(lexer->src[lexer->pos])) {
                         lexer->prog->error = "SyntaxError: Invalid decimal escape in unicode mode";
-                        return;
+                        { class_free(&current_union); return; }
                     }
                     start_char = '\0';
                 }
@@ -890,7 +934,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
             if (is_special && lexer->prog->unicode &&
                 lexer->src[lexer->pos] == '-' && lexer->src[lexer->pos+1] != ']') {
                 lexer->prog->error = "SyntaxError: Invalid character class range";
-                return;
+                { class_free(&current_union); return; }
             }
 
             if (!is_special) {
@@ -904,7 +948,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                     uint32_t end_char = decode_utf16_lexer(lexer);
                     if (end_char == '\\') {
                         uint32_t esc = decode_utf16_lexer(lexer);
-                        if (esc == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return; }
+                        if (esc == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; class_free(&current_union); return; }
                         /* Same rule for a class escape as the range END atom
                          * ([a-\d], [a-\p{Hex}]): SyntaxError in unicode mode.
                          * \p/\P (property escapes) must be rejected here too,
@@ -912,7 +956,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                         if (lexer->prog->unicode && esc < 128 &&
                             (strchr("dDwWsS", (char)esc) || esc == 'p' || esc == 'P')) {
                             lexer->prog->error = "SyntaxError: Invalid character class range";
-                            return;
+                            { class_free(&current_union); return; }
                         }
                         if (esc == 'x') {
                             if (!parse_hex(lexer, 2, &end_char)) {
@@ -921,7 +965,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                         }
                         else if (esc == 'u') {
                             if (lexer->prog->unicode && lexer->src[lexer->pos] == '{') {
-                                if (!parse_braced_hex(lexer, &end_char)) return;
+                                if (!parse_braced_hex(lexer, &end_char)) { class_free(&current_union); return; }
                             } else {
                                 if (!parse_hex(lexer, 4, &end_char)) {
                                     if (lexer->prog->unicode) {
@@ -960,7 +1004,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                         else if (esc == '0') {
                             if (lexer->prog->unicode && is_digit_char(lexer->src[lexer->pos])) {
                                 lexer->prog->error = "SyntaxError: Invalid decimal escape in unicode mode";
-                                return;
+                                { class_free(&current_union); return; }
                             }
                             end_char = '\0';
                         }
@@ -1248,7 +1292,14 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
     bool negate = false;
     if (lexer->src[lexer->pos] == '^') { negate = true; lexer->pos++; }
 
-    CharClass* tmp = malloc(sizeof(CharClass));
+    /* calloc, not malloc: the empty-class path ([] / [^]) skips the loop
+     * below -- and its per-iteration memsets -- entirely, yet still
+     * reaches the class_free at the end, which must see NULL buffer
+     * pointers, not uninitialized memory. (Latent from day one: the old
+     * ~16KB CharClass happened to keep its pointer fields in
+     * fresh-mapped-zero territory in practice; the right-sized struct
+     * made the garbage-free reachable, fuzzer-found.) */
+    CharClass* tmp = calloc(1, sizeof(CharClass));
     if (!tmp) {
         fprintf(stderr, "Fatal Error: Out of memory\n");
         exit(EXIT_FAILURE);
@@ -1270,7 +1321,7 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
                  * chained over single operands, nothing else. */
                 while (!lexer->prog->error && lexer->src[lexer->pos] == o0 && lexer->src[lexer->pos + 1] == o0) {
                     lexer->pos += 2;
-                    class_strings_free(tmp);
+                    class_free(tmp);
                     memset(tmp, 0, sizeof(CharClass));
                     uint32_t ch = 0;
                     if (!parse_class_set_operand(lexer, tmp, &ch)) {
@@ -1294,7 +1345,7 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
                         lexer->prog->error = "SyntaxError: Invalid set operation in character class";
                         break;
                     }
-                    class_strings_free(tmp);
+                    class_free(tmp);
                     memset(tmp, 0, sizeof(CharClass));
                     parse_class_v_element(lexer, tmp, &single);
                     if (lexer->prog->error) break;
@@ -1303,7 +1354,7 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
             }
         }
     }
-    class_strings_free(tmp);
+    class_free(tmp);
     free(tmp);
     if (lexer->prog->error) { lexer->parse_depth--; return; }
 

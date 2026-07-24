@@ -15,10 +15,10 @@
  *      unmatched optional group; group 0 is the whole match
  *   4. regex_free() the handle when done with this compiled pattern
  *
- * A compiled Program is large (multi-MB fixed-size opcode/class tables --
- * see regexp.h) and always heap-allocated here, never on the stack. Compile
- * once per distinct pattern and reuse the handle across calls; don't
- * recompile per exec.
+ * A compiled Program is a fixed header plus right-sized heap buffers
+ * (opcode array, class range/string sets -- see regexp.h), always
+ * heap-allocated here, never on the stack. Compile once per distinct
+ * pattern and reuse the handle across calls; don't recompile per exec.
  */
 #include <stdint.h>
 #include <stdlib.h>
@@ -96,7 +96,7 @@ uintptr_t regex_compile(const uint16_t* pattern, int pattern_units, int flags) {
     compile_into(&h->prog, pattern, flags);
     if (h->prog.error) {
         set_last_error(h->prog.error);
-        for (int i = 0; i < h->prog.class_count; i++) class_strings_free(&h->prog.classes[i]);
+        program_release(&h->prog);
         free(h);
         return 0;
     }
@@ -104,7 +104,7 @@ uintptr_t regex_compile(const uint16_t* pattern, int pattern_units, int flags) {
     h->captures = (int32_t*)malloc(sizeof(int32_t) * (size_t)pair_count);
     if (!h->captures) {
         set_last_error("OutOfMemory: could not allocate capture buffer");
-        for (int i = 0; i < h->prog.class_count; i++) class_strings_free(&h->prog.classes[i]);
+        program_release(&h->prog);
         free(h);
         return 0;
     }
@@ -252,7 +252,7 @@ EMSCRIPTEN_KEEPALIVE
 void regex_free(uintptr_t handle) {
     RegexHandle* h = (RegexHandle*)(uintptr_t)handle;
     if (!h) return;
-    for (int i = 0; i < h->prog.class_count; i++) class_strings_free(&h->prog.classes[i]);
+    program_release(&h->prog);
     vm_context_free(h->ctx);
     free(h->captures);
     free(h);

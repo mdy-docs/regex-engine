@@ -54,12 +54,13 @@ lexer → parser → validation → compiler and populates a caller-owned
 directly from the AST in one recursive walk (`compile_node`,
 `re_compiler.c:129`).
 
-## The `Program` struct — why it's (almost) all fixed-size arrays
+## The `Program` struct — a small fixed header over right-sized heap buffers
 
 ```c
 typedef struct {
-    Instruction code[MAX_OPCODES];       // 32768
-    CharClass classes[MAX_CLASSES];      // 128
+    Instruction* code;                   // heap, grown by emit(); cap MAX_OPCODES
+    int code_cap;
+    CharClass classes[MAX_CLASSES];      // 256 small headers; buffers on the heap
     char group_names[MAX_GROUPS][32];    // 255
     int name_chain[MAX_GROUPS];          // same-name links for \k<...>
     int code_count, class_count, group_count, counter_count;
@@ -71,28 +72,26 @@ typedef struct {
 } Program;
 ```
 
-`Program` itself is ~2MB of fixed-size arrays, deliberately sized to avoid
-dynamic growth logic in a component meant to run inside a WASM sandbox
-with no realloc-heavy allocator pressure. The **one deliberate exception**
-is each `CharClass`'s string set (`\q{…}` alternatives and Unicode
-"properties of strings"): `CharClass.strings` is a heap-allocated,
-right-sized buffer grown on demand during compilation — `\p{RGI_Emoji}`
-alone carries 2604 sequences, which embedded inline at `MAX_CLASSES`
-scale would add >10MB to every `Program` (see `CharClass` in
-`include/regexp.h` for the ownership rules; this replaced a fixed
-`strings[128]` that silently truncated those large properties).
-Consequences: a `Program` must be **zero-initialized before
-its first `compile_into`** (`regex_compile` uses `calloc`), re-compiling
-into the same `Program` frees the previous compile's buffers, and
-teardown must release them (`regex_free` does; a native host driving
-`compile_into` directly calls the public `class_strings_free` per class).
+The struct itself is a ~19KB fixed header (dominated by `group_names` and
+the class slot table); everything that scales with the pattern — the
+instruction array and each class's codepoint ranges and string set — is a
+heap-allocated, right-sized buffer grown on demand during compilation,
+with `MAX_OPCODES`/`MAX_CLASSES`/etc. surviving as hard caps rather than
+allocation sizes. It was ~2MB of embedded fixed-size arrays (a 10-instruction
+pattern paid for 32768; every class paid 16KB of `ranges[2048]`), which
+priced a host out of holding many compiled patterns at once.
+Consequences of heap ownership: a `Program` must be **zero-initialized
+before its first `compile_into`** (`regex_compile` uses `calloc`),
+re-compiling into the same `Program` frees the previous compile's class
+buffers (the code buffer is kept and reused), and teardown must release
+everything (`regex_free` does; a native host driving `compile_into`
+directly calls the public `program_release`). See `CharClass` in
+`include/regexp.h` for the per-class ownership rules — locally-built
+classes are moved via free-then-struct-assign (`class_free`), and every
+error path that abandons one frees it first.
 (*Matching* allocates a `VMContext` — backtrack stacks, capture arenas,
 fail caches — once per `regex_exec` call, reused across every start
-position; see the VM section below.) `compile_into`'s top comment
-(`re_compiler.c:317`) explains why it *doesn't* zero the whole struct on
-each compile (`= {0}` would touch all ~2MB) — only the bookkeeping
-counters and `group_names` (which is read by name lookups even for slots
-that were never written) get reset.
+position; see the VM section below.)
 
 All of `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS`/`MAX_COUNTERS` are
 enforced at their allocation sites (they originally weren't, with

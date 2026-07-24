@@ -235,22 +235,23 @@ int main(void) {
      * crashing; the exact boundary itself is deliberately not exercised
      * here for capture groups -- see the comment on that block below. */
     {
-        /* MAX_CLASSES = 128 (was 64 -- test262's classic XML pattern needs
-         * 72): exactly at the limit succeeds, one more fails cleanly
+        /* MAX_CLASSES = 256 (was 64 -- test262's classic XML pattern needs
+         * 72; cheap to raise now that a class is a small header over heap
+         * buffers): exactly at the limit succeeds, one more fails cleanly
          * instead of overflowing prog->classes[]. */
-        char* patA = malloc(128 * 3 + 1); patA[0] = 0;
-        for (int i = 0; i < 128; i++) strcat(patA, "[a]");
+        char* patA = malloc(256 * 3 + 1); patA[0] = 0;
+        for (int i = 0; i < 256; i++) strcat(patA, "[a]");
         uint16_t* pA = to_utf16(patA);
         uintptr_t hA = regex_compile(pA, 0, 0);
-        check(hA != 0, "MAX_CLASSES: exactly 128 character classes compiles");
+        check(hA != 0, "MAX_CLASSES: exactly 256 character classes compiles");
         if (hA) regex_free(hA);
         free(patA); free(pA);
 
-        char* patB = malloc(129 * 3 + 1); patB[0] = 0;
-        for (int i = 0; i < 129; i++) strcat(patB, "[a]");
+        char* patB = malloc(257 * 3 + 1); patB[0] = 0;
+        for (int i = 0; i < 257; i++) strcat(patB, "[a]");
         uint16_t* pB = to_utf16(patB);
         uintptr_t hB = regex_compile(pB, 0, 0);
-        check(hB == 0, "MAX_CLASSES: 129 character classes is a clean compile error, not a crash");
+        check(hB == 0, "MAX_CLASSES: 257 character classes is a clean compile error, not a crash");
         check(hB == 0 && strstr(regex_last_error(), "maximum character class count") != NULL,
               "MAX_CLASSES: error message identifies the resource limit");
         if (hB) regex_free(hB);
@@ -1325,7 +1326,7 @@ int main(void) {
               "an exhausted context refuses further matches");
         vm_context_free(c3);
 
-        for (int i = 0; i < prog->class_count; i++) class_strings_free(&prog->classes[i]);
+        program_release(prog);
         free(prog);
         free(pattern);
         free(text);
@@ -1551,6 +1552,23 @@ int main(void) {
         check(h != 0 && regex_exec(h, text3, 4, 0) && regex_captures_ptr(h)[0] == 3,
               "scan filter: negated class admits the complement");
         free(pattern); free(text3); regex_free(h);
+    }
+
+    /* Empty /v classes: [] never matches, [^] matches everything. This
+     * path skips the /v parser's whole operand loop, and its end-of-parse
+     * cleanup once freed uninitialized buffer pointers (fuzzer-found SEGV
+     * after CharClass was right-sized; latent before). */
+    {
+        uint16_t* pattern = to_utf16("[]");
+        uintptr_t h = regex_compile(pattern, 0, regex_flag_bit('v'));
+        uint16_t text = 'x';
+        check(h != 0 && !regex_exec(h, &text, 1, 0), "[]/v compiles and never matches");
+        free(pattern); regex_free(h);
+
+        pattern = to_utf16("[^]");
+        h = regex_compile(pattern, 0, regex_flag_bit('v'));
+        check(h != 0 && regex_exec(h, &text, 1, 0), "[^]/v compiles and matches anything");
+        free(pattern); regex_free(h);
     }
 
     if (failures == 0) {

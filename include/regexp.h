@@ -10,12 +10,12 @@
  * rather than capped at 128 -- needs ~17.5k instructions on its own. */
 #define MAX_OPCODES 32768
 #define MAX_GROUPS 255
-/* 128, not the original 64: real-world patterns clear 64 (test262's
+/* 256, not the original 64: real-world patterns clear 64 (test262's
  * classic XML shallow-parsing regex builds 72 distinct classes in one
- * pattern). Each embedded CharClass is ~16KB (ranges[2048]), so this is
- * the main Program-size lever -- raising it further should wait for
- * heap-sized ranges like CharClass.strings already has. */
-#define MAX_CLASSES 128
+ * pattern), and now that a CharClass is a ~50B header over heap-sized
+ * range/string buffers -- not a ~16KB embedded array -- the slot table is
+ * cheap enough to size generously. */
+#define MAX_CLASSES 256
 /* 256, not the original 16: every quantifier consumes a counter id, and
  * ordinary real-world patterns blow past 16 -- test262's classic XML
  * shallow-parsing regex (a single 907-char pattern) needs 75. Cheap to
@@ -92,27 +92,38 @@ typedef struct {
     int length;
 } StringSequence;
 
+/* Both buffers are heap-owned and right-sized (grown on demand; NULL iff
+ * the corresponding count is 0). ranges was a fixed [2048] embedded array
+ * (~16KB per class, the dominant term in Program's old multi-MB footprint)
+ * and strings a fixed [128] one (which silently truncated the large
+ * Unicode properties of strings -- RGI_Emoji alone has 2604 sequences).
+ * Ownership: a CharClass owns its buffers; copies must deep-copy
+ * (re_lexer.c's class_strings_push / add_range) or deliberately transfer
+ * ownership through a struct assignment AFTER freeing the destination's
+ * own buffers (class_free), which is also how compile_into re-entry and
+ * program_release tear classes down. A Program must be ZERO-INITIALIZED
+ * before its first compile_into so those frees never see garbage
+ * pointers. */
 typedef struct {
-    CodePointRange ranges[2048];
+    CodePointRange* ranges;
     int range_count;
-    /* Heap-owned, right-sized string set (grown on demand; NULL iff
-     * string_count == 0). This used to be a fixed strings[128] embedded
-     * array, which silently truncated the large Unicode properties of
-     * strings (RGI_Emoji alone has 2604 sequences). Ownership: a CharClass
-     * owns its buffer; copies must deep-copy (re_lexer.c's
-     * class_strings_push) or deliberately transfer ownership, and the
-     * buffers are released by class_strings_free -- compile_into frees a
-     * previous compile's buffers on re-entry, regex_free frees them at
-     * teardown. A Program must be ZERO-INITIALIZED before its first
-     * compile_into so those frees never see garbage pointers. */
+    int range_cap;
     StringSequence* strings;
     int string_count;
     int string_cap;
     bool negated;
 } CharClass;
 
+/* code is heap-owned and right-sized: emit() (re_compiler.c) grows it on
+ * demand up to the MAX_OPCODES hard cap, and compile_into re-entry reuses
+ * the buffer across recompiles. It was a fixed Instruction[MAX_OPCODES]
+ * embedded array -- 786KB per Program whether the pattern needed 10
+ * instructions or 30k. With that and CharClass's buffers right-sized, a
+ * typical compiled Program is tens of KB, not the ~2MB the fixed layout
+ * cost. */
 typedef struct {
-    Instruction code[MAX_OPCODES];
+    Instruction* code;
+    int code_cap;
     CharClass classes[MAX_CLASSES];
     char group_names[MAX_GROUPS][MAX_GROUP_NAME];
     /* name_chain[i] = the next group id > i sharing group i's name (0 =
@@ -165,11 +176,16 @@ typedef struct {
 
 void compile_into(Program* prog, const uint16_t* regex, int flags);
 
-/* Releases one class's heap-owned string set (safe on an empty class; the
- * pointer is NULLed). A host that drives compile_into directly must call
- * this for classes[0..class_count) before discarding a Program -- the
- * regex_wasm.c shim's regex_free does exactly that. */
-void class_strings_free(CharClass* cls);
+/* Releases one class's heap-owned buffers, ranges and strings both (safe
+ * on an empty class; the pointers are NULLed). */
+void class_free(CharClass* cls);
+
+/* Releases every heap buffer a Program owns -- the code array and all
+ * classes' range/string buffers -- leaving the struct reusable for another
+ * compile_into (and safe to call on a zero-initialized, never-compiled
+ * Program). A host that drives compile_into directly must call this before
+ * discarding a Program; the regex_wasm.c shim's regex_free does. */
+void program_release(Program* prog);
 
 /* Reusable execution scratch (backtrack stacks, capture arenas, fail
  * caches -- one set per lookaround recursion depth, allocated lazily and

@@ -25,13 +25,15 @@ test/built-ins/RegExp/match-indices/indices-property.js
 test/built-ins/RegExp/named-groups/groups-object.js
 
 ## Out of scope: test-harness resource exhaustion, not engine behavior.
-# This test compiles one fresh RegExp per non-whitespace BMP code point
-# (~65k compiles in one file). Each compiled Program is a multi-MB
-# fixed-size struct (see regexp.h), and the runner keeps every handle a
-# file creates alive until the file finishes -- 65k live handles exhausts
-# WASM linear memory long before the file ends. Each individual pattern
-# compiles and matches fine; a host that frees regexes it no longer
-# references would run this workload without issue.
+# This test compiles AND EXECUTES one fresh RegExp per non-whitespace BMP
+# code point (~65k in one file), and the runner keeps every handle a file
+# creates alive until the file finishes. A compiled Program is small now
+# (~19KB header + right-sized buffers), but each executed handle also
+# pins its reusable VM scratch (VMContext: fail cache + backtrack stack,
+# ~160KB) for the handle's lifetime -- 65k live handles is ~10GB, far
+# past WASM linear memory. Each individual pattern compiles and matches
+# fine; a host that frees regexes it no longer references would run this
+# workload without issue.
 test/built-ins/RegExp/character-class-escape-non-whitespace.js
 
 # NOTE: `node test/test262_runner.mjs --generated` additionally runs the

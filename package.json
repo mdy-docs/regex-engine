@@ -1,6 +1,6 @@
 {
   "name": "@mdy-docs/baru-re",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Standalone ECMAScript-flavored regex engine in C, compiled to WebAssembly. bārû (the Babylonian diviner — a reader of signs and patterns) + RE.",
   "license": "MIT",
   "author": "Daniel Walton <daniel@belteshazzar.com.au>",

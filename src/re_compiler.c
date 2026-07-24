@@ -34,19 +34,31 @@ static uint32_t emit_char_operand(const Program* prog, uint32_t ch) {
     return prog->unicode ? unicode_casefold(ch) : annexb_canonicalize(ch);
 }
 
-/* Bounds-checked against MAX_OPCODES (a
- * confirmed heap-buffer-overflow: an unchecked pattern compiling to more
- * than MAX_OPCODES instructions wrote past prog->code[]). Once the limit is
+/* The code array is heap-owned and grown here on demand (it was a fixed
+ * Instruction[MAX_OPCODES] embedded array -- 786KB per Program regardless
+ * of pattern size); MAX_OPCODES survives as the hard cap. Once the cap is
  * hit, prog->error is set and every subsequent call clamps to the last
  * valid slot instead of indexing out of bounds; callers keep patching that
  * slot's fields (`prog->code[returned_idx].argN = ...`) after the fact,
  * which produces nonsensical-but-safe bytecode that's never actually run,
  * since a Program with prog->error set is discarded by regex_compile()
- * without ever reaching vm_execute_internal() (see src/regex_wasm.c). */
+ * without ever reaching the VM (see src/regex_wasm.c). The clamp index is
+ * always in-bounds: this branch is only reachable once code_count == cap
+ * == MAX_OPCODES, so slot code_count-1 exists. */
 static int emit(Program* prog, RegexOpCode op, int arg1, int arg2, int arg3, int arg4, bool lazy) {
     if (prog->code_count >= MAX_OPCODES) {
         if (!prog->error) prog->error = "InternalError: pattern exceeds maximum compiled instruction count";
-        return MAX_OPCODES - 1;
+        return prog->code_count - 1;
+    }
+    if (prog->code_count == prog->code_cap) {
+        int new_cap = prog->code_cap ? prog->code_cap * 2 : 64;
+        Instruction* grown = realloc(prog->code, sizeof(Instruction) * (size_t)new_cap);
+        if (!grown) {
+            fprintf(stderr, "Fatal Error: Out of memory\n");
+            exit(EXIT_FAILURE);
+        }
+        prog->code = grown;
+        prog->code_cap = new_cap;
     }
     int idx = prog->code_count++;
     prog->code[idx] = (Instruction){op, arg1, arg2, arg3, arg4, lazy};
@@ -419,17 +431,30 @@ static void compute_scan_filter(Program* prog) {
     prog->scan_filter = ok;
 }
 
+/* Non-static, public (declared in regexp.h): full heap teardown for a
+ * Program a host is done with. Distinct from compile_into's re-entry
+ * reset, which frees the classes' buffers (their counts restart at zero)
+ * but deliberately KEEPS the code buffer for reuse across recompiles. */
+void program_release(Program* prog) {
+    for (int i = 0; i < prog->class_count; i++) class_free(&prog->classes[i]);
+    prog->class_count = 0;
+    free(prog->code);
+    prog->code = NULL;
+    prog->code_count = 0;
+    prog->code_cap = 0;
+}
+
 void compile_into(Program* prog, const uint16_t* regex, int flags) {
-    /* Program is ~2MB; a full `= {0}` zeroing (and return-by-value copying)
-     * dominated RegExp construction cost. Only the bookkeeping needs
-     * initialisation: code[]/classes[] entries are fully written before use
-     * and never read past their counts; group_names IS read by name lookups
-     * for unnamed groups, so it stays zeroed. Class string sets are heap-
-     * owned (see CharClass in regexp.h), so a re-compile into the same
-     * Program must release the previous compile's buffers first -- which
-     * also means a Program must be ZERO-initialized (calloc) before its
-     * FIRST compile_into, or this loop would free garbage pointers. */
-    for (int i = 0; i < prog->class_count; i++) class_strings_free(&prog->classes[i]);
+    /* Only the bookkeeping needs initialisation: code/classes entries are
+     * fully written before use and never read past their counts (the code
+     * buffer itself is kept and reused across recompiles); group_names IS
+     * read by name lookups for unnamed groups, so it stays zeroed. Class
+     * range/string buffers are heap-owned (see CharClass in regexp.h), so
+     * a re-compile into the same Program must release the previous
+     * compile's buffers first -- which also means a Program must be
+     * ZERO-initialized (calloc) before its FIRST compile_into, or this
+     * loop would free garbage pointers. */
+    for (int i = 0; i < prog->class_count; i++) class_free(&prog->classes[i]);
     memset(prog->group_names, 0, sizeof(prog->group_names));
     memset(prog->name_chain, 0, sizeof(prog->name_chain));
     prog->code_count = 0;

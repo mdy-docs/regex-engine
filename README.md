@@ -134,21 +134,20 @@ Notes:
   `compile_into` has no length parameter — it scans for `\0`). `text`
   passed to `regex_exec` does *not* need NUL-termination; `text_units` is
   authoritative there.
-- A compiled `Program` is a large, fixed-size struct (multi-megabyte —
-  `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS` in `regexp.h` are generous fixed
-  bounds, not dynamically sized) and is always heap-allocated by
-  `regex_compile`, never put on the stack. **Compile once per distinct
-  pattern and reuse the handle** across many `regex_exec` calls — don't
-  recompile per match attempt. If footprint matters for your target (e.g.
-  compiling many distinct patterns at once), shrinking those `MAX_*`
-  constants in `include/regexp.h` is the lever — see that file.
+- A compiled `Program` is a small fixed header (~19KB) plus right-sized
+  heap buffers for the instruction array and each character class's
+  range/string sets — `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS` in
+  `regexp.h` are hard caps, not allocation sizes. A typical pattern costs
+  a few KB of buffers. Still: **compile once per distinct pattern and
+  reuse the handle** across many `regex_exec` calls — don't recompile per
+  match attempt (and note each *executed* handle also holds its reusable
+  VM scratch, ~160KB, until freed).
 - If you call `compile_into` directly (bypassing `regex_compile`), the
   `Program` must be **zero-initialized before its first compile** (`calloc`
-  or `memset`), and released via per-class `class_strings_free` — class
-  string sets (`\q{…}`, Unicode properties of strings) are heap-owned,
-  right-sized buffers, not part of the fixed-size struct; `regex_compile`/
-  `regex_free` handle both automatically. See `CharClass` in
-  `include/regexp.h` for the ownership rules.
+  or `memset`), and released via `program_release` when you're done with
+  it — that frees the code buffer and every class's heap buffers;
+  `regex_compile`/`regex_free` handle both automatically. See `CharClass`
+  in `include/regexp.h` for the ownership rules.
 - `regex_exec` honors the sticky (`/y`) and unicode (`/u`, `/v`) flags baked
   into the compiled pattern automatically (no need to pass them again):
   sticky anchors exactly at `start_index`; unicode mode advances the search
