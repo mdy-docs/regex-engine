@@ -220,8 +220,22 @@ static inline void thread_copy_state(Thread* dst, const Thread* src, int cap_pai
  * stack now doubles on demand up to this many entries; a match needing
  * more is abandoned as no-match (a documented engine limit, like
  * MAX_GROUPS -- there's no error channel on the exec path) rather than
- * corrupting memory. 2^19 entries * ~250B/entry caps the worst case
- * around 130MB, tolerable transiently even under WASM's default heap. */
+ * corrupting memory.
+ *
+ * Worst-case bytes at the cap scale with the PATTERN, not just this
+ * constant: each entry costs sizeof(Thread) (40B) plus its arena slices --
+ * 8B per capture slot (cap_pairs = 2*(groups+1)) and 12B per counter. A
+ * typical few-group pattern is ~100B/entry, so 2^19 entries top out around
+ * 50MB, transient and tolerable even under WASM's default heap. A
+ * pathological pattern near the MAX_GROUPS/MAX_COUNTERS ceilings could in
+ * principle multiply that toward single-digit GBs before the entry cap
+ * bites -- reaching 2^19 live entries additionally requires a
+ * quantifier-driven subject in the hundreds of thousands of units, and
+ * allocation failure remains a clean fatal exit, but an embedder wanting a
+ * hard BYTE bound for adversarial pattern+subject pairs should derive the
+ * cap from per-entry cost rather than rely on this constant alone (the
+ * step budget usually intervenes first: every backtrack entry implies
+ * dispatched instructions). */
 #define VM_STACK_MAX (1 << 19)
 
 /* Per-recursion-depth execution scratch. Lookaround runs the VM
