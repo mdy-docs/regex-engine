@@ -171,8 +171,15 @@ static inline bool class_contains(const CharClass* cls, uint32_t cp) {
  * thread_copy_state(), and its call sites below -- since assignment now
  * only copies the *pointer*, aliasing two threads' capture state instead
  * of giving each its own snapshot. */
+/* counters/counter_sp are pointers into per-depth arenas (like captures),
+ * sized to the pattern's actual counter_count -- they were embedded
+ * [MAX_COUNTERS] arrays, which both put a hard 16-quantifier limit on
+ * patterns (real-world regexes blow past that: test262's classic XML
+ * shallow-parsing pattern needs ~30) and made every Thread carry 192 bytes
+ * of mostly-dead state. MAX_COUNTERS now only caps the compile-time id
+ * space, so raising it costs nothing per-thread. */
 typedef struct {
-    int pc; const uint16_t* sp; const uint16_t** captures; int counters[MAX_COUNTERS]; const uint16_t* counter_sp[MAX_COUNTERS];
+    int pc; const uint16_t* sp; const uint16_t** captures; int* counters; const uint16_t** counter_sp;
 } Thread;
 
 static inline unsigned int hash_state(const Thread* t, int counter_count) {
@@ -194,12 +201,12 @@ static inline void thread_copy_state(Thread* dst, const Thread* src, int cap_pai
     dst->pc = src->pc;
     dst->sp = src->sp;
     memcpy((void*)dst->captures, src->captures, sizeof(const uint16_t*) * (size_t)cap_pairs);
-    /* Only the pattern's live counters, not the full MAX_COUNTERS arrays
-     * (192 bytes when most patterns use 0-2 counters) -- this runs once per
-     * backtrack push and once per pop. Slots >= counter_count are never
-     * read: every access is by a compile-assigned counter id. */
-    memcpy(dst->counters, src->counters, sizeof(int) * (size_t)counter_count);
-    memcpy(dst->counter_sp, src->counter_sp, sizeof(const uint16_t*) * (size_t)counter_count);
+    /* Guarded: counter-free patterns leave the counter pointers NULL, and
+     * this runs once per backtrack push and once per pop. */
+    if (counter_count) {
+        memcpy(dst->counters, src->counters, sizeof(int) * (size_t)counter_count);
+        memcpy((void*)dst->counter_sp, src->counter_sp, sizeof(const uint16_t*) * (size_t)counter_count);
+    }
 }
 
 #define VM_STACK_CAPACITY 512
@@ -225,6 +232,22 @@ typedef struct {
     Thread* stack;
     const uint16_t** arena;            /* stack slots' capture slices */
     const uint16_t** current_captures; /* the in-flight thread's, outside the arena */
+    /* Counter-state arenas, same layout discipline as the captures arena:
+     * one counter_count-sized slice per stack slot, plus the in-flight
+     * thread's own slices outside the arena so growth never moves them.
+     * All NULL for counter-free patterns. */
+    int* counters_arena;
+    const uint16_t** counter_sp_arena;
+    int* current_counters;
+    const uint16_t** current_counter_sp;
+    /* Pop-time snapshot of the in-flight thread's counters, keyed into the
+     * fail cache if the path fails (counters mutate as the path runs, so
+     * the store can't read them from `current` then). Heap, not vm_run
+     * stack locals: MAX_COUNTERS-sized locals would put multiple KB on
+     * every lookaround recursion frame for a constant that no longer needs
+     * to be small. */
+    int* path_counters;
+    const uint16_t** path_counter_sp;
     CacheEntry* cache;
     /* Per-slot counter state, keyed alongside cache: counter values feed
      * OP_CHECK_COUNTER (and counter_sp its empty-iteration test), so two
@@ -286,6 +309,12 @@ void vm_context_free(VMContext* ctx) {
         free(ctx->depth[i].stack);
         free((void*)ctx->depth[i].arena);
         free((void*)ctx->depth[i].current_captures);
+        free(ctx->depth[i].counters_arena);
+        free((void*)ctx->depth[i].counter_sp_arena);
+        free(ctx->depth[i].current_counters);
+        free((void*)ctx->depth[i].current_counter_sp);
+        free(ctx->depth[i].path_counters);
+        free((void*)ctx->depth[i].path_counter_sp);
         free(ctx->depth[i].cache);
         free(ctx->depth[i].cache_counters);
         free((void*)ctx->depth[i].cache_counter_sp);
@@ -302,7 +331,7 @@ void vm_context_free(VMContext* ctx) {
  * own allocation, not the arena, precisely so growth never moves them.)
  * Returns false only at VM_STACK_MAX; allocation failure stays fatal,
  * matching the OOM policy everywhere else in this file. */
-static bool vm_grow_stack(VMDepth* d, int cap_pairs) {
+static bool vm_grow_stack(VMDepth* d, int cap_pairs, int cc) {
     if (d->capacity >= VM_STACK_MAX) return false;
     int new_capacity = d->capacity * 2;
     Thread* new_stack = realloc(d->stack, sizeof(Thread) * (size_t)new_capacity);
@@ -312,6 +341,22 @@ static bool vm_grow_stack(VMDepth* d, int cap_pairs) {
         exit(EXIT_FAILURE);
     }
     for (int i = 0; i < new_capacity; i++) new_stack[i].captures = new_arena + (size_t)i * cap_pairs;
+    if (cc > 0) {
+        /* Counter arenas grow (and rebase) in tandem, same discipline as
+         * the captures arena above. */
+        int* new_counters = realloc(d->counters_arena, sizeof(int) * (size_t)cc * (size_t)new_capacity);
+        const uint16_t** new_counter_sp = realloc((void*)d->counter_sp_arena, sizeof(uint16_t*) * (size_t)cc * (size_t)new_capacity);
+        if (!new_counters || !new_counter_sp) {
+            fprintf(stderr, "Fatal Error: Out of memory\n");
+            exit(EXIT_FAILURE);
+        }
+        for (int i = 0; i < new_capacity; i++) {
+            new_stack[i].counters = new_counters + (size_t)i * cc;
+            new_stack[i].counter_sp = new_counter_sp + (size_t)i * cc;
+        }
+        d->counters_arena = new_counters;
+        d->counter_sp_arena = new_counter_sp;
+    }
     d->stack = new_stack;
     d->arena = new_arena;
     d->capacity = new_capacity;
@@ -341,7 +386,15 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
         if (cc > 0) {
             d->cache_counters = malloc(sizeof(int) * (size_t)cc * CACHE_SIZE);
             d->cache_counter_sp = malloc(sizeof(uint16_t*) * (size_t)cc * CACHE_SIZE);
-            if (!d->cache_counters || !d->cache_counter_sp) {
+            d->counters_arena = malloc(sizeof(int) * (size_t)cc * (size_t)d->capacity);
+            d->counter_sp_arena = malloc(sizeof(uint16_t*) * (size_t)cc * (size_t)d->capacity);
+            d->current_counters = malloc(sizeof(int) * (size_t)cc);
+            d->current_counter_sp = malloc(sizeof(uint16_t*) * (size_t)cc);
+            d->path_counters = malloc(sizeof(int) * (size_t)cc);
+            d->path_counter_sp = malloc(sizeof(uint16_t*) * (size_t)cc);
+            if (!d->cache_counters || !d->cache_counter_sp || !d->counters_arena ||
+                !d->counter_sp_arena || !d->current_counters || !d->current_counter_sp ||
+                !d->path_counters || !d->path_counter_sp) {
                 fprintf(stderr, "Fatal Error: Out of memory\n");
                 exit(EXIT_FAILURE);
             }
@@ -350,7 +403,11 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
             fprintf(stderr, "Fatal Error: Out of memory\n");
             exit(EXIT_FAILURE);
         }
-        for (int i = 0; i < d->capacity; i++) d->stack[i].captures = d->arena + (size_t)i * cap_pairs;
+        for (int i = 0; i < d->capacity; i++) {
+            d->stack[i].captures = d->arena + (size_t)i * cap_pairs;
+            d->stack[i].counters = cc > 0 ? d->counters_arena + (size_t)i * cc : NULL;
+            d->stack[i].counter_sp = cc > 0 ? d->counter_sp_arena + (size_t)i * cc : NULL;
+        }
         /* gen 0 marks every entry stale forever; real generations start at 1. */
         for (int i = 0; i < CACHE_SIZE; i++) d->cache[i].gen = 0;
         d->gen = 0;
@@ -369,13 +426,17 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
 
     Thread current;
     current.captures = d->current_captures;
+    current.counters = d->current_counters;
+    current.counter_sp = d->current_counter_sp;
 
     stack[0].pc = start_pc;
     stack[0].sp = search_start;
     memset((void*)stack[0].captures, 0, sizeof(const uint16_t*) * (size_t)cap_pairs);
     if (out_captures) memcpy((void*)stack[0].captures, out_captures, sizeof(const uint16_t*) * (size_t)cap_pairs);
-    memset(stack[0].counters, 0, sizeof(stack[0].counters));
-    memset(stack[0].counter_sp, 0, sizeof(stack[0].counter_sp));
+    if (cc > 0) {
+        memset(stack[0].counters, 0, sizeof(int) * (size_t)cc);
+        memset((void*)stack[0].counter_sp, 0, sizeof(const uint16_t*) * (size_t)cc);
+    }
     stack_ptr = 1;
 
     while (stack_ptr > 0) {
@@ -383,12 +444,10 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
         thread_copy_state(&current, &stack[stack_ptr], cap_pairs, cc);
 
         unsigned int h = 0;
-        /* Snapshot the popped state's counters now: they mutate as the path
-         * below executes, and the entry stored on failure must key the
-         * state the path STARTED from -- pc/sp get the same treatment via
-         * path_start_pc/path_start_sp. */
-        int path_start_counters[MAX_COUNTERS];
-        const uint16_t* path_start_counter_sp[MAX_COUNTERS];
+        /* Snapshot the popped state's counters (into d->path_counters):
+         * they mutate as the path below executes, and the entry stored on
+         * failure must key the state the path STARTED from -- pc/sp get
+         * the same treatment via path_start_pc/path_start_sp. */
         if (use_cache) {
             h = hash_state(&current, cc);
             if (fail_cache[h].gen == gen && fail_cache[h].pc == current.pc && fail_cache[h].sp == current.sp &&
@@ -396,8 +455,8 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                              memcmp(d->cache_counter_sp + (size_t)h * cc, current.counter_sp, sizeof(const uint16_t*) * (size_t)cc) == 0)))
                 continue;
             if (cc > 0) {
-                memcpy(path_start_counters, current.counters, sizeof(int) * (size_t)cc);
-                memcpy(path_start_counter_sp, current.counter_sp, sizeof(const uint16_t*) * (size_t)cc);
+                memcpy(d->path_counters, current.counters, sizeof(int) * (size_t)cc);
+                memcpy((void*)d->path_counter_sp, current.counter_sp, sizeof(const uint16_t*) * (size_t)cc);
             }
         }
 
@@ -660,7 +719,7 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                  * abandons the whole match (see the define above). Growth
                  * reallocates through the VMDepth, so refresh the locals. */
                 if (stack_ptr == stack_capacity) {
-                    if (!vm_grow_stack(d, cap_pairs)) return false;
+                    if (!vm_grow_stack(d, cap_pairs, cc)) return false;
                     stack = d->stack;
                     stack_capacity = d->capacity;
                 }
@@ -673,15 +732,31 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
             case OP_INC_COUNTER:  { current.counters[inst.arg1]++; current.pc++; } break;
             case OP_CHECK_COUNTER: {
                 int c = current.counters[inst.arg1], min = inst.arg2, max = inst.arg3, exit_pc = inst.arg4;
-                if (c > 0 && current.counter_sp[inst.arg1] == current.sp && c >= min) {
-                    current.pc = exit_pc;
+                if (c > 0 && current.counter_sp[inst.arg1] == current.sp && c > min) {
+                    /* ECMA-262 RepeatMatcher: an OPTIONAL iteration (min
+                     * already satisfied when it began, i.e. c-1 >= min) that
+                     * consumed nothing is DISCARDED as failure -- backtracking
+                     * then explores the iteration's other alternatives, or the
+                     * loop exit pushed when the iteration began. Exiting the
+                     * loop here instead (as this used to, with c >= min) kept
+                     * the empty iteration's captures and never tried those
+                     * alternatives: (a?b??)* against "ab" matched only "a",
+                     * and a ?-quantified lookahead wrongly kept its inner
+                     * capture set. MANDATORY iterations (c-1 < min, so
+                     * c <= min here) may match empty per spec -- (?:){2}b
+                     * must still match -- and fall through: c < min keeps
+                     * looping, c == min proceeds to the max-exit / push-exit
+                     * logic below, whose next iteration, if also empty,
+                     * lands in this branch and fails. */
+                    path_failed = true;
+                    break;
                 } else {
                     current.counter_sp[inst.arg1] = current.sp;
                     if (c < min) current.pc++;
                     else if (max != -1 && c == max) current.pc = exit_pc;
                     else {
                         if (stack_ptr == stack_capacity) {
-                            if (!vm_grow_stack(d, cap_pairs)) return false;
+                            if (!vm_grow_stack(d, cap_pairs, cc)) return false;
                             stack = d->stack;
                             stack_capacity = d->capacity;
                         }
@@ -716,8 +791,8 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
         if (use_cache && path_failed) {
             fail_cache[h].pc = path_start_pc; fail_cache[h].sp = path_start_sp; fail_cache[h].gen = gen;
             if (cc > 0) {
-                memcpy(d->cache_counters + (size_t)h * cc, path_start_counters, sizeof(int) * (size_t)cc);
-                memcpy(d->cache_counter_sp + (size_t)h * cc, path_start_counter_sp, sizeof(const uint16_t*) * (size_t)cc);
+                memcpy(d->cache_counters + (size_t)h * cc, d->path_counters, sizeof(int) * (size_t)cc);
+                memcpy(d->cache_counter_sp + (size_t)h * cc, d->path_counter_sp, sizeof(const uint16_t*) * (size_t)cc);
             }
         }
     }

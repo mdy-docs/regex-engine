@@ -44,10 +44,24 @@ const TEST_DIRS = [
   "test/built-ins/RegExp/property-escapes",
   "test/built-ins/RegExp/regexp-modifiers",
   "test/built-ins/RegExp/unicodeSets",
+  "test/built-ins/RegExp/prototype/exec",
+  "test/built-ins/RegExp/prototype/test",
   // NOT test/language/literals/regexp: those test the JS *tokenizer's*
   // literal grammar (line terminators inside literals, \u-escaped flags,
   // etc.), which the literal-to-constructor transform cannot faithfully
   // represent -- they'd measure the transform, not the engine.
+];
+
+// The classic pattern-semantics suites (S15.10.1 grammar, S15.10.2
+// escapes/anchors/quantifiers/classes) live as FLAT files directly in the
+// RegExp root. Walked non-recursively so the RegExp-OBJECT plumbing
+// subtrees (flags/source/toString/Symbol.* getters, @@species, etc.)
+// stay out of scope -- those test the host RegExp object, not matching.
+// This root was originally omitted entirely, which let engine bugs the
+// modern suites never touch (\f/\v escapes, multiline \r anchors) coexist
+// with a green run.
+const FLAT_TEST_DIRS = [
+  "test/built-ins/RegExp",
 ];
 
 // Features that need host capabilities the sandbox deliberately lacks.
@@ -254,13 +268,22 @@ const BOOTSTRAP = String.raw`
       this.source = pattern === "" ? "(?:)" : pattern;
       this.flags = flags;
       for (const ch in FLAG_PROPS) this[FLAG_PROPS[ch]] = seen.has(ch);
-      this.lastIndex = 0;
+      // Spec descriptor: writable, non-enumerable, non-configurable
+      // (test262 lastIndex.js asserts exactly this shape).
+      Object.defineProperty(this, "lastIndex", {
+        value: 0, writable: true, enumerable: false, configurable: false,
+      });
     }
 
     exec(str) {
+      if (!(this instanceof RegExp2)) throw new TypeError("exec called on non-RegExp");
       str = String(str);
       const useLast = this.global || this.sticky;
-      let start = useLast ? Math.trunc(+this.lastIndex) || 0 : 0;
+      // RegExpBuiltinExec reads lastIndex (Get + ToLength, one valueOf)
+      // unconditionally, even when global/sticky are unset and the value
+      // is then discarded -- test262 counts the reads.
+      let start = Math.trunc(+this.lastIndex) || 0;
+      if (!useLast) start = 0;
       if (start < 0) start = 0;
       let caps = null;
       if (start <= str.length) caps = bridge.exec(this._handle, str, start);
@@ -310,9 +333,17 @@ const BOOTSTRAP = String.raw`
       return m;
     }
 
-    test(str) { return this.exec(str) !== null; }
+    test(str) {
+      if (!(this instanceof RegExp2)) throw new TypeError("test called on non-RegExp");
+      return this.exec(str) !== null;
+    }
     toString() { return "/" + this.source + "/" + this.flags; }
   }
+
+  // Object.prototype.toString must report "[object RegExp]".
+  Object.defineProperty(RegExp2.prototype, Symbol.toStringTag, {
+    value: "RegExp", writable: false, enumerable: false, configurable: true,
+  });
 
   const advance = (str, i, unicode) => {
     if (unicode && i < str.length - 1) {
@@ -486,13 +517,30 @@ const BOOTSTRAP = String.raw`
     return out;
   };
 
-  // RegExp is callable without new (RegExp(x) === new RegExp(x) for our
-  // purposes); a couple of test262 files rely on it. A Proxy forwards
-  // construct and plain-call to the same class.
+  // RegExp is callable without new; a Proxy forwards construct and
+  // plain-call to the same class. Per 22.2.4.1, RegExp(re) with flags
+  // undefined returns the SAME object when its constructor is RegExp --
+  // several classic S15.10.3.1 tests assert identity.
   const RegExpCallable = new Proxy(RegExp2, {
-    apply(target, thisArg, args) { return new target(...args); },
+    apply(target, thisArg, args) {
+      // 22.2.4.1: only when the value's own .constructor is this very
+      // RegExp does the call return it unchanged -- a tampered
+      // constructor forces a fresh object (asserted by
+      // call_with_regexp_not_same_constructor.js).
+      if (args[0] instanceof RegExp2 && args[1] === undefined &&
+          args[0].constructor === RegExpCallable) return args[0];
+      return new target(...args);
+    },
   });
-  globalThis.RegExp = RegExpCallable;
+  // instance.constructor must be the global RegExp value.
+  Object.defineProperty(RegExp2.prototype, "constructor", {
+    value: RegExpCallable, writable: true, enumerable: false, configurable: true,
+  });
+  // Spec descriptor for the global binding: writable, non-enumerable,
+  // configurable (test262 prop-desc.js asserts this shape).
+  Object.defineProperty(globalThis, "RegExp", {
+    value: RegExpCallable, writable: true, enumerable: false, configurable: true,
+  });
   globalThis.$DONOTEVALUATE = function () {};
 })(globalThis.__bridge);
 `;
@@ -622,10 +670,26 @@ const failures = [];      // unexpected failures
 const expectedFailures = []; // failures listed in expectations
 const unexpectedPasses = [];
 
-for (const dir of TEST_DIRS) {
-  const full = join(T262, dir);
-  if (!existsSync(full)) continue;
-  for (const file of walk(full, includeGenerated)) {
+function* flatFiles(dir) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith(".js") && !entry.name.endsWith("_FIXTURE.js"))
+      yield join(dir, entry.name);
+  }
+}
+
+function* allTestFiles() {
+  for (const dir of TEST_DIRS) {
+    const full = join(T262, dir);
+    if (existsSync(full)) yield* walk(full, includeGenerated);
+  }
+  for (const dir of FLAT_TEST_DIRS) {
+    const full = join(T262, dir);
+    if (existsSync(full)) yield* flatFiles(full);
+  }
+}
+
+{
+  for (const file of allTestFiles()) {
     const rel = relative(T262, file);
     if (filter && !rel.includes(filter)) continue;
     const meta = parseFrontmatter(readFileSync(file, "utf8"));

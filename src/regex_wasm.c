@@ -164,7 +164,21 @@ int regex_exec(uintptr_t handle, const uint16_t* text, int text_units, int start
         matched = vm_execute(&h->prog, ctx, 0, 1, text, text_end, text + start_index, captures);
     } else {
         int is_unicode = h->prog.unicode || h->prog.unicode_sets;
+        const int use_filter = h->prog.scan_filter;
         for (int index = start_index; index <= text_units; ) {
+            /* First-unit filter (see Program.scan_filter): positions whose
+             * first code unit can't start any match are skipped without
+             * entering the VM -- the dominant cost of a non-matching scan.
+             * index == text_units (the end position) is always tried: a
+             * filtered pattern can't match empty, but the bound keeps this
+             * loop honoring "text need not be NUL-terminated". */
+            if (use_filter && index < text_units) {
+                uint16_t u = text[index];
+                int admissible = (u < 128)
+                    ? (h->prog.scan_ascii[u >> 3] >> (u & 7)) & 1
+                    : h->prog.scan_non_ascii;
+                if (!admissible) { index++; continue; }
+            }
             matched = vm_execute(&h->prog, ctx, 0, 1, text, text_end, text + index, captures);
             if (matched) break;
             if (is_unicode && index < text_units &&

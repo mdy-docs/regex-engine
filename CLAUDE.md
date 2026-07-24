@@ -98,11 +98,13 @@ reasons in `test/test262.expectations`.
 - `include/ucd.h` is **generated** — never hand-edit it; change
   `scripts/generate_ucd.py` and regenerate (`python3 scripts/generate_ucd.py
   > include/ucd.h`).
-- The engine logic (not the file layout — see "What this is" above) is a
-  **verbatim upstream copy** from jsvm2 for the compiler/VM. Prefer minimal,
-  surgical diffs over stylistic rewrites when fixing something, and
-  consider whether a fix should also go back upstream (see README
-  "Provenance").
+- The engine logic originated as a **verbatim copy** from jsvm2's
+  compiler/VM (see README "Provenance" for the history), but jsvm2 is no
+  longer a live upstream — this repo has diverged substantially (bug
+  fixes, balanced ASTs, dynamic VM arenas, the scan filter) and nothing
+  syncs back. Prefer minimal, surgical diffs over stylistic rewrites when
+  fixing something — that's about reviewability now, not upstream
+  portability.
 
 ## Conventions already in place (follow these, don't relitigate)
 

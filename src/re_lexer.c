@@ -865,7 +865,15 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                 else if (esc == 'r') start_char = '\r';
                 else if (esc == 'f') start_char = '\f';
                 else if (esc == 'v') start_char = '\v';
-                else if (esc == '0') start_char = '\0';
+                else if (esc == '0') {
+                    /* Same \0-not-followed-by-digit rule as the top-level
+                     * escape path (legacy octal is an early error under /u). */
+                    if (lexer->prog->unicode && is_digit_char(lexer->src[lexer->pos])) {
+                        lexer->prog->error = "SyntaxError: Invalid decimal escape in unicode mode";
+                        return;
+                    }
+                    start_char = '\0';
+                }
                 else {
                     if (lexer->prog->unicode && (esc >= 128 || !strchr("^$\\.*+?()[]{}|/-", (char)esc))) {
                         lexer->prog->error = "SyntaxError: Invalid identity escape";
@@ -949,7 +957,13 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
                         else if (esc == 'r') end_char = '\r';
                         else if (esc == 'f') end_char = '\f';
                         else if (esc == 'v') end_char = '\v';
-                        else if (esc == '0') end_char = '\0';
+                        else if (esc == '0') {
+                            if (lexer->prog->unicode && is_digit_char(lexer->src[lexer->pos])) {
+                                lexer->prog->error = "SyntaxError: Invalid decimal escape in unicode mode";
+                                return;
+                            }
+                            end_char = '\0';
+                        }
                         else {
                             if (lexer->prog->unicode && (esc >= 128 || !strchr("^$\\.*+?()[]{}|/-", (char)esc))) {
                                 lexer->prog->error = "SyntaxError: Invalid identity escape";
@@ -1095,7 +1109,14 @@ static int64_t parse_class_set_char(Lexer* lexer) {
             case 'f': return '\f';
             case 'v': return '\v';
             case 'b': return '\b';
-            case '0': return 0;
+            case '0':
+                /* /v inherits /u's rule: \0 followed by a digit is a legacy
+                 * octal escape, an early error. */
+                if (is_digit_char(lexer->src[lexer->pos])) {
+                    lexer->prog->error = "SyntaxError: Invalid decimal escape";
+                    return -1;
+                }
+                return 0;
             case 'c': {
                 uint32_t ctrl = lexer->src[lexer->pos];
                 if ((ctrl >= 'a' && ctrl <= 'z') || (ctrl >= 'A' && ctrl <= 'Z')) {
@@ -1520,7 +1541,18 @@ void next_token(Lexer* lexer) {
             else if (esc == 'r') lexer->current = (Token){TOK_LITERAL, '\r'};
             else if (esc == 'f') lexer->current = (Token){TOK_LITERAL, '\f'};
             else if (esc == 'v') lexer->current = (Token){TOK_LITERAL, '\v'};
-            else if (esc == '0') lexer->current = (Token){TOK_LITERAL, '\0'};
+            else if (esc == '0') {
+                /* CharacterEscape :: `0` [lookahead ∉ DecimalDigit] -- under
+                 * /u a digit after \0 would be a legacy octal escape, an
+                 * early error (Annex B tolerates it as octal/literal, and
+                 * this engine's non-unicode mode keeps its existing
+                 * NUL-then-literal-digit reading there). */
+                if (lexer->prog->unicode && is_digit_char(lexer->src[lexer->pos])) {
+                    lexer->prog->error = "SyntaxError: Invalid decimal escape in unicode mode";
+                } else {
+                    lexer->current = (Token){TOK_LITERAL, '\0'};
+                }
+            }
             else {
                 if (lexer->prog->unicode && (esc >= 128 || !strchr("^$\\.*+?()[]{}|/", (char)esc))) {
                     lexer->prog->error = "SyntaxError: Invalid identity escape";
@@ -1584,6 +1616,19 @@ void next_token(Lexer* lexer) {
             }
             break;
         }
+        case ']':
+        case '}':
+            /* SyntaxCharacter-adjacent brackets: PatternCharacter excludes
+             * them only via Annex B's ExtendedPatternCharacter, so a lone
+             * unescaped ']' or '}' is an early error under /u (and /v),
+             * literal otherwise. '{' already errors through the quantifier
+             * path above; '(' ')' '[' error as unterminated/unmatched. */
+            if (lexer->prog->unicode) {
+                lexer->prog->error = "SyntaxError: Lone quantifier bracket in unicode mode";
+                return;
+            }
+            lexer->current = (Token){TOK_LITERAL, c};
+            break;
         default: lexer->current = (Token){TOK_LITERAL, c}; break;
     }
 }

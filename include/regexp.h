@@ -10,8 +10,20 @@
  * rather than capped at 128 -- needs ~17.5k instructions on its own. */
 #define MAX_OPCODES 32768
 #define MAX_GROUPS 255
-#define MAX_CLASSES 64
-#define MAX_COUNTERS 16
+/* 128, not the original 64: real-world patterns clear 64 (test262's
+ * classic XML shallow-parsing regex builds 72 distinct classes in one
+ * pattern). Each embedded CharClass is ~16KB (ranges[2048]), so this is
+ * the main Program-size lever -- raising it further should wait for
+ * heap-sized ranges like CharClass.strings already has. */
+#define MAX_CLASSES 128
+/* 256, not the original 16: every quantifier consumes a counter id, and
+ * ordinary real-world patterns blow past 16 -- test262's classic XML
+ * shallow-parsing regex (a single 907-char pattern) needs 75. Cheap to
+ * raise now that the VM sizes ALL counter storage (per-thread arenas,
+ * fail-cache side arrays, path-start snapshots) to the pattern's actual
+ * counter_count on the heap -- this constant only caps the compile-time
+ * id space. */
+#define MAX_COUNTERS 256
 #define CACHE_SIZE 8192
 /* Capture-group name buffer size in bytes: 31 UTF-8 bytes + NUL. An engine
  * limit, not a spec one (ECMAScript puts no length cap on group names) --
@@ -29,12 +41,18 @@
  * C stack in one of the several functions that recurse through it with no
  * depth limit of their own (free_ast, validate_group_names,
  * validate_backrefs, validate_named_backrefs, compile_node).
- * validate_group_names is the most fragile of
- * those (two ~8KB NameSet locals per stack frame) and was observed via
- * ASan to crash around recursion depth ~247 on an 8MB stack; this leaves a
- * comfortable safety margin below that while still accommodating any
- * pattern a human would plausibly write by hand. */
-#define MAX_AST_DEPTH 200
+ * Two changes made 400 safe where 200 once was the ceiling:
+ * validate_group_names' two ~8KB NameSet locals per frame (ASan-observed
+ * crash near depth ~247 on an 8MB stack) moved to the heap, and the
+ * parser now builds BALANCED concat/alternation trees, so height tracks
+ * real bracket nesting rather than pattern length. The remaining
+ * recursions carry small frames -- the largest per-level cost is vm_run's
+ * lookaround recursion (a cap_pairs-sized VLA, ~4KB worst case), which at
+ * 400 levels stays ~1.6MB against the 8MB native and WASM (Makefile
+ * STACK_SIZE) stacks. test262's classic suites nest 200 parens; 400
+ * accommodates that with the same 2x headroom the old value had over
+ * hand-written patterns. */
+#define MAX_AST_DEPTH 400
 
 #define REGEX_FLAG_IGNORECASE 1
 #define REGEX_FLAG_GLOBAL 2
@@ -123,6 +141,20 @@ typedef struct {
      * the cache for such patterns; the step budget remains their defense
      * against catastrophic backtracking. */
     bool has_backrefs;
+    /* First-unit scan filter, computed by compile_into from the finished
+     * bytecode. When scan_filter is true, a match can only START at a
+     * position whose first UTF-16 code unit is admitted: units < 128 are
+     * looked up in the scan_ascii bitmap, units >= 128 (including all
+     * surrogates) are admitted iff scan_non_ascii. An unanchored scan loop
+     * can skip inadmissible positions without entering the VM at all --
+     * regex_wasm.c's regex_exec does exactly this; native scan loops may
+     * too. The filter OVER-approximates (skipping is only ever safe, never
+     * required); it is left false whenever a conservative answer isn't
+     * cheap -- patterns that can match empty, or whose first consuming
+     * opcode is a backreference or lookaround. */
+    bool scan_filter;
+    bool scan_non_ascii;
+    uint8_t scan_ascii[16];
     const char* error;
 } Program;
 

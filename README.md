@@ -39,6 +39,12 @@ stays behind — it's the glue that converts between jsvm2's `Value`/
 in this directory is a from-scratch replacement for that glue, aimed at a
 generic WASM host instead of jsvm2 specifically.
 
+The above is history, not a live relationship: jsvm2 is no longer an
+upstream for this repo. The engine here has since diverged substantially
+(conformance and memory-safety fixes, balanced AST construction, dynamic
+VM arenas, the first-unit scan filter), and nothing is synced in either
+direction.
+
 **Note on the engine's own file layout:** jsvm2's `src/regexp.c` was
 originally extracted here as a single verbatim file of the same name. It
 has since been split into `src/re_lexer.c` / `re_parser.c` / `re_compiler.c`

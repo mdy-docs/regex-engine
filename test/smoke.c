@@ -235,46 +235,49 @@ int main(void) {
      * crashing; the exact boundary itself is deliberately not exercised
      * here for capture groups -- see the comment on that block below. */
     {
-        /* MAX_CLASSES = 64: exactly at the limit succeeds, one more fails
-         * cleanly instead of overflowing prog->classes[]. */
-        char pat64[64 * 3 + 1] = {0};
-        for (int i = 0; i < 64; i++) strcat(pat64, "[a]");
-        uint16_t* p64 = to_utf16(pat64);
-        uintptr_t h64 = regex_compile(p64, 0, 0);
-        check(h64 != 0, "MAX_CLASSES: exactly 64 character classes compiles");
-        if (h64) regex_free(h64);
-        free(p64);
+        /* MAX_CLASSES = 128 (was 64 -- test262's classic XML pattern needs
+         * 72): exactly at the limit succeeds, one more fails cleanly
+         * instead of overflowing prog->classes[]. */
+        char* patA = malloc(128 * 3 + 1); patA[0] = 0;
+        for (int i = 0; i < 128; i++) strcat(patA, "[a]");
+        uint16_t* pA = to_utf16(patA);
+        uintptr_t hA = regex_compile(pA, 0, 0);
+        check(hA != 0, "MAX_CLASSES: exactly 128 character classes compiles");
+        if (hA) regex_free(hA);
+        free(patA); free(pA);
 
-        char pat65[65 * 3 + 1] = {0};
-        for (int i = 0; i < 65; i++) strcat(pat65, "[a]");
-        uint16_t* p65 = to_utf16(pat65);
-        uintptr_t h65 = regex_compile(p65, 0, 0);
-        check(h65 == 0, "MAX_CLASSES: 65 character classes is a clean compile error, not a crash");
-        check(h65 == 0 && strstr(regex_last_error(), "maximum character class count") != NULL,
+        char* patB = malloc(129 * 3 + 1); patB[0] = 0;
+        for (int i = 0; i < 129; i++) strcat(patB, "[a]");
+        uint16_t* pB = to_utf16(patB);
+        uintptr_t hB = regex_compile(pB, 0, 0);
+        check(hB == 0, "MAX_CLASSES: 129 character classes is a clean compile error, not a crash");
+        check(hB == 0 && strstr(regex_last_error(), "maximum character class count") != NULL,
               "MAX_CLASSES: error message identifies the resource limit");
-        if (h65) regex_free(h65);
-        free(p65);
+        if (hB) regex_free(hB);
+        free(patB); free(pB);
     }
     {
-        /* MAX_COUNTERS = 16: exactly at the limit succeeds, one more fails
-         * cleanly instead of overflowing the VM's per-thread counters[]. */
-        char pat16[16 * 8 + 1] = {0};
-        for (int i = 0; i < 16; i++) { char b[8]; snprintf(b, sizeof(b), "%c{1,2}", 'a' + (i % 26)); strcat(pat16, b); }
-        uint16_t* p16 = to_utf16(pat16);
-        uintptr_t h16 = regex_compile(p16, 0, 0);
-        check(h16 != 0, "MAX_COUNTERS: exactly 16 bounded quantifiers compiles");
-        if (h16) regex_free(h16);
-        free(p16);
+        /* MAX_COUNTERS = 256 (was 16 back when every Thread embedded the
+         * full counter arrays; the VM right-sizes all counter storage to
+         * the pattern's actual count now): exactly at the limit succeeds,
+         * one more fails cleanly. */
+        char* patA = malloc(256 * 8 + 1); patA[0] = 0;
+        for (int i = 0; i < 256; i++) { char b[8]; snprintf(b, sizeof(b), "%c{1,2}", 'a' + (i % 26)); strcat(patA, b); }
+        uint16_t* pA = to_utf16(patA);
+        uintptr_t hA = regex_compile(pA, 0, 0);
+        check(hA != 0, "MAX_COUNTERS: exactly 256 bounded quantifiers compiles");
+        if (hA) regex_free(hA);
+        free(patA); free(pA);
 
-        char pat17[17 * 8 + 1] = {0};
-        for (int i = 0; i < 17; i++) { char b[8]; snprintf(b, sizeof(b), "%c{1,2}", 'a' + (i % 26)); strcat(pat17, b); }
-        uint16_t* p17 = to_utf16(pat17);
-        uintptr_t h17 = regex_compile(p17, 0, 0);
-        check(h17 == 0, "MAX_COUNTERS: 17 bounded quantifiers is a clean compile error, not a crash");
-        check(h17 == 0 && strstr(regex_last_error(), "maximum quantifier count") != NULL,
+        char* patB = malloc(257 * 8 + 1); patB[0] = 0;
+        for (int i = 0; i < 257; i++) { char b[8]; snprintf(b, sizeof(b), "%c{1,2}", 'a' + (i % 26)); strcat(patB, b); }
+        uint16_t* pB = to_utf16(patB);
+        uintptr_t hB = regex_compile(pB, 0, 0);
+        check(hB == 0, "MAX_COUNTERS: 257 bounded quantifiers is a clean compile error, not a crash");
+        check(hB == 0 && strstr(regex_last_error(), "maximum quantifier count") != NULL,
               "MAX_COUNTERS: error message identifies the resource limit");
-        if (h17) regex_free(h17);
-        free(p17);
+        if (hB) regex_free(hB);
+        free(patB); free(pB);
     }
     {
         /* MAX_GROUPS: 255 groups (one over the real ceiling of 254 -- see
@@ -310,16 +313,20 @@ int main(void) {
      * Every case below previously crashed (verified against this exact
      * commit's pre-fix behavior); all now fail cleanly instead. */
     {
-        /* The original, simplest repro: a long flat run of literals with no
-         * groups/alternation at all -- pure parse_concat chain depth. */
+        /* Flat length no longer counts against the depth guard: the parser
+         * builds BALANCED concat trees (a 20000-atom run is ~15 levels), so
+         * the pattern that was the original stack-overflow repro -- and
+         * later a hard ~200-atom length limit -- now simply compiles and
+         * matches. Depth guards real bracket nesting only (below). */
         char* pat = malloc(20001); memset(pat, 'a', 20000); pat[20000] = 0;
         uint16_t* p = to_utf16(pat);
         uintptr_t h = regex_compile(p, 0, 0);
-        check(h == 0, "MAX_AST_DEPTH: 20000 flat literal characters is a clean compile error, not a crash");
-        check(h == 0 && strstr(regex_last_error(), "deeply nested or too long") != NULL,
-              "MAX_AST_DEPTH: error message identifies the resource limit");
+        check(h != 0, "20000 flat literal characters compiles (balanced concat tree)");
+        uint16_t* text = malloc(sizeof(uint16_t) * 20000);
+        for (int i = 0; i < 20000; i++) text[i] = 'a';
+        check(h != 0 && regex_exec(h, text, 20000, 0), "20000-literal pattern matches");
         if (h) regex_free(h);
-        free(pat); free(p);
+        free(pat); free(p); free(text);
     }
     {
         /* Deeply nested groups: "((((...a...))))" -- tests both the
@@ -355,22 +362,22 @@ int main(void) {
         free(pat); free(p);
     }
     {
-        /* The specific case this fix was written for: a *legitimate*,
-         * within-MAX_GROUPS pattern (254 capture groups -- no bounds
-         * violation, would compile successfully before this fix) that
-         * still crashed via validate_group_names' own recursion once it
-         * ran on the resulting 254-deep AST. Confirmed via ASan, pre-fix,
-         * to crash with no other error condition involved. Now rejected
-         * cleanly by the depth guard before validate_group_names ever
-         * runs (compile_into only calls it inside an `if (!prog->error)`
-         * guard) instead of reaching it at all. */
+        /* 254 flat capture groups -- the exact MAX_GROUPS ceiling. This
+         * once crashed validate_group_names outright (two ~8KB NameSet
+         * stack locals per recursion frame), then was rejected by the
+         * depth guard as collateral of the linear concat chains. With
+         * heap NameSets and balanced trees it now does what a
+         * within-every-bound pattern should: compiles and matches. */
         char* pat = malloc(254 * 4 + 1); pat[0] = 0;
         for (int i = 0; i < 254; i++) strcat(pat, "(a)");
         uint16_t* p = to_utf16(pat);
         uintptr_t h = regex_compile(p, 0, 0);
-        check(h == 0, "MAX_AST_DEPTH: 254 groups (legitimate under MAX_GROUPS) no longer crashes validate_group_names");
+        check(h != 0 && regex_group_count(h) == 254, "254 groups (the MAX_GROUPS ceiling) compiles");
+        uint16_t* text = malloc(sizeof(uint16_t) * 254);
+        for (int i = 0; i < 254; i++) text[i] = 'a';
+        check(h != 0 && regex_exec(h, text, 254, 0), "254-group pattern matches");
         if (h) regex_free(h);
-        free(pat); free(p);
+        free(pat); free(p); free(text);
     }
     {
         /* Moderate nesting/length, comfortably clear of MAX_AST_DEPTH --
@@ -1470,6 +1477,80 @@ int main(void) {
         free(pattern);
         free(text);
         regex_free(h);
+    }
+
+    /* ECMA-262 RepeatMatcher: optional iterations that match empty are
+     * discarded as failure (backtracking then tries the iteration's other
+     * alternatives), rather than exiting the loop -- (a?b??)* on "ab" must
+     * match all of "ab" via two one-char iterations. Mandatory iterations
+     * may still match empty. */
+    {
+        uint16_t* pattern = to_utf16("(a?b??)*");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t* text = to_utf16("ab");
+        check(h != 0 && regex_exec(h, text, 2, 0) && regex_captures_ptr(h)[1] == 2,
+              "(a?b??)* matches all of 'ab' (empty optional iterations are discarded)");
+        free(pattern); free(text); regex_free(h);
+
+        pattern = to_utf16("(?:){2}b");
+        h = regex_compile(pattern, 0, 0);
+        text = to_utf16("b");
+        check(h != 0 && regex_exec(h, text, 1, 0),
+              "(?:){2}b still matches (mandatory iterations may be empty)");
+        free(pattern); free(text); regex_free(h);
+    }
+
+    /* /u restricted syntax: lone ']'/'}' and \0-followed-by-digit are early
+     * errors in unicode mode, literals/NUL-plus-digit in legacy mode. */
+    {
+        const char* bad_u[] = {"]", "}", "\\00", "[\\01]"};
+        for (int i = 0; i < 4; i++) {
+            uint16_t* pattern = to_utf16(bad_u[i]);
+            check(regex_compile(pattern, 0, regex_flag_bit('u')) == 0,
+                  "restricted /u pattern is a SyntaxError");
+            uintptr_t h = regex_compile(pattern, 0, 0);
+            check(h != 0, "same pattern still compiles in legacy mode");
+            regex_free(h);
+            free(pattern);
+        }
+    }
+
+    /* First-unit scan filter (Program.scan_filter): correctness probes for
+     * the skip logic -- matches must be found at any offset, after skipped
+     * prefixes, under /i pre-images (both ASCII case-siblings and the two
+     * non-ASCII fold pre-images U+212A -> k, U+017F -> s), and patterns
+     * that can match empty must be unaffected (filter disabled). */
+    {
+        uint16_t* pattern = to_utf16("needle");
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        uint16_t* text = to_utf16("xxxxxxxxxxxxxxxneedle");
+        check(h != 0 && regex_exec(h, text, 21, 0) && regex_captures_ptr(h)[0] == 15,
+              "scan filter: literal found after a skipped prefix");
+        free(pattern); free(text); regex_free(h);
+
+        pattern = to_utf16("K");
+        h = regex_compile(pattern, 0, regex_flag_bit('i') | regex_flag_bit('u'));
+        uint16_t kelvin[2] = {'x', 0x212A};
+        check(h != 0 && regex_exec(h, kelvin, 2, 0) && regex_captures_ptr(h)[0] == 1,
+              "scan filter: /K/iu still matches KELVIN SIGN (non-ASCII fold pre-image)");
+        uint16_t lower[2] = {'x', 'k'};
+        check(regex_exec(h, lower, 2, 0) && regex_captures_ptr(h)[0] == 1,
+              "scan filter: /K/iu matches 'k' (ASCII case-sibling)");
+        free(pattern); regex_free(h);
+
+        pattern = to_utf16("a*");
+        h = regex_compile(pattern, 0, 0);
+        uint16_t* text2 = to_utf16("bbb");
+        check(h != 0 && regex_exec(h, text2, 3, 0) && regex_captures_ptr(h)[1] == 0,
+              "scan filter: empty-matching pattern is exempt and matches empty at 0");
+        free(pattern); free(text2); regex_free(h);
+
+        pattern = to_utf16("[^a-z]");
+        h = regex_compile(pattern, 0, 0);
+        uint16_t* text3 = to_utf16("abcD");
+        check(h != 0 && regex_exec(h, text3, 4, 0) && regex_captures_ptr(h)[0] == 3,
+              "scan filter: negated class admits the complement");
+        free(pattern); free(text3); regex_free(h);
     }
 
     if (failures == 0) {

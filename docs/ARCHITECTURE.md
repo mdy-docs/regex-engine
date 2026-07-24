@@ -59,10 +59,14 @@ directly from the AST in one recursive walk (`compile_node`,
 ```c
 typedef struct {
     Instruction code[MAX_OPCODES];       // 32768
-    CharClass classes[MAX_CLASSES];      // 64
+    CharClass classes[MAX_CLASSES];      // 128
     char group_names[MAX_GROUPS][32];    // 255
+    int name_chain[MAX_GROUPS];          // same-name links for \k<...>
     int code_count, class_count, group_count, counter_count;
     bool ignore_case, multiline, dot_all, sticky, unicode, has_indices, unicode_sets;
+    bool has_backrefs;                   // gates the VM's fail cache
+    bool scan_filter, scan_non_ascii;    // first-unit scan filter
+    uint8_t scan_ascii[16];              //   (see regexp.h)
     const char* error;
 } Program;
 ```
@@ -193,18 +197,20 @@ parse_primary      ::= literal | class | ^ | $ | \b | \B | backref
 chains** of `AST_CONCAT`/`AST_ALT` nodes for a flat sequence, not balanced
 trees — a pattern with N flat concatenated atoms produces an AST N nodes
 deep. `free_ast`, `validate_group_names`, `validate_backrefs`, and
-`compile_node` all recurse through that chain with no iterative fallback,
+`compile_node` all recurse through the tree with no iterative fallback,
 which used to mean O(pattern length) recursion depth and a real
-stack-overflow DoS on long patterns (confirmed via ASan) —
-since fixed: `parse_concat`/`parse_alt`/
-`parse_quantifier`/`parse_primary` track each node's subtree height as
-it's built (`ASTNode.depth`, via `finish_node()` in `re_parser.c`) and
-`parse_alt` additionally checks a live recursion counter
-(`Lexer.parse_depth`) before recursing into itself or a group body, so a
-pattern that would produce a tree taller than `MAX_AST_DEPTH`
-(`include/regexp.h`) is rejected with a clean `prog->error` before any of
-the four walkers above — or the parser's own recursion, for deeply nested
-groups/alternation — ever gets that deep.
+stack-overflow DoS on long patterns (confirmed via ASan). Two mechanisms
+now bound it: `parse_concat` and `parse_alt` collect their atoms
+iteratively and build **balanced** trees (`build_balanced`), so tree
+height tracks real bracket nesting rather than pattern length (a
+million-atom flat pattern is ~20 levels — flat length is no longer
+limited); and each node's subtree height is tracked as it's built
+(`ASTNode.depth`, via `finish_node()` in `re_parser.c`), with `parse_alt`
+additionally checking a live recursion counter (`Lexer.parse_depth`)
+before recursing into a group body, so a pattern that would produce a
+tree taller than `MAX_AST_DEPTH` (`include/regexp.h`) is rejected with a
+clean `prog->error` before any of the four walkers above — or the
+parser's own recursion, for deeply nested groups — ever gets that deep.
 
 Group numbering happens during parsing, not compilation:
 `parse_primary`'s group case (`re_parser.c:106`) claims
@@ -237,7 +243,10 @@ lex time). A few more things worth knowing before you touch this:
   actually branches: greedy pushes the "give up and exit" thread onto the
   backtrack stack and continues into the body first; lazy does the
   opposite. Each quantifier gets its own counter slot
-  (`prog->counter_count++`), bounds-checked against `MAX_COUNTERS` = 16.
+  (`prog->counter_count++`), bounds-checked against `MAX_COUNTERS` = 256
+  (raised from 16 once the VM stopped embedding counter arrays in every
+  `Thread` — real patterns clear 16 easily; test262's classic XML
+  shallow-parsing regex needs 75).
 - **Lookaround compiles to an out-of-line subroutine plus a jump around
   it.** `AST_LOOKAHEAD`/`AST_LOOKBEHIND` (`re_compiler.c:206`) emit an
   unconditional `OP_JMP` past the lookaround body, compile the body inline
@@ -279,6 +288,19 @@ lex time). A few more things worth knowing before you touch this:
   name), so the handler walks a short id chain instead of the strcmp scan
   over every group name it used to do per execution.
   (Numeric backrefs still compile to `OP_BACKREF` with the id baked in.)
+- **A first-unit scan filter is computed from the finished bytecode.**
+  `compute_scan_filter` (`re_compiler.c`) walks the emitted code from
+  pc 0 through zero-width opcodes (splits, jumps, saves, counters,
+  assertions) to the first *consuming* opcodes, and collects which UTF-16
+  code units can possibly begin a match into `Program.scan_ascii` (a
+  128-bit bitmap) plus a `scan_non_ascii` flag. Unanchored scan loops —
+  `regex_exec` in the shim does this — then skip inadmissible start
+  positions without entering the VM, which is the dominant cost of a
+  non-matching scan (~36x measured on a 1M-unit subject with a rare
+  first character). The filter over-approximates and is simply disabled
+  (`scan_filter == false`) for patterns where a cheap answer doesn't
+  exist: anything that can match empty, or whose first consuming opcode
+  is a backreference or lookaround.
 - **Character classes containing multi-codepoint strings** (`\q{...}` or a
   Unicode "property of strings" like `\p{RGI_Emoji}`, `/v`
   mode only) don't compile to a plain `OP_CLASS` — `compile_class_with_strings`
@@ -329,8 +351,8 @@ one-shot convenience wrapper (create context, run once, free):
 typedef struct {
     int pc; const uint16_t* sp;
     const uint16_t** captures;
-    int counters[MAX_COUNTERS];
-    const uint16_t* counter_sp[MAX_COUNTERS];
+    int* counters;
+    const uint16_t** counter_sp;
 } Thread;
 ```
 
@@ -339,7 +361,10 @@ typedef struct {
   KB and this function's own stack frame balloon to ~2.2MB regardless of
   how many groups the compiled pattern actually has, a real crash risk
   once lookaround's recursion (below) is in the picture (`re_vm.c`'s top
-  comment has the history). Each `VMContext` depth slot
+  comment has the history). `counters`/`counter_sp` follow the identical
+  arena discipline for the identical reason — as embedded
+  `[MAX_COUNTERS]` arrays they both bloated every `Thread` and pinned
+  `MAX_COUNTERS` at 16, a limit ordinary patterns exceeded. Each `VMContext` depth slot
   holds one arena, sized to `cap_pairs =
   (prog->group_count + 1) * 2` — the pattern's *actual* group count — with
   one slice per backtrack-stack slot (the in-flight thread's captures live

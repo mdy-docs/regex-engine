@@ -325,6 +325,100 @@ static bool scan_has_named_group(const uint16_t* src) {
     return false;
 }
 
+/* ---- First-unit scan filter (see Program.scan_filter in regexp.h) ------ */
+
+static void scan_set_ascii(Program* prog, uint32_t u) {
+    prog->scan_ascii[u >> 3] |= (uint8_t)(1u << (u & 7));
+}
+
+/* Admit every code unit that can match this OP_CHAR as a match's first
+ * unit. arg1 is already canonicalized (emit_char_operand), so under /i the
+ * admissible INPUTS are its fold pre-images: the ASCII case-sibling, plus
+ * -- /u only -- any non-ASCII character whose simple case folding lands on
+ * it (U+212A KELVIN -> 'k', U+017F long s -> 's'; derived from the fold
+ * table rather than hardcoded). Annex B's ASCII-crossing rule excludes
+ * non-ASCII pre-images in non-unicode mode. */
+static void scan_add_char(Program* prog, const Instruction* in) {
+    uint32_t cp = (uint32_t)in->arg1;
+    if (cp >= 128) { prog->scan_non_ascii = true; return; }
+    scan_set_ascii(prog, cp);
+    if (in->arg2) {
+        if (cp >= 'A' && cp <= 'Z') scan_set_ascii(prog, cp + 32);
+        else if (cp >= 'a' && cp <= 'z') scan_set_ascii(prog, cp - 32);
+        if (prog->unicode && !prog->scan_non_ascii) {
+            for (size_t i = 0; i < sizeof(UCD_CASE_FOLD)/sizeof(CaseFoldMapping); i++) {
+                if (UCD_CASE_FOLD[i].to == cp && UCD_CASE_FOLD[i].from >= 128) {
+                    prog->scan_non_ascii = true;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static bool class_has_unit(const CharClass* cls, uint32_t u) {
+    for (int i = 0; i < cls->range_count; i++)
+        if (u >= cls->ranges[i].start && u <= cls->ranges[i].end) return true;
+    return false;
+}
+
+/* Classes are already fold-closed at construction, so no /i handling here.
+ * A negated class admits the ASCII complement, and conservatively any
+ * non-ASCII unit (computing the true non-ASCII complement isn't worth it
+ * for a filter that only needs to over-approximate). */
+static void scan_add_class(Program* prog, const CharClass* cls) {
+    if (cls->negated) {
+        prog->scan_non_ascii = true;
+        for (uint32_t u = 0; u < 128; u++)
+            if (!class_has_unit(cls, u)) scan_set_ascii(prog, u);
+    } else {
+        for (int i = 0; i < cls->range_count; i++) {
+            if (cls->ranges[i].end >= 128) prog->scan_non_ascii = true;
+            uint32_t hi = cls->ranges[i].end < 127 ? cls->ranges[i].end : 127;
+            for (uint32_t u = cls->ranges[i].start; u <= hi; u++) scan_set_ascii(prog, u);
+        }
+    }
+}
+
+/* Walks the bytecode from pc 0 through zero-width opcodes (assertions are
+ * transparent: they only ever NARROW where a match can start, and the
+ * filter may over-approximate), collecting the first CONSUMING opcode's
+ * admissible units. Bails -- leaving scan_filter false -- on anything that
+ * makes "which units can come first" non-obvious: reaching OP_MATCH
+ * (the pattern can match empty, so no position may be skipped), a
+ * backreference, or a lookaround. Each pc is visited once; a SPLIT pushes
+ * two successors, so the worklist is bounded by 2*code_count. */
+static void compute_scan_filter(Program* prog) {
+    bool* visited = calloc((size_t)prog->code_count, sizeof(bool));
+    int* work = malloc(sizeof(int) * (2 * (size_t)prog->code_count + 1));
+    if (!visited || !work) { free(visited); free(work); return; } /* no filter; not fatal */
+    int wp = 0;
+    bool ok = prog->code_count > 0;
+    work[wp++] = 0;
+    while (wp > 0 && ok) {
+        int pc = work[--wp];
+        if (pc < 0 || pc >= prog->code_count || visited[pc]) continue;
+        visited[pc] = true;
+        const Instruction* in = &prog->code[pc];
+        switch (in->op) {
+            case OP_CHAR: scan_add_char(prog, in); break;
+            case OP_CLASS: scan_add_class(prog, &prog->classes[in->arg1]); break;
+            case OP_SAVE: case OP_INIT_COUNTER: case OP_INC_COUNTER:
+            case OP_CLEAR_CAPTURES:
+            case OP_ASSERT_START: case OP_ASSERT_END:
+            case OP_WORD_BOUNDARY: case OP_NON_WORD_BOUNDARY:
+                work[wp++] = pc + 1; break;
+            case OP_JMP: work[wp++] = in->arg1; break;
+            case OP_SPLIT: work[wp++] = in->arg1; work[wp++] = in->arg2; break;
+            case OP_CHECK_COUNTER: work[wp++] = pc + 1; work[wp++] = in->arg4; break;
+            default: ok = false; break; /* OP_MATCH, backrefs, lookaround */
+        }
+    }
+    free(visited);
+    free(work);
+    prog->scan_filter = ok;
+}
+
 void compile_into(Program* prog, const uint16_t* regex, int flags) {
     /* Program is ~2MB; a full `= {0}` zeroing (and return-by-value copying)
      * dominated RegExp construction cost. Only the bookkeeping needs
@@ -343,6 +437,9 @@ void compile_into(Program* prog, const uint16_t* regex, int flags) {
     prog->group_count = 0;
     prog->counter_count = 0;
     prog->has_backrefs = false;
+    prog->scan_filter = false;
+    prog->scan_non_ascii = false;
+    memset(prog->scan_ascii, 0, sizeof(prog->scan_ascii));
     prog->error = NULL;
     prog->ignore_case = (flags & REGEX_FLAG_IGNORECASE) != 0;
     prog->multiline = (flags & REGEX_FLAG_MULTILINE) != 0;
@@ -405,5 +502,6 @@ void compile_into(Program* prog, const uint16_t* regex, int flags) {
         emit(prog, OP_SAVE, 1, 0, 0, 0, false);
         emit(prog, OP_MATCH, 0, 0, 0, 0, false);
     }
+    if (!prog->error) compute_scan_filter(prog);
     free_ast(ast);
 }

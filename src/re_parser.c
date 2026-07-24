@@ -145,7 +145,12 @@ static ASTNode* parse_primary(Lexer* lexer) {
         }
         if (lexer->current.type == TOK_RPAREN) {
             next_token(lexer);
-        } else {
+        } else if (!lexer->prog->error) {
+            /* First failure wins, like every other error site: once any
+             * error is set, next_token short-circuits to TOK_EOF, so this
+             * branch is reached for EVERY open group on the way out --
+             * unguarded, it masked the real error (e.g. the class-count
+             * limit surfaced as "Unterminated group"). */
             lexer->prog->error = "SyntaxError: Unterminated group";
         }
 
@@ -189,25 +194,72 @@ static ASTNode* parse_quantifier(Lexer* lexer) {
     return node;
 }
 
+/* Builds a BALANCED binary tree over items[lo..hi] instead of the linear
+ * chain the parser originally produced. Concatenation and alternation are
+ * both associative in every way this engine observes them -- compile_node
+ * emits CONCAT children in sequence order (either direction under rtl) and
+ * ALT children in preference order regardless of association, and
+ * validate_group_names' cross-branch rules compose -- so tree shape is
+ * free to choose. Linear chains made AST height equal the ATOM COUNT,
+ * which turned MAX_AST_DEPTH's C-stack guard into a hard ~200-atom limit
+ * on flat patterns (a 300-character literal string failed to compile);
+ * balanced, a million atoms are ~20 levels and the guard constrains only
+ * real nesting. Recursion depth here is O(log n). */
+static ASTNode* build_balanced(Lexer* lexer, ASTType type, ASTNode** items, int lo, int hi) {
+    if (lo >= hi) return items[lo];
+    int mid = lo + (hi - lo) / 2;
+    ASTNode* n = create_node(type);
+    n->left = build_balanced(lexer, type, items, lo, mid);
+    n->right = build_balanced(lexer, type, items, mid + 1, hi);
+    return finish_node(lexer, n);
+}
+
+static ASTNode** items_push(ASTNode** items, int* count, int* cap, ASTNode* node) {
+    if (*count == *cap) {
+        *cap *= 2;
+        ASTNode** grown = realloc(items, sizeof(ASTNode*) * (size_t)*cap);
+        if (!grown) {
+            fprintf(stderr, "Fatal Error: Out of memory\n");
+            exit(EXIT_FAILURE);
+        }
+        items = grown;
+    }
+    items[(*count)++] = node;
+    return items;
+}
+
+static bool starts_atom(TokenType t) {
+    return t == TOK_LITERAL || t == TOK_CLASS ||
+           t == TOK_LPAREN || t == TOK_LOOKAHEAD ||
+           t == TOK_NEG_LOOKAHEAD ||
+           t == TOK_LOOKBEHIND ||
+           t == TOK_NEG_LOOKBEHIND ||
+           t == TOK_CARET || t == TOK_DOLLAR || t == TOK_MODIFIER_GROUP ||
+           t == TOK_BACKREF ||
+           t == TOK_NAMED_BACKREF ||
+           t == TOK_NONCAP_GROUP ||
+           t == TOK_NAMED_GROUP ||
+           t == TOK_WORD_BOUNDARY ||
+           t == TOK_NON_WORD_BOUNDARY;
+}
+
 static ASTNode* parse_concat(Lexer* lexer) {
     ASTNode* node = parse_quantifier(lexer);
-    while (lexer->current.type == TOK_LITERAL || lexer->current.type == TOK_CLASS || 
-           lexer->current.type == TOK_LPAREN || lexer->current.type == TOK_LOOKAHEAD ||
-           lexer->current.type == TOK_NEG_LOOKAHEAD ||
-           lexer->current.type == TOK_LOOKBEHIND ||
-           lexer->current.type == TOK_NEG_LOOKBEHIND ||
-           lexer->current.type == TOK_CARET || lexer->current.type == TOK_DOLLAR || lexer->current.type == TOK_MODIFIER_GROUP ||
-           lexer->current.type == TOK_BACKREF || 
-           lexer->current.type == TOK_NAMED_BACKREF ||
-           lexer->current.type == TOK_NONCAP_GROUP ||
-           lexer->current.type == TOK_NAMED_GROUP ||
-           lexer->current.type == TOK_WORD_BOUNDARY ||
-           lexer->current.type == TOK_NON_WORD_BOUNDARY) {
-        ASTNode* right = parse_quantifier(lexer);
-        ASTNode* concat = create_node(AST_CONCAT);
-        concat->left = node; concat->right = right;
-        node = finish_node(lexer, concat);
+    if (!starts_atom(lexer->current.type)) return node;
+    int cap = 8, count = 0;
+    ASTNode** items = malloc(sizeof(ASTNode*) * (size_t)cap);
+    if (!items) {
+        fprintf(stderr, "Fatal Error: Out of memory\n");
+        exit(EXIT_FAILURE);
     }
+    items = items_push(items, &count, &cap, node);
+    while (starts_atom(lexer->current.type)) {
+        ASTNode* right = parse_quantifier(lexer);
+        if (!right) break;
+        items = items_push(items, &count, &cap, right);
+    }
+    node = build_balanced(lexer, AST_CONCAT, items, 0, count - 1);
+    free(items);
     return node;
 }
 
@@ -232,11 +284,24 @@ ASTNode* parse_alt(Lexer* lexer) {
     }
     ASTNode* node = parse_concat(lexer);
     if (lexer->current.type == TOK_OR) {
-        next_token(lexer);
-        ASTNode* right = parse_alt(lexer);
-        ASTNode* alt = create_node(AST_ALT);
-        alt->left = node; alt->right = right;
-        node = finish_node(lexer, alt);
+        /* Chained '|' is collected iteratively and built balanced (see
+         * build_balanced) -- the old one-recursion-per-alternative shape
+         * both consumed a parse_depth level per '|' and made AST height
+         * equal the alternative count. NULL items are legitimate: an empty
+         * alternative (/a|/) has no concat node and matches empty. */
+        int cap = 8, count = 0;
+        ASTNode** items = malloc(sizeof(ASTNode*) * (size_t)cap);
+        if (!items) {
+            fprintf(stderr, "Fatal Error: Out of memory\n");
+            exit(EXIT_FAILURE);
+        }
+        items = items_push(items, &count, &cap, node);
+        while (lexer->current.type == TOK_OR) {
+            next_token(lexer);
+            items = items_push(items, &count, &cap, parse_concat(lexer));
+        }
+        node = build_balanced(lexer, AST_ALT, items, 0, count - 1);
+        free(items);
     }
     lexer->parse_depth--;
     return node;
@@ -253,49 +318,61 @@ void free_ast(ASTNode* node) {
  * re_internal.h. */
 bool validate_group_names(ASTNode* node, NameSet* out_set, const char** error) {
     if (!node) return true;
+    /* The two child NameSets are HEAP-allocated: as ~8KB stack locals they
+     * made this the most stack-hungry recursion over the AST (observed
+     * crashing near depth ~247 on an 8MB stack), which is what originally
+     * forced MAX_AST_DEPTH down to 200 -- a depth real patterns hit
+     * (test262 exercises 200 nested groups). With small frames here, the
+     * depth cap could be raised; see MAX_AST_DEPTH in include/regexp.h. */
+    NameSet* sets = calloc(2, sizeof(NameSet));
+    if (!sets) {
+        fprintf(stderr, "Fatal Error: Out of memory\n");
+        exit(EXIT_FAILURE);
+    }
+    NameSet* left_set = &sets[0];
+    NameSet* right_set = &sets[1];
+    bool ok = false;
+    if (!validate_group_names(node->left, left_set, error)) goto done;
+    if (!validate_group_names(node->right, right_set, error)) goto done;
+
     if (node->type == AST_ALT) {
-        NameSet left_set = {0}, right_set = {0};
-        if (!validate_group_names(node->left, &left_set, error)) return false;
-        if (!validate_group_names(node->right, &right_set, error)) return false;
-        
-        for (int i = 0; i < left_set.count; i++) {
-            strcpy(out_set->names[out_set->count++], left_set.names[i]);
+        for (int i = 0; i < left_set->count; i++) {
+            strcpy(out_set->names[out_set->count++], left_set->names[i]);
         }
-        for (int i = 0; i < right_set.count; i++) {
+        for (int i = 0; i < right_set->count; i++) {
             bool found = false;
-            for (int j = 0; j < left_set.count; j++) {
-                if (strcmp(right_set.names[i], left_set.names[j]) == 0) { found = true; break; }
+            for (int j = 0; j < left_set->count; j++) {
+                if (strcmp(right_set->names[i], left_set->names[j]) == 0) { found = true; break; }
             }
-            if (!found && out_set->count < MAX_GROUPS) strcpy(out_set->names[out_set->count++], right_set.names[i]);
+            if (!found && out_set->count < MAX_GROUPS) strcpy(out_set->names[out_set->count++], right_set->names[i]);
         }
-        return true;
+        ok = true;
     } else {
-        NameSet left_set = {0}, right_set = {0};
-        if (!validate_group_names(node->left, &left_set, error)) return false;
-        if (!validate_group_names(node->right, &right_set, error)) return false;
-        
-        for (int i = 0; i < left_set.count; i++) {
-            strcpy(out_set->names[out_set->count++], left_set.names[i]);
+        for (int i = 0; i < left_set->count; i++) {
+            strcpy(out_set->names[out_set->count++], left_set->names[i]);
         }
-        for (int i = 0; i < right_set.count; i++) {
-            for (int j = 0; j < left_set.count; j++) {
-                if (strcmp(right_set.names[i], left_set.names[j]) == 0) {
+        for (int i = 0; i < right_set->count; i++) {
+            for (int j = 0; j < left_set->count; j++) {
+                if (strcmp(right_set->names[i], left_set->names[j]) == 0) {
                     *error = "SyntaxError: Duplicate capture group name";
-                    return false;
+                    goto done;
                 }
             }
-            if (out_set->count < MAX_GROUPS) strcpy(out_set->names[out_set->count++], right_set.names[i]);
+            if (out_set->count < MAX_GROUPS) strcpy(out_set->names[out_set->count++], right_set->names[i]);
         }
-        
+
         if (node->type == AST_GROUP && node->name[0] != '\0') {
             for (int i = 0; i < out_set->count; i++) {
                 if (strcmp(out_set->names[i], node->name) == 0) {
                     *error = "SyntaxError: Duplicate capture group name";
-                    return false;
+                    goto done;
                 }
             }
             if (out_set->count < MAX_GROUPS) strcpy(out_set->names[out_set->count++], node->name);
         }
-        return true;
+        ok = true;
     }
+done:
+    free(sets);
+    return ok;
 }
